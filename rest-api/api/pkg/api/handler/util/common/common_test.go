@@ -3015,7 +3015,7 @@ func TestTenantHasTargetedInstanceCreation(t *testing.T) {
 
 	for _, tc := range siteTests {
 		t.Run(tc.name, func(t *testing.T) {
-			got, gerr := TenantHasTargetedInstanceCreation(ctx, nil, dbSession, tenant, tc.site)
+			got, gerr := TenantHasTargetedInstanceCreation(ctx, nil, dbSession, tenant, SiteScope(tc.site))
 			assert.Nil(t, gerr)
 			assert.Equal(t, tc.expected, got)
 		})
@@ -3029,7 +3029,7 @@ func TestTenantHasTargetedInstanceCreation(t *testing.T) {
 
 	// A Tenant whose Ready TenantAccount global default is disabled but which
 	// has a per-site override enabling the capability must pass the coarse
-	// (site == nil) ceiling used by the privileged-tenant precheck.
+	// (nil scope) ceiling used by the privileged-tenant precheck.
 	overrideTenant, err := tnDAO.Create(ctx, nil, cdbm.TenantCreateInput{
 		Name:      "override-tenant",
 		Org:       effOrg + "-override-tenant",
@@ -3059,4 +3059,13 @@ func TestTenantHasTargetedInstanceCreation(t *testing.T) {
 	got, gerr = TenantHasTargetedInstanceCreation(ctx, nil, dbSession, overrideTenant, nil)
 	assert.Nil(t, gerr)
 	assert.True(t, got)
+
+	// Provider-scoped ceiling: enabled on ip but not on ip2.
+	got, gerr = TenantHasTargetedInstanceCreation(ctx, nil, dbSession, enabledTenant, &TenantPrivilegeScope{InfrastructureProviderID: &ip.ID})
+	assert.Nil(t, gerr)
+	assert.True(t, got)
+
+	got, gerr = TenantHasTargetedInstanceCreation(ctx, nil, dbSession, enabledTenant, &TenantPrivilegeScope{InfrastructureProviderID: &ip2.ID})
+	assert.Nil(t, gerr)
+	assert.False(t, got)
 }

@@ -60,7 +60,7 @@ func ValidateProviderOrTenantSiteAccess(ctx context.Context, logger zerolog.Logg
 		// Privileged tenants may access Sites via a Ready TenantAccount with
 		// TargetedInstanceCreation even without an explicit TenantSite row.
 		if !hasAccess {
-			enabled, err := common.TenantHasTargetedInstanceCreation(ctx, nil, dbSession, tenant, site)
+			enabled, err := common.TenantHasTargetedInstanceCreation(ctx, nil, dbSession, tenant, common.SiteScope(site))
 			if err != nil {
 				logger.Error().Err(err).Msg("error resolving TargetedInstanceCreation for Tenant/Site")
 				return false, cutil.NewAPIError(http.StatusInternalServerError, "Failed to resolve Tenant capability for Site due to DB error", nil)
@@ -115,7 +115,7 @@ func (cemh CreateExpectedMachineHandler) Handle(c echo.Context) error {
 	}
 
 	// ensure our user is a provider or tenant for the org
-	infrastructureProvider, tenant, apiError := common.IsProviderOrTenant(ctx, logger, cemh.dbSession, org, dbUser, false, true)
+	infrastructureProvider, tenant, apiError := common.IsProviderOrTenant(ctx, logger, cemh.dbSession, org, dbUser, false, &common.TenantPrivilegeScope{})
 	if apiError != nil {
 		return cutil.NewAPIErrorResponse(c, apiError.Code, apiError.Message, apiError.Data)
 	}
@@ -313,10 +313,10 @@ func (gaemh GetAllExpectedMachineHandler) Handle(c echo.Context) error {
 	}
 
 	// ensure our user is a provider or tenant for the org. We do not request the
-	// privileged-tenant pre-gate (requirePrivilegedTenant=false): tenant-only
+	// privileged-tenant pre-gate (requirePrivilegedScope=nil): tenant-only
 	// callers are scoped below to Sites with effective TargetedInstanceCreation,
 	// and receive 403 when none are resolved.
-	infrastructureProvider, tenant, apiError := common.IsProviderOrTenant(ctx, logger, gaemh.dbSession, org, dbUser, true, false)
+	infrastructureProvider, tenant, apiError := common.IsProviderOrTenant(ctx, logger, gaemh.dbSession, org, dbUser, true, nil)
 	if apiError != nil {
 		return cutil.NewAPIErrorResponse(c, apiError.Code, apiError.Message, apiError.Data)
 	}
@@ -497,7 +497,7 @@ func (gemh GetExpectedMachineHandler) Handle(c echo.Context) error {
 	}
 
 	// ensure our user is a provider for the org
-	infrastructureProvider, tenant, apiError := common.IsProviderOrTenant(ctx, logger, gemh.dbSession, org, dbUser, true, true)
+	infrastructureProvider, tenant, apiError := common.IsProviderOrTenant(ctx, logger, gemh.dbSession, org, dbUser, true, &common.TenantPrivilegeScope{})
 	if apiError != nil {
 		return cutil.NewAPIErrorResponse(c, apiError.Code, apiError.Message, apiError.Data)
 	}
@@ -605,7 +605,7 @@ func (uemh UpdateExpectedMachineHandler) Handle(c echo.Context) error {
 	}
 
 	// Ensure our user is a provider for the org
-	infrastructureProvider, tenant, apiError := common.IsProviderOrTenant(ctx, logger, uemh.dbSession, org, dbUser, false, true)
+	infrastructureProvider, tenant, apiError := common.IsProviderOrTenant(ctx, logger, uemh.dbSession, org, dbUser, false, &common.TenantPrivilegeScope{})
 	if apiError != nil {
 		return cutil.NewAPIErrorResponse(c, apiError.Code, apiError.Message, apiError.Data)
 	}
@@ -804,7 +804,7 @@ func (demh DeleteExpectedMachineHandler) Handle(c echo.Context) error {
 	}
 
 	// Ensure our user is a provider for the org
-	infrastructureProvider, tenant, apiError := common.IsProviderOrTenant(ctx, logger, demh.dbSession, org, dbUser, false, true)
+	infrastructureProvider, tenant, apiError := common.IsProviderOrTenant(ctx, logger, demh.dbSession, org, dbUser, false, &common.TenantPrivilegeScope{})
 	if apiError != nil {
 		return cutil.NewAPIErrorResponse(c, apiError.Code, apiError.Message, apiError.Data)
 	}
@@ -928,7 +928,7 @@ func (cemh CreateExpectedMachinesHandler) Handle(c echo.Context) error {
 	}
 
 	// ensure our user is a provider or tenant for the org
-	infrastructureProvider, tenant, apiError := common.IsProviderOrTenant(ctx, logger, cemh.dbSession, org, dbUser, false, true)
+	infrastructureProvider, tenant, apiError := common.IsProviderOrTenant(ctx, logger, cemh.dbSession, org, dbUser, false, &common.TenantPrivilegeScope{})
 	if apiError != nil {
 		return cutil.NewAPIErrorResponse(c, apiError.Code, apiError.Message, apiError.Data)
 	}
@@ -1265,7 +1265,7 @@ func (uemh UpdateExpectedMachinesHandler) Handle(c echo.Context) error {
 	}
 
 	// Ensure our user is a provider or tenant for the org
-	infrastructureProvider, tenant, apiError := common.IsProviderOrTenant(ctx, logger, uemh.dbSession, org, dbUser, false, true)
+	infrastructureProvider, tenant, apiError := common.IsProviderOrTenant(ctx, logger, uemh.dbSession, org, dbUser, false, &common.TenantPrivilegeScope{})
 	if apiError != nil {
 		return cutil.NewAPIErrorResponse(c, apiError.Code, apiError.Message, apiError.Data)
 	}
