@@ -4632,6 +4632,32 @@ paths:
         in: path
         required: true
         description: Name of the Org
+    post:
+      summary: Create SKU
+      operationId: create-sku
+      description: |-
+        Create a SKU on the selected Site's NICo Core service.
+
+        The Org must have an Infrastructure Provider that owns the Site. The user must have an authorization role with the `PROVIDER_ADMIN` suffix.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SkuCreateRequest'
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SkuMutationResponse'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '403':
+          $ref: '#/components/responses/ForbiddenError'
+      tags:
+        - SKU
     get:
       summary: Retrieve all SKUs
       operationId: get-all-sku
@@ -4749,6 +4775,58 @@ paths:
         in: path
         required: true
         description: ID of the SKU
+    patch:
+      summary: Update SKU
+      operationId: update-sku
+      description: |-
+        Update selected mutable fields on a SKU owned by the selected Site's NICo Core service.
+
+        Fields omitted from the request retain their current Core values. The Org must have an Infrastructure Provider that owns the Site. The user must have an authorization role with the `PROVIDER_ADMIN` suffix.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SkuUpdateRequest'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SkuMutationResponse'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '403':
+          $ref: '#/components/responses/ForbiddenError'
+        '404':
+          $ref: '#/components/responses/NotFoundError'
+      tags:
+        - SKU
+    delete:
+      summary: Delete SKU
+      operationId: delete-sku
+      description: |-
+        Delete an unused SKU from the selected Site's NICo Core service.
+
+        The Org must have an Infrastructure Provider that owns the Site. The user must have an authorization role with the `PROVIDER_ADMIN` suffix.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SkuDeleteRequest'
+      responses:
+        '204':
+          description: No Content
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '403':
+          $ref: '#/components/responses/ForbiddenError'
+        '404':
+          $ref: '#/components/responses/NotFoundError'
+      tags:
+        - SKU
     get:
       summary: Retrieve SKU
       operationId: get-sku
@@ -22502,6 +22580,120 @@ components:
           format: date-time
           description: ISO 8601 datetime when the SKU was last updated
           readOnly: true
+    SkuCreateRequest:
+      title: SkuCreateRequest
+      type: object
+      description: Request data to create a SKU on a Site's NICo Core service.
+      properties:
+        siteId:
+          type: string
+          format: uuid
+          description: ID of the Site where the SKU will be created
+        id:
+          type: string
+          minLength: 1
+          description: Unique SKU identifier
+        description:
+          type: string
+          description: Human-readable SKU description
+        schemaVersion:
+          type: integer
+          format: uint32
+          minimum: 1
+          description: Core SKU schema version
+        deviceType:
+          type:
+            - string
+            - 'null'
+          description: Optional device type identifier
+        components:
+          $ref: '#/components/schemas/SkuComponents'
+      required:
+        - siteId
+        - id
+        - schemaVersion
+        - components
+    SkuUpdateRequest:
+      title: SkuUpdateRequest
+      type: object
+      description: |-
+        Request data to update a SKU on a Site's NICo Core service.
+        At least one of description, schemaVersion, deviceType, or components must be provided.
+      properties:
+        siteId:
+          type: string
+          format: uuid
+          description: ID of the Site that owns the SKU
+        description:
+          type: string
+          description: Replacement SKU description
+        schemaVersion:
+          type: integer
+          format: uint32
+          minimum: 1
+          description: Replacement Core SKU schema version
+        deviceType:
+          type: string
+          description: Replacement device type identifier
+        components:
+          $ref: '#/components/schemas/SkuComponents'
+      required:
+        - siteId
+    SkuDeleteRequest:
+      title: SkuDeleteRequest
+      type: object
+      description: Request data to delete a SKU from a Site's NICo Core service.
+      properties:
+        siteId:
+          type: string
+          format: uuid
+          description: ID of the Site that owns the SKU
+      required:
+        - siteId
+    SkuMutationResponse:
+      title: SkuMutationResponse
+      type: object
+      description: Core-backed SKU returned after a create or update operation.
+      properties:
+        id:
+          type: string
+          description: Unique SKU identifier
+        siteId:
+          type: string
+          format: uuid
+          description: ID of the Site that owns the SKU
+        description:
+          type: string
+          description: Human-readable SKU description
+        schemaVersion:
+          type: integer
+          format: uint32
+          description: Core SKU schema version
+        deviceType:
+          type:
+            - string
+            - 'null'
+          description: Optional device type identifier
+        associatedMachineIds:
+          type: array
+          description: Machine IDs currently associated with the SKU
+          items:
+            type: string
+        components:
+          $ref: '#/components/schemas/SkuComponents'
+        created:
+          type:
+            - string
+            - 'null'
+          format: date-time
+          description: Core creation timestamp when available
+      required:
+        - id
+        - siteId
+        - description
+        - schemaVersion
+        - associatedMachineIds
+        - components
     SkuComponents:
       title: SkuComponents
       type: object
@@ -22541,10 +22733,8 @@ components:
           items:
             $ref: '#/components/schemas/SkuInfinibandDevice'
         tpm:
-          type: array
-          description: TPM components
-          items:
-            $ref: '#/components/schemas/SkuTpm'
+          $ref: '#/components/schemas/SkuTpm'
+          description: TPM component
     SkuCpu:
       title: SkuCpu
       type: object
@@ -22628,6 +22818,9 @@ components:
         model:
           type: string
           description: Model of the chassis
+        architecture:
+          type: string
+          description: Architecture of the chassis
     SkuEthernetDevice:
       title: SkuEthernetDevice
       type: object
@@ -22643,6 +22836,9 @@ components:
           type: integer
           format: uint32
           description: Number of ethernet devices present
+        isConnected:
+          type: boolean
+          description: Whether the ethernet device is connected
     SkuInfinibandDevice:
       title: SkuInfinibandDevice
       type: object
@@ -22658,6 +22854,12 @@ components:
           type: integer
           format: uint32
           description: Number of infiniband devices present
+        inactiveDevices:
+          type: array
+          description: Zero-based indexes of inactive devices
+          items:
+            type: integer
+            format: uint32
     SkuTpm:
       title: SkuTpm
       type: object
