@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	corev1 "github.com/NVIDIA/infra-controller/rest-api/proto/core/gen/v1"
+	validation "github.com/go-ozzo/ozzo-validation/v4"
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -71,6 +72,37 @@ func TestAPISkuUpdateRequest_ApplyToProto(t *testing.T) {
 func TestAPISkuUpdateRequest_ValidateRequiresChange(t *testing.T) {
 	req := APISkuUpdateRequest{SiteID: uuid.NewString()}
 	assert.Error(t, req.Validate())
+}
+
+func TestAPISkuUpdateRequest_ValidateAggregatesErrors(t *testing.T) {
+	zero := uint32(0)
+	tests := []struct {
+		name         string
+		req          APISkuUpdateRequest
+		expectedKeys []string
+	}{
+		{
+			name:         "invalid site and schema version",
+			req:          APISkuUpdateRequest{SiteID: "not-a-uuid", SchemaVersion: &zero},
+			expectedKeys: []string{"siteId", "schemaVersion"},
+		},
+		{
+			name:         "invalid site and no mutable field",
+			req:          APISkuUpdateRequest{SiteID: "not-a-uuid"},
+			expectedKeys: []string{"siteId", "request"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := tt.req.Validate()
+			validationErrors, ok := err.(validation.Errors)
+			require.True(t, ok, "expected validation.Errors, got %T", err)
+			for _, key := range tt.expectedKeys {
+				assert.Contains(t, validationErrors, key)
+			}
+		})
+	}
 }
 
 func TestAPISkuDeleteRequest_Validate(t *testing.T) {

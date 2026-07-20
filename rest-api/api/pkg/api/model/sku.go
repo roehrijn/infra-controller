@@ -105,16 +105,45 @@ func (r APISkuCreateRequest) ToProto() *corev1.SkuList {
 
 // Validate checks the update request and requires at least one mutable field.
 func (r APISkuUpdateRequest) Validate() error {
-	if r.SchemaVersion != nil && *r.SchemaVersion == 0 {
-		return validation.Errors{"schemaVersion": validation.NewError("validation_min", "schemaVersion must be greater than zero")}
-	}
+	validationErrors := validation.Errors{}
 	if err := validation.ValidateStruct(&r,
 		validation.Field(&r.SiteID,
 			validation.Required.Error(validationErrorValueRequired),
 			validationis.UUID.Error(validationErrorInvalidUUID)),
+		validation.Field(&r.SchemaVersion, validation.By(r.validateSchemaVersion)),
 	); err != nil {
-		return err
+		fieldErrors, ok := err.(validation.Errors)
+		if !ok {
+			return err
+		}
+		for field, fieldErr := range fieldErrors {
+			validationErrors[field] = fieldErr
+		}
 	}
+	if err := validation.By(r.validateHasMutableField).Validate(r); err != nil {
+		fieldErrors, ok := err.(validation.Errors)
+		if !ok {
+			return err
+		}
+		for field, fieldErr := range fieldErrors {
+			validationErrors[field] = fieldErr
+		}
+	}
+	if len(validationErrors) > 0 {
+		return validationErrors
+	}
+	return nil
+}
+
+func (r APISkuUpdateRequest) validateSchemaVersion(value interface{}) error {
+	schemaVersion, ok := value.(*uint32)
+	if ok && schemaVersion != nil && *schemaVersion == 0 {
+		return validation.NewError("validation_min", "schemaVersion must be greater than zero")
+	}
+	return nil
+}
+
+func (r APISkuUpdateRequest) validateHasMutableField(interface{}) error {
 	if r.Description == nil && r.SchemaVersion == nil && r.DeviceType == nil && r.Components == nil {
 		return validation.Errors{"request": validation.NewError("validation_required", "at least one mutable field is required")}
 	}
