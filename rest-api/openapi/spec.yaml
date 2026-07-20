@@ -168,7 +168,7 @@ tags:
     description: |-
       SKU (Stock Keeping Unit) defines one or more hardware configurations or Machine Bill of Materials (BOM).
 
-      SKUs are automatically derived from machine hardware characteristics and used to group similar machines. SKUs are read-only and managed by the system.
+      SKUs group similar machines by their hardware characteristics. Most SKUs are managed by the system, but Provider Admins can create, update, and delete SKUs for a Site.
   - name: InfiniBand Partition
     x-displayName: InfiniBand Partition
     description: |-
