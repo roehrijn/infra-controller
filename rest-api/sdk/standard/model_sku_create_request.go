@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 /*
 NVIDIA Infra Controller REST API
 
@@ -30,8 +33,8 @@ type SkuCreateRequest struct {
 	// Core SKU schema version
 	SchemaVersion int32 `json:"schemaVersion"`
 	// Optional device type identifier
-	DeviceType NullableString `json:"deviceType,omitempty"`
-	Components SkuComponents  `json:"components"`
+	DeviceType NullableString        `json:"deviceType,omitempty"`
+	Components SkuMutationComponents `json:"components"`
 }
 
 type _SkuCreateRequest SkuCreateRequest
@@ -40,7 +43,7 @@ type _SkuCreateRequest SkuCreateRequest
 // This constructor will assign default values to properties that have it defined,
 // and makes sure properties required by API are set, but the set of arguments
 // will change when the set of required properties is changed
-func NewSkuCreateRequest(siteId string, id string, schemaVersion int32, components SkuComponents) *SkuCreateRequest {
+func NewSkuCreateRequest(siteId string, id string, schemaVersion int32, components SkuMutationComponents) *SkuCreateRequest {
 	this := SkuCreateRequest{}
 	this.SiteId = siteId
 	this.Id = id
@@ -205,9 +208,9 @@ func (o *SkuCreateRequest) UnsetDeviceType() {
 }
 
 // GetComponents returns the Components field value
-func (o *SkuCreateRequest) GetComponents() SkuComponents {
+func (o *SkuCreateRequest) GetComponents() SkuMutationComponents {
 	if o == nil {
-		var ret SkuComponents
+		var ret SkuMutationComponents
 		return ret
 	}
 
@@ -216,7 +219,7 @@ func (o *SkuCreateRequest) GetComponents() SkuComponents {
 
 // GetComponentsOk returns a tuple with the Components field value
 // and a boolean to check if the value has been set.
-func (o *SkuCreateRequest) GetComponentsOk() (*SkuComponents, bool) {
+func (o *SkuCreateRequest) GetComponentsOk() (*SkuMutationComponents, bool) {
 	if o == nil {
 		return nil, false
 	}
@@ -224,7 +227,7 @@ func (o *SkuCreateRequest) GetComponentsOk() (*SkuComponents, bool) {
 }
 
 // SetComponents sets field value
-func (o *SkuCreateRequest) SetComponents(v SkuComponents) {
+func (o *SkuCreateRequest) SetComponents(v SkuMutationComponents) {
 	o.Components = v
 }
 

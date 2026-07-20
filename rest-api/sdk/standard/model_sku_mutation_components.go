@@ -17,11 +17,11 @@ import (
 	"encoding/json"
 )
 
-// checks if the SkuComponents type satisfies the MappedNullable interface at compile time
-var _ MappedNullable = &SkuComponents{}
+// checks if the SkuMutationComponents type satisfies the MappedNullable interface at compile time
+var _ MappedNullable = &SkuMutationComponents{}
 
-// SkuComponents Hardware components that make up a SKU
-type SkuComponents struct {
+// SkuMutationComponents Hardware components accepted and returned by SKU mutation endpoints
+type SkuMutationComponents struct {
 	// CPU components
 	Cpus []SkuCpu `json:"cpus,omitempty"`
 	// GPU components
@@ -36,29 +36,29 @@ type SkuComponents struct {
 	EthernetDevices []SkuEthernetDevice `json:"ethernetDevices,omitempty"`
 	// Infiniband device components
 	InfinibandDevices []SkuInfinibandDevice `json:"infinibandDevices,omitempty"`
-	// TPM components
-	Tpm []SkuTpm `json:"tpm,omitempty"`
+	// TPM component
+	Tpm *SkuTpm `json:"tpm,omitempty"`
 }
 
-// NewSkuComponents instantiates a new SkuComponents object
+// NewSkuMutationComponents instantiates a new SkuMutationComponents object
 // This constructor will assign default values to properties that have it defined,
 // and makes sure properties required by API are set, but the set of arguments
 // will change when the set of required properties is changed
-func NewSkuComponents() *SkuComponents {
-	this := SkuComponents{}
+func NewSkuMutationComponents() *SkuMutationComponents {
+	this := SkuMutationComponents{}
 	return &this
 }
 
-// NewSkuComponentsWithDefaults instantiates a new SkuComponents object
+// NewSkuMutationComponentsWithDefaults instantiates a new SkuMutationComponents object
 // This constructor will only assign default values to properties that have it defined,
 // but it doesn't guarantee that properties required by API are set
-func NewSkuComponentsWithDefaults() *SkuComponents {
-	this := SkuComponents{}
+func NewSkuMutationComponentsWithDefaults() *SkuMutationComponents {
+	this := SkuMutationComponents{}
 	return &this
 }
 
 // GetCpus returns the Cpus field value if set, zero value otherwise.
-func (o *SkuComponents) GetCpus() []SkuCpu {
+func (o *SkuMutationComponents) GetCpus() []SkuCpu {
 	if o == nil || IsNil(o.Cpus) {
 		var ret []SkuCpu
 		return ret
@@ -68,7 +68,7 @@ func (o *SkuComponents) GetCpus() []SkuCpu {
 
 // GetCpusOk returns a tuple with the Cpus field value if set, nil otherwise
 // and a boolean to check if the value has been set.
-func (o *SkuComponents) GetCpusOk() ([]SkuCpu, bool) {
+func (o *SkuMutationComponents) GetCpusOk() ([]SkuCpu, bool) {
 	if o == nil || IsNil(o.Cpus) {
 		return nil, false
 	}
@@ -76,7 +76,7 @@ func (o *SkuComponents) GetCpusOk() ([]SkuCpu, bool) {
 }
 
 // HasCpus returns a boolean if a field has been set.
-func (o *SkuComponents) HasCpus() bool {
+func (o *SkuMutationComponents) HasCpus() bool {
 	if o != nil && !IsNil(o.Cpus) {
 		return true
 	}
@@ -85,12 +85,12 @@ func (o *SkuComponents) HasCpus() bool {
 }
 
 // SetCpus gets a reference to the given []SkuCpu and assigns it to the Cpus field.
-func (o *SkuComponents) SetCpus(v []SkuCpu) {
+func (o *SkuMutationComponents) SetCpus(v []SkuCpu) {
 	o.Cpus = v
 }
 
 // GetGpus returns the Gpus field value if set, zero value otherwise.
-func (o *SkuComponents) GetGpus() []SkuGpu {
+func (o *SkuMutationComponents) GetGpus() []SkuGpu {
 	if o == nil || IsNil(o.Gpus) {
 		var ret []SkuGpu
 		return ret
@@ -100,7 +100,7 @@ func (o *SkuComponents) GetGpus() []SkuGpu {
 
 // GetGpusOk returns a tuple with the Gpus field value if set, nil otherwise
 // and a boolean to check if the value has been set.
-func (o *SkuComponents) GetGpusOk() ([]SkuGpu, bool) {
+func (o *SkuMutationComponents) GetGpusOk() ([]SkuGpu, bool) {
 	if o == nil || IsNil(o.Gpus) {
 		return nil, false
 	}
@@ -108,7 +108,7 @@ func (o *SkuComponents) GetGpusOk() ([]SkuGpu, bool) {
 }
 
 // HasGpus returns a boolean if a field has been set.
-func (o *SkuComponents) HasGpus() bool {
+func (o *SkuMutationComponents) HasGpus() bool {
 	if o != nil && !IsNil(o.Gpus) {
 		return true
 	}
@@ -117,12 +117,12 @@ func (o *SkuComponents) HasGpus() bool {
 }
 
 // SetGpus gets a reference to the given []SkuGpu and assigns it to the Gpus field.
-func (o *SkuComponents) SetGpus(v []SkuGpu) {
+func (o *SkuMutationComponents) SetGpus(v []SkuGpu) {
 	o.Gpus = v
 }
 
 // GetMemory returns the Memory field value if set, zero value otherwise.
-func (o *SkuComponents) GetMemory() []SkuMemory {
+func (o *SkuMutationComponents) GetMemory() []SkuMemory {
 	if o == nil || IsNil(o.Memory) {
 		var ret []SkuMemory
 		return ret
@@ -132,7 +132,7 @@ func (o *SkuComponents) GetMemory() []SkuMemory {
 
 // GetMemoryOk returns a tuple with the Memory field value if set, nil otherwise
 // and a boolean to check if the value has been set.
-func (o *SkuComponents) GetMemoryOk() ([]SkuMemory, bool) {
+func (o *SkuMutationComponents) GetMemoryOk() ([]SkuMemory, bool) {
 	if o == nil || IsNil(o.Memory) {
 		return nil, false
 	}
@@ -140,7 +140,7 @@ func (o *SkuComponents) GetMemoryOk() ([]SkuMemory, bool) {
 }
 
 // HasMemory returns a boolean if a field has been set.
-func (o *SkuComponents) HasMemory() bool {
+func (o *SkuMutationComponents) HasMemory() bool {
 	if o != nil && !IsNil(o.Memory) {
 		return true
 	}
@@ -149,12 +149,12 @@ func (o *SkuComponents) HasMemory() bool {
 }
 
 // SetMemory gets a reference to the given []SkuMemory and assigns it to the Memory field.
-func (o *SkuComponents) SetMemory(v []SkuMemory) {
+func (o *SkuMutationComponents) SetMemory(v []SkuMemory) {
 	o.Memory = v
 }
 
 // GetStorage returns the Storage field value if set, zero value otherwise.
-func (o *SkuComponents) GetStorage() []SkuStorage {
+func (o *SkuMutationComponents) GetStorage() []SkuStorage {
 	if o == nil || IsNil(o.Storage) {
 		var ret []SkuStorage
 		return ret
@@ -164,7 +164,7 @@ func (o *SkuComponents) GetStorage() []SkuStorage {
 
 // GetStorageOk returns a tuple with the Storage field value if set, nil otherwise
 // and a boolean to check if the value has been set.
-func (o *SkuComponents) GetStorageOk() ([]SkuStorage, bool) {
+func (o *SkuMutationComponents) GetStorageOk() ([]SkuStorage, bool) {
 	if o == nil || IsNil(o.Storage) {
 		return nil, false
 	}
@@ -172,7 +172,7 @@ func (o *SkuComponents) GetStorageOk() ([]SkuStorage, bool) {
 }
 
 // HasStorage returns a boolean if a field has been set.
-func (o *SkuComponents) HasStorage() bool {
+func (o *SkuMutationComponents) HasStorage() bool {
 	if o != nil && !IsNil(o.Storage) {
 		return true
 	}
@@ -181,12 +181,12 @@ func (o *SkuComponents) HasStorage() bool {
 }
 
 // SetStorage gets a reference to the given []SkuStorage and assigns it to the Storage field.
-func (o *SkuComponents) SetStorage(v []SkuStorage) {
+func (o *SkuMutationComponents) SetStorage(v []SkuStorage) {
 	o.Storage = v
 }
 
 // GetChassis returns the Chassis field value if set, zero value otherwise.
-func (o *SkuComponents) GetChassis() SkuChassis {
+func (o *SkuMutationComponents) GetChassis() SkuChassis {
 	if o == nil || IsNil(o.Chassis) {
 		var ret SkuChassis
 		return ret
@@ -196,7 +196,7 @@ func (o *SkuComponents) GetChassis() SkuChassis {
 
 // GetChassisOk returns a tuple with the Chassis field value if set, nil otherwise
 // and a boolean to check if the value has been set.
-func (o *SkuComponents) GetChassisOk() (*SkuChassis, bool) {
+func (o *SkuMutationComponents) GetChassisOk() (*SkuChassis, bool) {
 	if o == nil || IsNil(o.Chassis) {
 		return nil, false
 	}
@@ -204,7 +204,7 @@ func (o *SkuComponents) GetChassisOk() (*SkuChassis, bool) {
 }
 
 // HasChassis returns a boolean if a field has been set.
-func (o *SkuComponents) HasChassis() bool {
+func (o *SkuMutationComponents) HasChassis() bool {
 	if o != nil && !IsNil(o.Chassis) {
 		return true
 	}
@@ -213,12 +213,12 @@ func (o *SkuComponents) HasChassis() bool {
 }
 
 // SetChassis gets a reference to the given SkuChassis and assigns it to the Chassis field.
-func (o *SkuComponents) SetChassis(v SkuChassis) {
+func (o *SkuMutationComponents) SetChassis(v SkuChassis) {
 	o.Chassis = &v
 }
 
 // GetEthernetDevices returns the EthernetDevices field value if set, zero value otherwise.
-func (o *SkuComponents) GetEthernetDevices() []SkuEthernetDevice {
+func (o *SkuMutationComponents) GetEthernetDevices() []SkuEthernetDevice {
 	if o == nil || IsNil(o.EthernetDevices) {
 		var ret []SkuEthernetDevice
 		return ret
@@ -228,7 +228,7 @@ func (o *SkuComponents) GetEthernetDevices() []SkuEthernetDevice {
 
 // GetEthernetDevicesOk returns a tuple with the EthernetDevices field value if set, nil otherwise
 // and a boolean to check if the value has been set.
-func (o *SkuComponents) GetEthernetDevicesOk() ([]SkuEthernetDevice, bool) {
+func (o *SkuMutationComponents) GetEthernetDevicesOk() ([]SkuEthernetDevice, bool) {
 	if o == nil || IsNil(o.EthernetDevices) {
 		return nil, false
 	}
@@ -236,7 +236,7 @@ func (o *SkuComponents) GetEthernetDevicesOk() ([]SkuEthernetDevice, bool) {
 }
 
 // HasEthernetDevices returns a boolean if a field has been set.
-func (o *SkuComponents) HasEthernetDevices() bool {
+func (o *SkuMutationComponents) HasEthernetDevices() bool {
 	if o != nil && !IsNil(o.EthernetDevices) {
 		return true
 	}
@@ -245,12 +245,12 @@ func (o *SkuComponents) HasEthernetDevices() bool {
 }
 
 // SetEthernetDevices gets a reference to the given []SkuEthernetDevice and assigns it to the EthernetDevices field.
-func (o *SkuComponents) SetEthernetDevices(v []SkuEthernetDevice) {
+func (o *SkuMutationComponents) SetEthernetDevices(v []SkuEthernetDevice) {
 	o.EthernetDevices = v
 }
 
 // GetInfinibandDevices returns the InfinibandDevices field value if set, zero value otherwise.
-func (o *SkuComponents) GetInfinibandDevices() []SkuInfinibandDevice {
+func (o *SkuMutationComponents) GetInfinibandDevices() []SkuInfinibandDevice {
 	if o == nil || IsNil(o.InfinibandDevices) {
 		var ret []SkuInfinibandDevice
 		return ret
@@ -260,7 +260,7 @@ func (o *SkuComponents) GetInfinibandDevices() []SkuInfinibandDevice {
 
 // GetInfinibandDevicesOk returns a tuple with the InfinibandDevices field value if set, nil otherwise
 // and a boolean to check if the value has been set.
-func (o *SkuComponents) GetInfinibandDevicesOk() ([]SkuInfinibandDevice, bool) {
+func (o *SkuMutationComponents) GetInfinibandDevicesOk() ([]SkuInfinibandDevice, bool) {
 	if o == nil || IsNil(o.InfinibandDevices) {
 		return nil, false
 	}
@@ -268,7 +268,7 @@ func (o *SkuComponents) GetInfinibandDevicesOk() ([]SkuInfinibandDevice, bool) {
 }
 
 // HasInfinibandDevices returns a boolean if a field has been set.
-func (o *SkuComponents) HasInfinibandDevices() bool {
+func (o *SkuMutationComponents) HasInfinibandDevices() bool {
 	if o != nil && !IsNil(o.InfinibandDevices) {
 		return true
 	}
@@ -277,22 +277,22 @@ func (o *SkuComponents) HasInfinibandDevices() bool {
 }
 
 // SetInfinibandDevices gets a reference to the given []SkuInfinibandDevice and assigns it to the InfinibandDevices field.
-func (o *SkuComponents) SetInfinibandDevices(v []SkuInfinibandDevice) {
+func (o *SkuMutationComponents) SetInfinibandDevices(v []SkuInfinibandDevice) {
 	o.InfinibandDevices = v
 }
 
 // GetTpm returns the Tpm field value if set, zero value otherwise.
-func (o *SkuComponents) GetTpm() []SkuTpm {
+func (o *SkuMutationComponents) GetTpm() SkuTpm {
 	if o == nil || IsNil(o.Tpm) {
-		var ret []SkuTpm
+		var ret SkuTpm
 		return ret
 	}
-	return o.Tpm
+	return *o.Tpm
 }
 
 // GetTpmOk returns a tuple with the Tpm field value if set, nil otherwise
 // and a boolean to check if the value has been set.
-func (o *SkuComponents) GetTpmOk() ([]SkuTpm, bool) {
+func (o *SkuMutationComponents) GetTpmOk() (*SkuTpm, bool) {
 	if o == nil || IsNil(o.Tpm) {
 		return nil, false
 	}
@@ -300,7 +300,7 @@ func (o *SkuComponents) GetTpmOk() ([]SkuTpm, bool) {
 }
 
 // HasTpm returns a boolean if a field has been set.
-func (o *SkuComponents) HasTpm() bool {
+func (o *SkuMutationComponents) HasTpm() bool {
 	if o != nil && !IsNil(o.Tpm) {
 		return true
 	}
@@ -308,12 +308,12 @@ func (o *SkuComponents) HasTpm() bool {
 	return false
 }
 
-// SetTpm gets a reference to the given []SkuTpm and assigns it to the Tpm field.
-func (o *SkuComponents) SetTpm(v []SkuTpm) {
-	o.Tpm = v
+// SetTpm gets a reference to the given SkuTpm and assigns it to the Tpm field.
+func (o *SkuMutationComponents) SetTpm(v SkuTpm) {
+	o.Tpm = &v
 }
 
-func (o SkuComponents) MarshalJSON() ([]byte, error) {
+func (o SkuMutationComponents) MarshalJSON() ([]byte, error) {
 	toSerialize, err := o.ToMap()
 	if err != nil {
 		return []byte{}, err
@@ -321,7 +321,7 @@ func (o SkuComponents) MarshalJSON() ([]byte, error) {
 	return json.Marshal(toSerialize)
 }
 
-func (o SkuComponents) ToMap() (map[string]interface{}, error) {
+func (o SkuMutationComponents) ToMap() (map[string]interface{}, error) {
 	toSerialize := map[string]interface{}{}
 	if !IsNil(o.Cpus) {
 		toSerialize["cpus"] = o.Cpus
@@ -350,38 +350,38 @@ func (o SkuComponents) ToMap() (map[string]interface{}, error) {
 	return toSerialize, nil
 }
 
-type NullableSkuComponents struct {
-	value *SkuComponents
+type NullableSkuMutationComponents struct {
+	value *SkuMutationComponents
 	isSet bool
 }
 
-func (v NullableSkuComponents) Get() *SkuComponents {
+func (v NullableSkuMutationComponents) Get() *SkuMutationComponents {
 	return v.value
 }
 
-func (v *NullableSkuComponents) Set(val *SkuComponents) {
+func (v *NullableSkuMutationComponents) Set(val *SkuMutationComponents) {
 	v.value = val
 	v.isSet = true
 }
 
-func (v NullableSkuComponents) IsSet() bool {
+func (v NullableSkuMutationComponents) IsSet() bool {
 	return v.isSet
 }
 
-func (v *NullableSkuComponents) Unset() {
+func (v *NullableSkuMutationComponents) Unset() {
 	v.value = nil
 	v.isSet = false
 }
 
-func NewNullableSkuComponents(val *SkuComponents) *NullableSkuComponents {
-	return &NullableSkuComponents{value: val, isSet: true}
+func NewNullableSkuMutationComponents(val *SkuMutationComponents) *NullableSkuMutationComponents {
+	return &NullableSkuMutationComponents{value: val, isSet: true}
 }
 
-func (v NullableSkuComponents) MarshalJSON() ([]byte, error) {
+func (v NullableSkuMutationComponents) MarshalJSON() ([]byte, error) {
 	return json.Marshal(v.value)
 }
 
-func (v *NullableSkuComponents) UnmarshalJSON(src []byte) error {
+func (v *NullableSkuMutationComponents) UnmarshalJSON(src []byte) error {
 	v.isSet = true
 	return json.Unmarshal(src, &v.value)
 }

@@ -22610,7 +22610,7 @@ components:
             - 'null'
           description: Optional device type identifier
         components:
-          $ref: '#/components/schemas/SkuComponents'
+          $ref: '#/components/schemas/SkuMutationComponents'
       required:
         - siteId
         - id
@@ -22639,7 +22639,7 @@ components:
           type: string
           description: Replacement device type identifier
         components:
-          $ref: '#/components/schemas/SkuComponents'
+          $ref: '#/components/schemas/SkuMutationComponents'
       required:
         - siteId
     SkuDeleteRequest:
@@ -22683,7 +22683,7 @@ components:
           items:
             type: string
         components:
-          $ref: '#/components/schemas/SkuComponents'
+          $ref: '#/components/schemas/SkuMutationComponents'
         created:
           type:
             - string
@@ -22701,6 +22701,49 @@ components:
       title: SkuComponents
       type: object
       description: Hardware components that make up a SKU
+      properties:
+        cpus:
+          type: array
+          description: CPU components
+          items:
+            $ref: '#/components/schemas/SkuCpu'
+        gpus:
+          type: array
+          description: GPU components
+          items:
+            $ref: '#/components/schemas/SkuGpu'
+        memory:
+          type: array
+          description: Memory components
+          items:
+            $ref: '#/components/schemas/SkuMemory'
+        storage:
+          type: array
+          description: Storage components
+          items:
+            $ref: '#/components/schemas/SkuStorage'
+        chassis:
+          $ref: '#/components/schemas/SkuChassis'
+          description: Chassis component
+        ethernetDevices:
+          type: array
+          description: Ethernet device components
+          items:
+            $ref: '#/components/schemas/SkuEthernetDevice'
+        infinibandDevices:
+          type: array
+          description: Infiniband device components
+          items:
+            $ref: '#/components/schemas/SkuInfinibandDevice'
+        tpm:
+          type: array
+          description: TPM components
+          items:
+            $ref: '#/components/schemas/SkuTpm'
+    SkuMutationComponents:
+      title: SkuMutationComponents
+      type: object
+      description: Hardware components accepted and returned by SKU mutation endpoints
       properties:
         cpus:
           type: array

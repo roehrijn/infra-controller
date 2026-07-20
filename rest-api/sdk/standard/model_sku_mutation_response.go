@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 /*
 NVIDIA Infra Controller REST API
 
@@ -33,8 +36,8 @@ type SkuMutationResponse struct {
 	// Optional device type identifier
 	DeviceType NullableString `json:"deviceType,omitempty"`
 	// Machine IDs currently associated with the SKU
-	AssociatedMachineIds []string      `json:"associatedMachineIds"`
-	Components           SkuComponents `json:"components"`
+	AssociatedMachineIds []string              `json:"associatedMachineIds"`
+	Components           SkuMutationComponents `json:"components"`
 	// Core creation timestamp when available
 	Created NullableTime `json:"created,omitempty"`
 }
@@ -45,7 +48,7 @@ type _SkuMutationResponse SkuMutationResponse
 // This constructor will assign default values to properties that have it defined,
 // and makes sure properties required by API are set, but the set of arguments
 // will change when the set of required properties is changed
-func NewSkuMutationResponse(id string, siteId string, description string, schemaVersion int32, associatedMachineIds []string, components SkuComponents) *SkuMutationResponse {
+func NewSkuMutationResponse(id string, siteId string, description string, schemaVersion int32, associatedMachineIds []string, components SkuMutationComponents) *SkuMutationResponse {
 	this := SkuMutationResponse{}
 	this.Id = id
 	this.SiteId = siteId
@@ -228,9 +231,9 @@ func (o *SkuMutationResponse) SetAssociatedMachineIds(v []string) {
 }
 
 // GetComponents returns the Components field value
-func (o *SkuMutationResponse) GetComponents() SkuComponents {
+func (o *SkuMutationResponse) GetComponents() SkuMutationComponents {
 	if o == nil {
-		var ret SkuComponents
+		var ret SkuMutationComponents
 		return ret
 	}
 
@@ -239,7 +242,7 @@ func (o *SkuMutationResponse) GetComponents() SkuComponents {
 
 // GetComponentsOk returns a tuple with the Components field value
 // and a boolean to check if the value has been set.
-func (o *SkuMutationResponse) GetComponentsOk() (*SkuComponents, bool) {
+func (o *SkuMutationResponse) GetComponentsOk() (*SkuMutationComponents, bool) {
 	if o == nil {
 		return nil, false
 	}
@@ -247,7 +250,7 @@ func (o *SkuMutationResponse) GetComponentsOk() (*SkuComponents, bool) {
 }
 
 // SetComponents sets field value
-func (o *SkuMutationResponse) SetComponents(v SkuComponents) {
+func (o *SkuMutationResponse) SetComponents(v SkuMutationComponents) {
 	o.Components = v
 }
 

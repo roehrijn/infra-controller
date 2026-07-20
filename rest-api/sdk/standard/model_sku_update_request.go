@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 /*
 NVIDIA Infra Controller REST API
 
@@ -28,8 +31,8 @@ type SkuUpdateRequest struct {
 	// Replacement Core SKU schema version
 	SchemaVersion *int32 `json:"schemaVersion,omitempty"`
 	// Replacement device type identifier
-	DeviceType *string        `json:"deviceType,omitempty"`
-	Components *SkuComponents `json:"components,omitempty"`
+	DeviceType *string                `json:"deviceType,omitempty"`
+	Components *SkuMutationComponents `json:"components,omitempty"`
 }
 
 type _SkuUpdateRequest SkuUpdateRequest
@@ -173,9 +176,9 @@ func (o *SkuUpdateRequest) SetDeviceType(v string) {
 }
 
 // GetComponents returns the Components field value if set, zero value otherwise.
-func (o *SkuUpdateRequest) GetComponents() SkuComponents {
+func (o *SkuUpdateRequest) GetComponents() SkuMutationComponents {
 	if o == nil || IsNil(o.Components) {
-		var ret SkuComponents
+		var ret SkuMutationComponents
 		return ret
 	}
 	return *o.Components
@@ -183,7 +186,7 @@ func (o *SkuUpdateRequest) GetComponents() SkuComponents {
 
 // GetComponentsOk returns a tuple with the Components field value if set, nil otherwise
 // and a boolean to check if the value has been set.
-func (o *SkuUpdateRequest) GetComponentsOk() (*SkuComponents, bool) {
+func (o *SkuUpdateRequest) GetComponentsOk() (*SkuMutationComponents, bool) {
 	if o == nil || IsNil(o.Components) {
 		return nil, false
 	}
@@ -199,8 +202,8 @@ func (o *SkuUpdateRequest) HasComponents() bool {
 	return false
 }
 
-// SetComponents gets a reference to the given SkuComponents and assigns it to the Components field.
-func (o *SkuUpdateRequest) SetComponents(v SkuComponents) {
+// SetComponents gets a reference to the given SkuMutationComponents and assigns it to the Components field.
+func (o *SkuUpdateRequest) SetComponents(v SkuMutationComponents) {
 	o.Components = &v
 }
 
