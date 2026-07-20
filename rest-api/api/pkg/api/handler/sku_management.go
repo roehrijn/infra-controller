@@ -82,8 +82,9 @@ func (h CreateSkuHandler) Handle(c echo.Context) error {
 
 	sku, apiErr := findSkuByIDViaCore(ctx, stc, siteID, ids.Ids[0])
 	if apiErr != nil {
-		logAPIError(logger, apiErr, "failed to retrieve created SKU via Core proxy")
-		return cutil.NewAPIErrorResponse(c, apiErr.Code, apiErr.Message, nil)
+		logger.Warn().Err(apiErr).Str("skuID", ids.Ids[0]).Str("siteID", siteID).
+			Msg("SKU created but post-create retrieval failed; returning request-derived response")
+		return c.JSON(http.StatusCreated, model.NewAPISkuMutationResponseFromCreateRequest(apiReq, ids.Ids[0], siteID))
 	}
 	return c.JSON(http.StatusCreated, model.NewAPISkuMutationResponse(sku, siteID))
 }

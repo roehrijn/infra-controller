@@ -6,6 +6,7 @@ package handler
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -50,6 +51,28 @@ func TestCreateSkuHandler_ProxiesCreateAndReturnsCreatedSku(t *testing.T) {
 	assert.Equal(t, req.ID, response.ID)
 	assert.Equal(t, fixture.siteID, response.SiteID)
 	assert.Empty(t, response.AssociatedMachineIDs)
+}
+
+func TestCreateSkuHandler_ReturnsCreatedWhenPostCreateFetchFails(t *testing.T) {
+	fixture := newSkuManagementFixtureWithFindError(t, []string{authz.ProviderAdminRole}, errors.New("post-create fetch failed"))
+	req := validSkuCreateRequest(fixture.siteID)
+
+	rec := fixture.request(t, http.MethodPost, "", req, fixture.createHandler.Handle)
+	require.Equal(t, http.StatusCreated, rec.Code, rec.Body.String())
+	require.Len(t, fixture.requests, 2)
+	assert.Equal(t, createSkuMethod, fixture.requests[0].FullMethod)
+	assert.Equal(t, findSkusByIDsMethod, fixture.requests[1].FullMethod)
+
+	var response model.APISkuMutationResponse
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &response))
+	assert.Equal(t, req.ID, response.ID)
+	assert.Equal(t, fixture.siteID, response.SiteID)
+	assert.Equal(t, req.Description, response.Description)
+	assert.Equal(t, req.SchemaVersion, response.SchemaVersion)
+	assert.Equal(t, req.DeviceType, response.DeviceType)
+	assert.Equal(t, req.Components, response.Components)
+	assert.Empty(t, response.AssociatedMachineIDs)
+	assert.Nil(t, response.Created)
 }
 
 func TestUpdateSkuHandler_MergesPatchBeforeReplace(t *testing.T) {
@@ -107,6 +130,10 @@ type skuManagementFixture struct {
 }
 
 func newSkuManagementFixture(t *testing.T, roles []string) *skuManagementFixture {
+	return newSkuManagementFixtureWithFindError(t, roles, nil)
+}
+
+func newSkuManagementFixtureWithFindError(t *testing.T, roles []string, findErr error) *skuManagementFixture {
 	t.Helper()
 	dbSession := common.TestInitDB(t)
 	t.Cleanup(dbSession.Close)
@@ -127,7 +154,11 @@ func newSkuManagementFixture(t *testing.T, roles []string) *skuManagementFixture
 	client := &tmocks.Client{}
 	existing := existingSkuProto()
 	fixture.addWorkflow(t, client, createSkuMethod, &corev1.SkuIdList{Ids: []string{"sku-1"}})
-	fixture.addWorkflow(t, client, findSkusByIDsMethod, &corev1.SkuList{Skus: []*corev1.Sku{existing}})
+	if findErr == nil {
+		fixture.addWorkflow(t, client, findSkusByIDsMethod, &corev1.SkuList{Skus: []*corev1.Sku{existing}})
+	} else {
+		fixture.addWorkflowError(client, findSkusByIDsMethod, findErr)
+	}
 	fixture.addWorkflow(t, client, replaceSkuMethod, existing)
 	fixture.addWorkflow(t, client, deleteSkuMethod, nil)
 
@@ -137,6 +168,20 @@ func newSkuManagementFixture(t *testing.T, roles []string) *skuManagementFixture
 	fixture.updateHandler = NewUpdateSkuHandler(dbSession, scp)
 	fixture.deleteHandler = NewDeleteSkuHandler(dbSession, scp)
 	return fixture
+}
+
+func (f *skuManagementFixture) addWorkflowError(client *tmocks.Client, method string, getErr error) {
+	run := &tmocks.WorkflowRun{}
+	run.On("Get", mock.Anything, mock.Anything).Return(getErr)
+	client.On(
+		"ExecuteWorkflow",
+		mock.Anything,
+		mock.Anything,
+		coreproxy.WorkflowName,
+		mock.MatchedBy(func(req coreproxy.Request) bool { return req.FullMethod == method }),
+	).Run(func(args mock.Arguments) {
+		f.requests = append(f.requests, args.Get(3).(coreproxy.Request))
+	}).Return(run, nil).Maybe()
 }
 
 func (f *skuManagementFixture) addWorkflow(t *testing.T, client *tmocks.Client, method string, response proto.Message) {

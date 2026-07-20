@@ -175,6 +175,20 @@ func NewAPISkuMutationResponse(sku *corev1.Sku, siteID string) *APISkuMutationRe
 	return response
 }
 
+// NewAPISkuMutationResponseFromCreateRequest builds the best-known response
+// after Core accepted a create request but the post-create read failed.
+func NewAPISkuMutationResponseFromCreateRequest(req APISkuCreateRequest, skuID, siteID string) *APISkuMutationResponse {
+	return &APISkuMutationResponse{
+		ID:                   skuID,
+		SiteID:               siteID,
+		Description:          req.Description,
+		SchemaVersion:        req.SchemaVersion,
+		DeviceType:           req.DeviceType,
+		AssociatedMachineIDs: []string{},
+		Components:           req.Components,
+	}
+}
+
 // NewAPISku accepts a DB layer SKU object and returns an API layer object
 func NewAPISku(dbSku *cdbm.SKU) *APISku {
 	if dbSku == nil {
