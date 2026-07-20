@@ -22587,6 +22587,17 @@ components:
       title: SkuCreateRequest
       type: object
       description: Request data to create a SKU on a Site's NICo Core service.
+      examples:
+        - siteId: 60189e9c-7d12-438c-b9ca-6998d9c364b1
+          id: dgx-h100
+          description: DGX H100 compute node
+          schemaVersion: 4
+          deviceType: gpu-server
+          components:
+            chassis:
+              vendor: NVIDIA
+              model: DGX H100
+              architecture: x86_64
       properties:
         siteId:
           type: string
@@ -22622,6 +22633,9 @@ components:
       description: |-
         Request data to update a SKU on a Site's NICo Core service.
         At least one of description, schemaVersion, deviceType, or components must be provided.
+      examples:
+        - siteId: 60189e9c-7d12-438c-b9ca-6998d9c364b1
+          description: DGX H100 compute node with updated firmware baseline
       properties:
         siteId:
           type: string
@@ -22646,6 +22660,8 @@ components:
       title: SkuDeleteRequest
       type: object
       description: Request data to delete a SKU from a Site's NICo Core service.
+      examples:
+        - siteId: 60189e9c-7d12-438c-b9ca-6998d9c364b1
       properties:
         siteId:
           type: string
@@ -22657,6 +22673,19 @@ components:
       title: SkuMutationResponse
       type: object
       description: Core-backed SKU returned after a create or update operation.
+      examples:
+        - id: dgx-h100
+          siteId: 60189e9c-7d12-438c-b9ca-6998d9c364b1
+          description: DGX H100 compute node
+          schemaVersion: 4
+          deviceType: gpu-server
+          associatedMachineIds: []
+          components:
+            chassis:
+              vendor: NVIDIA
+              model: DGX H100
+              architecture: x86_64
+          created: '2026-07-20T14:15:22Z'
       properties:
         id:
           type: string

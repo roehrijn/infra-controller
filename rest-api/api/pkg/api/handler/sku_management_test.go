@@ -18,6 +18,9 @@ import (
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 	tmocks "go.temporal.io/sdk/mocks"
+	tp "go.temporal.io/sdk/temporal"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
 
@@ -29,6 +32,7 @@ import (
 	cutil "github.com/NVIDIA/infra-controller/rest-api/common/pkg/util"
 	cdbm "github.com/NVIDIA/infra-controller/rest-api/db/pkg/db/model"
 	corev1 "github.com/NVIDIA/infra-controller/rest-api/proto/core/gen/v1"
+	swe "github.com/NVIDIA/infra-controller/rest-api/site-workflow/pkg/error"
 )
 
 func TestCreateSkuHandler_ProxiesCreateAndReturnsCreatedSku(t *testing.T) {
@@ -98,6 +102,22 @@ func TestUpdateSkuHandler_MergesPatchBeforeReplace(t *testing.T) {
 	assert.Equal(t, "existing chassis", coreReq.Components.Chassis.Model)
 }
 
+func TestUpdateSkuHandler_ReturnsNotFoundWithoutReplace(t *testing.T) {
+	fixture := newSkuManagementFixtureWithOptions(t, []string{authz.ProviderAdminRole}, skuManagementFixtureOptions{
+		findResponse: &corev1.SkuList{},
+	})
+	description := "updated description"
+
+	rec := fixture.request(t, http.MethodPatch, "missing-sku", model.APISkuUpdateRequest{
+		SiteID:      fixture.siteID,
+		Description: &description,
+	}, fixture.updateHandler.Handle)
+	require.Equal(t, http.StatusNotFound, rec.Code, rec.Body.String())
+	assert.JSONEq(t, `{"source":"","message":"Could not find SKU with the specified ID","data":null}`, rec.Body.String())
+	require.Len(t, fixture.requests, 1)
+	assert.Equal(t, findSkusByIDsMethod, fixture.requests[0].FullMethod)
+}
+
 func TestDeleteSkuHandler_ProxiesDelete(t *testing.T) {
 	fixture := newSkuManagementFixture(t, []string{authz.ProviderAdminRole})
 
@@ -109,6 +129,23 @@ func TestDeleteSkuHandler_ProxiesDelete(t *testing.T) {
 	var coreReq corev1.SkuIdList
 	require.NoError(t, protojson.Unmarshal(fixture.requests[0].RequestJSON, &coreReq))
 	assert.Equal(t, []string{"sku-1"}, coreReq.Ids)
+}
+
+func TestDeleteSkuHandler_ReturnsCoreNotFound(t *testing.T) {
+	deleteErr := tp.NewApplicationErrorWithCause(
+		"SKU not found",
+		swe.ErrTypeNICoObjectNotFound,
+		status.Error(codes.NotFound, "SKU not found"),
+	)
+	fixture := newSkuManagementFixtureWithOptions(t, []string{authz.ProviderAdminRole}, skuManagementFixtureOptions{
+		deleteError: deleteErr,
+	})
+
+	rec := fixture.request(t, http.MethodDelete, "missing-sku", model.APISkuDeleteRequest{SiteID: fixture.siteID}, fixture.deleteHandler.Handle)
+	require.Equal(t, http.StatusNotFound, rec.Code, rec.Body.String())
+	assert.Contains(t, rec.Body.String(), "SKU not found")
+	require.Len(t, fixture.requests, 1)
+	assert.Equal(t, deleteSkuMethod, fixture.requests[0].FullMethod)
 }
 
 func TestCreateSkuHandler_RejectsTenantAdmin(t *testing.T) {
@@ -129,11 +166,21 @@ type skuManagementFixture struct {
 	requests      []coreproxy.Request
 }
 
+type skuManagementFixtureOptions struct {
+	findResponse *corev1.SkuList
+	findError    error
+	deleteError  error
+}
+
 func newSkuManagementFixture(t *testing.T, roles []string) *skuManagementFixture {
-	return newSkuManagementFixtureWithFindError(t, roles, nil)
+	return newSkuManagementFixtureWithOptions(t, roles, skuManagementFixtureOptions{})
 }
 
 func newSkuManagementFixtureWithFindError(t *testing.T, roles []string, findErr error) *skuManagementFixture {
+	return newSkuManagementFixtureWithOptions(t, roles, skuManagementFixtureOptions{findError: findErr})
+}
+
+func newSkuManagementFixtureWithOptions(t *testing.T, roles []string, options skuManagementFixtureOptions) *skuManagementFixture {
 	t.Helper()
 	dbSession := common.TestInitDB(t)
 	t.Cleanup(dbSession.Close)
@@ -154,13 +201,21 @@ func newSkuManagementFixtureWithFindError(t *testing.T, roles []string, findErr 
 	client := &tmocks.Client{}
 	existing := existingSkuProto()
 	fixture.addWorkflow(t, client, createSkuMethod, &corev1.SkuIdList{Ids: []string{"sku-1"}})
-	if findErr == nil {
-		fixture.addWorkflow(t, client, findSkusByIDsMethod, &corev1.SkuList{Skus: []*corev1.Sku{existing}})
+	if options.findError != nil {
+		fixture.addWorkflowError(client, findSkusByIDsMethod, options.findError)
 	} else {
-		fixture.addWorkflowError(client, findSkusByIDsMethod, findErr)
+		findResponse := options.findResponse
+		if findResponse == nil {
+			findResponse = &corev1.SkuList{Skus: []*corev1.Sku{existing}}
+		}
+		fixture.addWorkflow(t, client, findSkusByIDsMethod, findResponse)
 	}
 	fixture.addWorkflow(t, client, replaceSkuMethod, existing)
-	fixture.addWorkflow(t, client, deleteSkuMethod, nil)
+	if options.deleteError != nil {
+		fixture.addWorkflowError(client, deleteSkuMethod, options.deleteError)
+	} else {
+		fixture.addWorkflow(t, client, deleteSkuMethod, nil)
+	}
 
 	scp := sc.NewClientPool(nil)
 	scp.IDClientMap[site.ID.String()] = client
