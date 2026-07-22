@@ -81,9 +81,10 @@ use crate::types::{
     BlueFieldSoftwareParams, BmcPasswordProvider, ConfigPortsServiceType, DHCP_SERVER_SERVICE_NAME,
     DOCA_HBN_SERVICE_NAME, DPU_AGENT_SERVICE_NAME, DTS_SERVICE_NAME, DpfProxyDetails,
     DpuDeploymentType, DpuDeviceInfo, DpuDeviceSummary, DpuMismatch, DpuNodeInfo, DpuNodeSummary,
-    DpuPhase, DpuServiceInterfaceTemplateDefinition, DpuServiceInterfaceTemplateType, DpuSummary,
-    FMDS_SERVICE_NAME, HostDpfSnapshot, InitDpfResourcesConfig, OTEL_COLLECTOR_SERVICE_NAME,
-    ServiceConfigPortProtocol, ServiceDefinition, ServiceNADResourceType, ServiceTemplateVersion,
+    DpuPhase, DpuServiceInterfaceTemplateDefinition, DpuServiceInterfaceTemplateType,
+    DpuServiceVersion, DpuSummary, FMDS_SERVICE_NAME, HostDpfSnapshot, InitDpfResourcesConfig,
+    OTEL_COLLECTOR_SERVICE_NAME, ServiceConfigPortProtocol, ServiceDefinition,
+    ServiceNADResourceType, ServiceTemplateVersion,
 };
 use crate::watcher::DpuWatcherBuilder;
 
@@ -320,14 +321,14 @@ async fn refresh_bmc_secret_if_changed<R: K8sConfigRepository>(
     match provider.get_bmc_password().await {
         Ok(new_pw) if new_pw != last_password => {
             if let Err(e) = write_bmc_secret::<R>(repo, namespace, &new_pw).await {
-                tracing::error!("Failed to refresh BMC secret: {e}");
+                tracing::error!(error = %e, "Failed to refresh BMC secret");
                 last_password
             } else {
                 new_pw
             }
         }
         Err(e) => {
-            tracing::error!("Failed to read BMC password: {e}");
+            tracing::error!(error = %e, "Failed to read BMC password");
             last_password
         }
         _ => last_password,
@@ -1546,7 +1547,7 @@ impl<R: DpuNodeRepository, L: ResourceLabeler> DpfSdk<R, L> {
         if let Err(e) =
             DpuNodeRepository::patch(&*self.repo, node_name, &self.namespace, patch).await
         {
-            tracing::warn!("Failed to remove label from DPU node {}: {}", node_name, e);
+            tracing::warn!(node_name, error = %e, "Failed to remove label from DPU node");
         }
 
         DpuNodeRepository::delete(&*self.repo, node_name, &self.namespace).await
@@ -1656,14 +1657,15 @@ impl<R: DpuDeploymentRepository + DpuRepository, L> DpfSdk<R, L> {
                     .and_then(|l| l.get(DPU_OWNED_BY_DEPLOYMENT_LABEL));
                 let Some(owner_label) = owner_label else {
                     tracing::debug!(
-                        dpu = %cr_name,
-                        "DPU is missing {DPU_OWNED_BY_DEPLOYMENT_LABEL} label; skipping"
+                        dpu_name = %cr_name,
+                        label = DPU_OWNED_BY_DEPLOYMENT_LABEL,
+                        "DPU is missing label; skipping"
                     );
                     return None;
                 };
                 let Some(deployment) = ready_deployments.get(owner_label.as_str()) else {
                     tracing::debug!(
-                        dpu = %cr_name,
+                        dpu_name = %cr_name,
                         owner = %owner_label,
                         "DPU's owning DPUDeployment is not ready or not found; skipping"
                     );
@@ -1795,12 +1797,12 @@ impl<R: DpuRepository + DpuNodeRepository + DpuDeviceRepository, L: ResourceLabe
             if let Err(e) =
                 DpuNodeRepository::patch(&*self.repo, node_name, &self.namespace, patch).await
             {
-                tracing::warn!("Failed to remove label from DPU node {}: {}", node_name, e);
+                tracing::warn!(node_name, error = %e, "Failed to remove label from DPU node");
             }
 
             if let Err(e) = DpuNodeRepository::delete(&*self.repo, node_name, &self.namespace).await
             {
-                tracing::warn!("Failed to delete DPU node {}: {}", node_name, e);
+                tracing::warn!(node_name, error = %e, "Failed to delete DPU node");
             }
 
             // dpus[].name already has the device- prefix (set by register_dpu_node)
@@ -1808,13 +1810,17 @@ impl<R: DpuRepository + DpuNodeRepository + DpuDeviceRepository, L: ResourceLabe
                 if let Err(e) =
                     DpuDeviceRepository::delete(&*self.repo, &dpu.name, &self.namespace).await
                 {
-                    tracing::warn!("Failed to delete DPU device {}: {}", dpu.name, e);
+                    tracing::warn!(
+                        dpu_device = %dpu.name,
+                        error = %e,
+                        "Failed to delete DPU device"
+                    );
                 }
             }
         } else {
             tracing::info!(
-                "DPU node {} not found, trying to delete DPU devices",
-                node_name
+                node_name,
+                "DPU node not found, trying to delete DPU devices"
             );
         }
 
@@ -1823,7 +1829,11 @@ impl<R: DpuRepository + DpuNodeRepository + DpuDeviceRepository, L: ResourceLabe
             if let Err(e) =
                 DpuDeviceRepository::delete(&*self.repo, &cr_name, &self.namespace).await
             {
-                tracing::warn!("Failed to delete DPU device {}: {}", cr_name, e);
+                tracing::warn!(
+                    dpu_device = %cr_name,
+                    error = %e,
+                    "Failed to delete DPU device"
+                );
             }
         }
 
@@ -1842,13 +1852,17 @@ impl<R: DpuRepository + DpuNodeRepository + DpuDeviceRepository, L: ResourceLabe
         let dpf_id = node_id_from_dpu_node_cr_name(node_name);
         let cr_name = dpu_cr_name(dpu_device_name, dpf_id);
         if let Err(e) = DpuRepository::delete(&*self.repo, &cr_name, &self.namespace).await {
-            tracing::warn!("Failed to delete DPU {}: {}", cr_name, e);
+            tracing::warn!(dpu_name = %cr_name, error = %e, "Failed to delete DPU");
         }
         let device_cr_name = dpu_device_cr_name(dpu_device_name);
         if let Err(e) =
             DpuDeviceRepository::delete(&*self.repo, &device_cr_name, &self.namespace).await
         {
-            tracing::warn!("Failed to delete DPU device {}: {}", device_cr_name, e);
+            tracing::warn!(
+                dpu_device = %device_cr_name,
+                error = %e,
+                "Failed to delete DPU device"
+            );
         }
         Ok(())
     }
@@ -1869,15 +1883,19 @@ impl<R: DpuRepository + DpuNodeRepository + DpuDeviceRepository, L: ResourceLabe
         if let Err(e) =
             DpuNodeRepository::patch(&*self.repo, node_name, &self.namespace, patch).await
         {
-            tracing::warn!("Failed to remove label from DPU node {}: {}", node_name, e);
+            tracing::warn!(node_name, error = %e, "Failed to remove label from DPU node");
         }
         if let Err(e) = DpuNodeRepository::delete(&*self.repo, node_name, &self.namespace).await {
-            tracing::warn!("Failed to delete DPU node {}: {}", node_name, e);
+            tracing::warn!(node_name, error = %e, "Failed to delete DPU node");
         }
         for dpu_id in &dpu_ids {
             if let Err(e) = DpuDeviceRepository::delete(&*self.repo, dpu_id, &self.namespace).await
             {
-                tracing::warn!("Failed to delete DPU device {}: {}", dpu_id, e);
+                tracing::warn!(
+                    dpu_device = %dpu_id,
+                    error = %e,
+                    "Failed to delete DPU device"
+                );
             }
         }
         Ok(())
@@ -1986,6 +2004,118 @@ impl<R: DpuServiceTemplateRepository, L> DpfSdk<R, L> {
                 }
             })
             .collect())
+    }
+}
+
+impl<R: DpuRepository + DpuDeploymentRepository + DpuServiceTemplateRepository, L> DpfSdk<R, L> {
+    /// Resolve the installed service versions for a DPU by looking up its owning
+    /// DPUDeployment (via the `svc.dpu.nvidia.com/owned-by-dpudeployment` label on the DPU CR)
+    /// and reading each service's DPUServiceTemplate.
+    ///
+    /// Each returned [`DpuServiceVersion`] is derived per field:
+    /// - `version`: `helmChart.values.image.tag` when set and non-empty, else
+    ///   `helmChart.source.version`.
+    /// - `url` + `name`: when `helmChart.values.image.repository` is set, it is
+    ///   split at its final `/` into `url` (registry/path) and `name` (image name);
+    ///   otherwise `url` is `helmChart.source.repoURL` and `name` is
+    ///   `helmChart.source.chart`. If no name can be derived, the DPUDeployment
+    ///   service name is used.
+    pub async fn get_service_versions_for_dpu(
+        &self,
+        dpu_name: &str,
+    ) -> Result<Vec<DpuServiceVersion>, DpfError> {
+        let dpu = DpuRepository::get(&*self.repo, dpu_name, &self.namespace)
+            .await?
+            .ok_or_else(|| DpfError::InvalidState(format!("DPU CR not found: {dpu_name}")))?;
+
+        let owner_label = dpu
+            .metadata
+            .labels
+            .as_ref()
+            .and_then(|l| l.get(DPU_OWNED_BY_DEPLOYMENT_LABEL))
+            .ok_or_else(|| {
+                DpfError::InvalidState(format!(
+                    "DPU {dpu_name} is missing {DPU_OWNED_BY_DEPLOYMENT_LABEL} label"
+                ))
+            })?;
+
+        let deployment_name = owner_label
+            .strip_prefix(&format!("{}_", self.namespace))
+            .unwrap_or(owner_label.as_str());
+
+        let deployment =
+            DpuDeploymentRepository::get(&*self.repo, deployment_name, &self.namespace)
+                .await?
+                .ok_or_else(|| {
+                    DpfError::InvalidState(format!(
+                        "DPUDeployment {deployment_name} not found for DPU {dpu_name}"
+                    ))
+                })?;
+
+        let mut versions = Vec::new();
+        for (service_name, service) in &deployment.spec.services {
+            let Some(template_name) = &service.service_template else {
+                continue;
+            };
+            let Some(template) =
+                DpuServiceTemplateRepository::get(&*self.repo, template_name, &self.namespace)
+                    .await?
+            else {
+                continue;
+            };
+
+            let image_values = template
+                .spec
+                .helm_chart
+                .values
+                .as_ref()
+                .and_then(|v| v.get("image"));
+            let image_tag = image_values
+                .and_then(|img| img.get("tag"))
+                .and_then(|tag| tag.as_str())
+                .filter(|s| !s.is_empty());
+            let image_repo = image_values
+                .and_then(|img| img.get("repository"))
+                .and_then(|r| r.as_str())
+                .filter(|s| !s.is_empty());
+
+            // Version is the image tag when set, otherwise the Helm chart version.
+            // These are independent of the image repository: a template that only
+            // overrides the tag must still report that tag.
+            let version = image_tag
+                .map(str::to_string)
+                .unwrap_or_else(|| template.spec.helm_chart.source.version.clone());
+
+            // url + name: split the image repository at its final '/' when present
+            // (registry/path as url, image name as name); otherwise fall back to the
+            // Helm source repo URL and chart name.
+            let (url, mut name) = if let Some(repo) = image_repo {
+                repo.rsplit_once('/')
+                    .map(|(prefix, base)| (prefix.to_string(), base.to_string()))
+                    .unwrap_or_else(|| (String::new(), repo.to_string()))
+            } else {
+                (
+                    template.spec.helm_chart.source.repo_url.clone(),
+                    template
+                        .spec
+                        .helm_chart
+                        .source
+                        .chart
+                        .clone()
+                        .unwrap_or_default(),
+                )
+            };
+
+            // Never emit a nameless component; the DPUDeployment service name is a
+            // stable identifier when neither the image basename nor chart name is set.
+            if name.is_empty() {
+                name = service_name.clone();
+            }
+
+            versions.push(DpuServiceVersion { name, version, url });
+        }
+
+        Ok(versions)
     }
 }
 

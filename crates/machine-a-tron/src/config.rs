@@ -15,7 +15,7 @@
  * limitations under the License.
  */
 use std::collections::{BTreeMap, HashMap};
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, SocketAddrV4};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -44,19 +44,19 @@ use crate::machine_state_machine::OsImage;
 pub struct MachineATronArgs {
     #[clap(long, env = "FORGE_ROOT_CA_PATH")]
     #[clap(
-        help = "Default to FORGE_ROOT_CA_PATH environment variable or $HOME/.config/carbide_api_cli.json file."
+        help = "Default to FORGE_ROOT_CA_PATH environment variable or $HOME/.config/nico_api_cli.json file."
     )]
     pub forge_root_ca_path: Option<String>,
 
     #[clap(long, env = "CLIENT_CERT_PATH")]
     #[clap(
-        help = "Default to CLIENT_CERT_PATH environment variable or $HOME/.config/carbide_api_cli.json file."
+        help = "Default to CLIENT_CERT_PATH environment variable or $HOME/.config/nico_api_cli.json file."
     )]
     pub client_cert_path: Option<String>,
 
     #[clap(long, env = "CLIENT_KEY_PATH")]
     #[clap(
-        help = "Default to CLIENT_KEY_PATH environment variable or $HOME/.config/carbide_api_cli.json file."
+        help = "Default to CLIENT_KEY_PATH environment variable or $HOME/.config/nico_api_cli.json file."
     )]
     pub client_key_path: Option<String>,
 
@@ -85,10 +85,12 @@ pub struct MachineConfig {
         serialize_with = "as_std_duration"
     )]
     pub scout_run_interval: Duration,
-    #[serde(default = "default_template_dir")]
-    pub template_dir: String,
     pub oob_dhcp_relay_address: Ipv4Addr,
     pub admin_dhcp_relay_address: Ipv4Addr,
+    /// Relay address used when a host DHCPs directly through a plain NIC rather than a managed DPU.
+    /// If omitted, direct host DHCP falls back to `admin_dhcp_relay_address` for compatibility.
+    #[serde(default)]
+    pub host_inband_dhcp_relay_address: Option<Ipv4Addr>,
 
     #[serde(
         default = "default_run_interval_working",
@@ -126,6 +128,13 @@ pub struct MachineConfig {
 
     #[serde(default)]
     pub dpu_agent_version: Option<String>,
+}
+
+impl MachineConfig {
+    pub(crate) fn missing_host_inband_relay_for_direct_host_dhcp(&self) -> bool {
+        self.host_inband_dhcp_relay_address.is_none()
+            && (self.dpu_per_host_count == 0 || self.dpus_in_nic_mode)
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
@@ -196,6 +205,10 @@ pub struct MachineATronConfig {
     pub carbide_api_url: String,
     pub log_file: Option<String>,
     pub interface: String,
+
+    /// How machine-a-tron obtains DHCP leases for BMCs and directly attached hosts.
+    #[serde(default)]
+    pub dhcp: DhcpType,
     #[serde(default = "default_true")]
     pub tui_enabled: bool,
 
@@ -209,6 +222,10 @@ pub struct MachineATronConfig {
     /// for testing things like ssh-console.
     #[serde(default = "default_false")]
     pub mock_bmc_ssh_server: bool,
+
+    /// Opt in to an independent IPMI/SOL simulator for each IPMI-capable host BMC.
+    #[serde(default = "default_false")]
+    pub enable_ipmi_simulation: bool,
 
     /// Set this to configure the port to use when mocking a BMC SSH server. If unset and
     /// use_single_bmc_mock is true, it will pick a random port. If unset and use_single_bmc_mock
@@ -275,6 +292,42 @@ pub struct MachineATronConfig {
 
 impl MachineATronConfig {
     pub fn validate(&self) -> eyre::Result<()> {
+        if let DhcpType::UdpRelay {
+            server_address,
+            listen_address,
+            advertise_address,
+        } = self.dhcp
+        {
+            eyre::ensure!(
+                server_address.port() != 0,
+                "DHCP server address must use a nonzero UDP port"
+            );
+            eyre::ensure!(
+                !server_address.ip().is_unspecified()
+                    && !server_address.ip().is_broadcast()
+                    && !server_address.ip().is_multicast(),
+                "DHCP server address must use a concrete unicast IPv4 address"
+            );
+            eyre::ensure!(
+                listen_address.port() != 0,
+                "DHCP relay listen address must use a nonzero UDP port"
+            );
+            eyre::ensure!(
+                !listen_address.ip().is_broadcast() && !listen_address.ip().is_multicast(),
+                "DHCP relay listen address must use an unspecified or unicast IPv4 address"
+            );
+            eyre::ensure!(
+                !advertise_address.is_unspecified()
+                    && !advertise_address.is_broadcast()
+                    && !advertise_address.is_multicast(),
+                "DHCP relay advertise address must be a concrete unicast IPv4 address"
+            );
+        }
+
+        if self.enable_ipmi_simulation {
+            bmc_mock::ipmi_sim::validate_executable()?;
+        }
+
         for (rack_id, rack) in &self.racks {
             eyre::ensure!(!rack_id.as_str().is_empty(), "rack ID cannot be empty");
             eyre::ensure!(
@@ -360,6 +413,26 @@ impl MachineATronConfig {
     }
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum DhcpType {
+    Api {},
+    UdpRelay {
+        /// Destination for relayed DHCP packets.
+        server_address: SocketAddrV4,
+        /// Local UDP socket used to receive relayed DHCP replies.
+        listen_address: SocketAddrV4,
+        /// Reachable IPv4 address placed in DHCP `giaddr` for server replies.
+        advertise_address: Ipv4Addr,
+    },
+}
+
+impl Default for DhcpType {
+    fn default() -> Self {
+        Self::Api {}
+    }
+}
+
 /// A subset of the information about a HostMachine which is persisted to JSON to be recovered in
 /// subsequent runs of machine-a-tron.
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -433,10 +506,6 @@ fn default_bmc_mock_port() -> u16 {
     2000
 }
 
-fn default_template_dir() -> String {
-    String::from("dev/machine-a-tron/templates")
-}
-
 fn default_run_interval_working() -> Duration {
     Duration::from_secs(5)
 }
@@ -494,6 +563,7 @@ pub struct MachineATronContext {
     /// firmware, DPU's can mock that they already have this installed.
     pub desired_firmware_versions: Vec<DesiredFirmwareVersionEntry>,
     pub forge_api_client: ForgeApiClient,
+    pub dhcp_client: crate::dhcp_wrapper::DhcpClient,
     pub mac_address_pool: Arc<Mutex<MacAddressPool>>,
 }
 
@@ -541,7 +611,7 @@ where
 #[cfg(test)]
 mod tests {
     use carbide_test_support::Outcome::*;
-    use carbide_test_support::{Case, check_cases};
+    use carbide_test_support::{Case, Check, check_cases, check_values};
 
     use super::*;
 
@@ -571,6 +641,7 @@ dpu_reboot_delay = 1 # in units of seconds
 host_reboot_delay = 1 # in units of seconds
 vpc_count = 0
 admin_dhcp_relay_address = "192.168.176.1"
+host_inband_dhcp_relay_address = "192.168.177.1"
 oob_dhcp_relay_address = "192.168.192.1"
 subnets_per_vpc = 0
 run_interval_working = "100ms"
@@ -590,6 +661,198 @@ scout_run_interval = "5s"
         let round_tripped = toml::from_str::<MachineATronConfig>(&serialized)
             .expect("Could not deserialize serialized config");
         assert_eq!(round_tripped, cfg);
+    }
+
+    #[test]
+    fn ipmi_simulation_is_disabled_by_default() {
+        assert!(!rack_config().enable_ipmi_simulation);
+    }
+
+    #[test]
+    fn dhcp_uses_api_by_default() {
+        assert_eq!(rack_config().dhcp, DhcpType::Api {});
+    }
+
+    #[test]
+    fn udp_relay_configuration_requires_all_addresses() {
+        check_values(
+            [
+                Check {
+                    scenario: "complete UDP relay configuration",
+                    input: r#"type = "udp_relay"
+server_address = "127.0.0.1:6767"
+listen_address = "0.0.0.0:6768"
+advertise_address = "127.0.0.1""#,
+                    expect: false,
+                },
+                Check {
+                    scenario: "missing DHCP server address",
+                    input: r#"type = "udp_relay"
+listen_address = "0.0.0.0:6768"
+advertise_address = "127.0.0.1""#,
+                    expect: true,
+                },
+                Check {
+                    scenario: "missing relay listen address",
+                    input: r#"type = "udp_relay"
+server_address = "127.0.0.1:6767"
+advertise_address = "127.0.0.1""#,
+                    expect: true,
+                },
+                Check {
+                    scenario: "missing relay advertise address",
+                    input: r#"type = "udp_relay"
+server_address = "127.0.0.1:6767"
+listen_address = "0.0.0.0:6768""#,
+                    expect: true,
+                },
+                Check {
+                    scenario: "relay address on API mode",
+                    input: r#"type = "api"
+server_address = "127.0.0.1:6767""#,
+                    expect: true,
+                },
+            ],
+            |serialized| toml::from_str::<DhcpType>(serialized).is_err(),
+        );
+    }
+
+    #[test]
+    fn udp_relay_configuration_is_validated() {
+        fn udp_relay(
+            server_address: &str,
+            listen_address: &str,
+            advertise_address: Ipv4Addr,
+        ) -> DhcpType {
+            DhcpType::UdpRelay {
+                server_address: server_address.parse().unwrap(),
+                listen_address: listen_address.parse().unwrap(),
+                advertise_address,
+            }
+        }
+
+        let mut complete = rack_config();
+        complete.dhcp = udp_relay("127.0.0.1:6767", "0.0.0.0:6768", Ipv4Addr::LOCALHOST);
+
+        let mut unspecified_advertise_address = complete.clone();
+        unspecified_advertise_address.dhcp =
+            udp_relay("127.0.0.1:6767", "0.0.0.0:6768", Ipv4Addr::UNSPECIFIED);
+
+        let mut zero_server_port = complete.clone();
+        zero_server_port.dhcp = udp_relay("127.0.0.1:0", "0.0.0.0:6768", Ipv4Addr::LOCALHOST);
+
+        let mut unspecified_server_address = complete.clone();
+        unspecified_server_address.dhcp =
+            udp_relay("0.0.0.0:6767", "0.0.0.0:6768", Ipv4Addr::LOCALHOST);
+
+        let mut multicast_server_address = complete.clone();
+        multicast_server_address.dhcp =
+            udp_relay("224.0.0.1:6767", "0.0.0.0:6768", Ipv4Addr::LOCALHOST);
+
+        let mut broadcast_server_address = complete.clone();
+        broadcast_server_address.dhcp =
+            udp_relay("255.255.255.255:6767", "0.0.0.0:6768", Ipv4Addr::LOCALHOST);
+
+        let mut zero_listen_port = complete.clone();
+        zero_listen_port.dhcp = udp_relay("127.0.0.1:6767", "0.0.0.0:0", Ipv4Addr::LOCALHOST);
+
+        let mut multicast_listen_address = complete.clone();
+        multicast_listen_address.dhcp =
+            udp_relay("127.0.0.1:6767", "224.0.0.1:6768", Ipv4Addr::LOCALHOST);
+
+        let mut broadcast_listen_address = complete.clone();
+        broadcast_listen_address.dhcp = udp_relay(
+            "127.0.0.1:6767",
+            "255.255.255.255:6768",
+            Ipv4Addr::LOCALHOST,
+        );
+
+        let mut multicast_advertise_address = complete.clone();
+        multicast_advertise_address.dhcp = udp_relay(
+            "127.0.0.1:6767",
+            "0.0.0.0:6768",
+            Ipv4Addr::new(224, 0, 0, 1),
+        );
+
+        let mut broadcast_advertise_address = complete.clone();
+        broadcast_advertise_address.dhcp =
+            udp_relay("127.0.0.1:6767", "0.0.0.0:6768", Ipv4Addr::BROADCAST);
+
+        check_cases(
+            [
+                Case {
+                    scenario: "complete UDP relay configuration",
+                    input: complete,
+                    expect: Yields(()),
+                },
+                Case {
+                    scenario: "zero DHCP server port",
+                    input: zero_server_port,
+                    expect: Fails,
+                },
+                Case {
+                    scenario: "unspecified DHCP server address",
+                    input: unspecified_server_address,
+                    expect: Fails,
+                },
+                Case {
+                    scenario: "multicast DHCP server address",
+                    input: multicast_server_address,
+                    expect: Fails,
+                },
+                Case {
+                    scenario: "broadcast DHCP server address",
+                    input: broadcast_server_address,
+                    expect: Fails,
+                },
+                Case {
+                    scenario: "zero relay listen port",
+                    input: zero_listen_port,
+                    expect: Fails,
+                },
+                Case {
+                    scenario: "multicast relay listen address",
+                    input: multicast_listen_address,
+                    expect: Fails,
+                },
+                Case {
+                    scenario: "broadcast relay listen address",
+                    input: broadcast_listen_address,
+                    expect: Fails,
+                },
+                Case {
+                    scenario: "unspecified advertised address",
+                    input: unspecified_advertise_address,
+                    expect: Fails,
+                },
+                Case {
+                    scenario: "multicast advertised address",
+                    input: multicast_advertise_address,
+                    expect: Fails,
+                },
+                Case {
+                    scenario: "broadcast advertised address",
+                    input: broadcast_advertise_address,
+                    expect: Fails,
+                },
+            ],
+            |config| config.validate().map_err(drop),
+        );
+    }
+
+    #[test]
+    fn host_inband_dhcp_relay_is_optional() {
+        let mut serialized =
+            toml::Value::try_from(rack_config()).expect("Could not serialize config");
+        serialized["machines"]["config"]
+            .as_table_mut()
+            .expect("machine config should be a TOML table")
+            .remove("host_inband_dhcp_relay_address");
+
+        let cfg: MachineATronConfig = serialized
+            .try_into()
+            .expect("legacy config without host_inband_dhcp_relay_address should deserialize");
+        assert_eq!(cfg.machines["config"].host_inband_dhcp_relay_address, None);
     }
 
     #[test]
@@ -648,6 +911,44 @@ scout_run_interval = "5s"
                 },
             ],
             |config| config.validate().map_err(drop),
+        );
+    }
+
+    #[test]
+    fn missing_host_inband_relay_warning_selection() {
+        let host_inband = Ipv4Addr::new(192, 168, 177, 1);
+
+        check_values(
+            [
+                Check {
+                    scenario: "zero-DPU host without HostInband",
+                    input: (0, false, None),
+                    expect: true,
+                },
+                Check {
+                    scenario: "NIC-mode host without HostInband",
+                    input: (1, true, None),
+                    expect: true,
+                },
+                Check {
+                    scenario: "managed-DPU host without HostInband",
+                    input: (1, false, None),
+                    expect: false,
+                },
+                Check {
+                    scenario: "zero-DPU host with HostInband",
+                    input: (0, false, Some(host_inband)),
+                    expect: false,
+                },
+            ],
+            |(dpu_per_host_count, dpus_in_nic_mode, host_inband_dhcp_relay_address)| {
+                let mut config = rack_config();
+                let machine = Arc::make_mut(config.machines.get_mut("config").unwrap());
+                machine.dpu_per_host_count = dpu_per_host_count;
+                machine.dpus_in_nic_mode = dpus_in_nic_mode;
+                machine.host_inband_dhcp_relay_address = host_inband_dhcp_relay_address;
+                machine.missing_host_inband_relay_for_direct_host_dhcp()
+            },
         );
     }
 }

@@ -21,7 +21,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use carbide_dpf::types::{HostDpfSnapshot, ServiceTemplateVersion};
+use carbide_dpf::types::{DpuServiceVersion, HostDpfSnapshot, ServiceTemplateVersion};
 use carbide_dpf::{
     BmcPasswordProvider, DpfError, DpfSdk, DpuDeploymentType, DpuDeviceInfo, DpuNodeInfo, DpuPhase,
     DpuWatcher, KubeRepository, ResourceLabeler, node_id_from_dpu_node_cr_name,
@@ -108,6 +108,18 @@ pub trait DpfOperations: Send + Sync + std::fmt::Debug {
     /// CR — used for comparing config vs deployed state.
     async fn list_service_template_versions(&self)
     -> Result<Vec<ServiceTemplateVersion>, DpfError>;
+
+    /// Get service versions for a DPU from its owning DPUDeployment.
+    ///
+    /// Looks up the DPU CR by device name, follows the
+    /// `svc.dpu.nvidia.com/owned-by-dpudeployment` label to find the owning
+    /// DPUDeployment, and resolves each service's version from its
+    /// DPUServiceTemplate. Used to populate `agent_reported_inventory` once
+    /// the DPU reaches `DpuPhase::Ready`.
+    async fn get_service_versions_for_dpu(
+        &self,
+        dpu_name: &str,
+    ) -> Result<Vec<DpuServiceVersion>, DpfError>;
 
     /// Return DPUs whose installed BFB or `spec.dpuFlavor` does not match
     /// the namespace's ready DPUDeployment, mapped back to carbide
@@ -351,7 +363,7 @@ impl DpfSdkOps {
             .watcher()
             .on_dpu_event(|event| async move {
                 tracing::debug!(
-                    dpu = %event.dpu_name,
+                    dpu_name = %event.dpu_name,
                     device_name = %event.device_name,
                     node = %event.node_name,
                     phase = ?event.phase,
@@ -366,7 +378,7 @@ impl DpfSdkOps {
                     async move {
                         tracing::info!(
                             node = %event.node_name,
-                            host = %event.host_bmc_ip,
+                            host_bmc_ip_address = %event.host_bmc_ip,
                             "DPF reboot required"
                         );
                         enqueue_host(&db_pool, &event.node_name, "reboot").await
@@ -379,7 +391,7 @@ impl DpfSdkOps {
                     let db_pool = db_pool.clone();
                     async move {
                         tracing::info!(
-                            dpu = %event.dpu_name,
+                            dpu_name = %event.dpu_name,
                             device_name = %event.device_name,
                             node = %event.node_name,
                             "DPF DPU ready"
@@ -406,7 +418,7 @@ impl DpfSdkOps {
                     let db_pool = db_pool.clone();
                     async move {
                         tracing::error!(
-                            dpu = %event.dpu_name,
+                            dpu_name = %event.dpu_name,
                             device_name = %event.device_name,
                             node = %event.node_name,
                             "DPF DPU entered error phase"
@@ -447,7 +459,7 @@ async fn enqueue_host(db_pool: &PgPool, node_name: &str, reason: &str) -> Result
     };
 
     let Some(host_machine_id) = host_machine_id else {
-        tracing::warn!(node = %node_name, %bmc_mac, reason, "Could not find host for DPF node");
+        tracing::warn!(node = %node_name, bmc_mac_address = %bmc_mac, reason, "Could not find host for DPF node");
         return Ok(());
     };
 
@@ -476,7 +488,7 @@ async fn enqueue_host(db_pool: &PgPool, node_name: &str, reason: &str) -> Result
             DpfError::InvalidState(format!("Failed to enqueue machine {}: {e}", host.id))
         })?;
 
-    tracing::info!(node = %node_name, host = %host.id, reason, "Enqueued host for DPF state handling");
+    tracing::info!(node = %node_name, machine_id = %host.id, reason, "Enqueued host for DPF state handling");
     Ok(())
 }
 
@@ -535,6 +547,7 @@ impl DpfOperations for DpfSdkOps {
 
     fn deployment_type_for_dpu(&self, dpu: &Machine) -> Result<DpuDeploymentType, DpfError> {
         let part_number = dpu
+            .status
             .hardware_info
             .as_ref()
             .and_then(|hw| hw.dpu_info.as_ref())
@@ -579,6 +592,13 @@ impl DpfOperations for DpfSdkOps {
         self.sdk.list_service_template_versions().await
     }
 
+    async fn get_service_versions_for_dpu(
+        &self,
+        dpu_name: &str,
+    ) -> Result<Vec<DpuServiceVersion>, DpfError> {
+        self.sdk.get_service_versions_for_dpu(dpu_name).await
+    }
+
     async fn find_outdated_dpus_dpf(&self) -> Result<Vec<OutdatedDpfDpu>, DpfError> {
         let label_selector = format!("{CONTROLLED_DEVICE_LABEL}=true");
         let mismatches = self
@@ -590,8 +610,9 @@ impl DpfOperations for DpfSdkOps {
         for m in mismatches {
             let Some(machine_id_str) = m.dpu_labels.get(DPU_MACHINE_ID_LABEL) else {
                 tracing::warn!(
-                    dpu = %m.dpu_cr_name,
-                    "Outdated DPU missing {DPU_MACHINE_ID_LABEL} label; skipping"
+                    dpu_name = %m.dpu_cr_name,
+                    label = DPU_MACHINE_ID_LABEL,
+                    "Outdated DPU missing label; skipping"
                 );
                 continue;
             };
@@ -599,10 +620,11 @@ impl DpfOperations for DpfSdkOps {
                 Ok(id) => id,
                 Err(e) => {
                     tracing::warn!(
-                        dpu = %m.dpu_cr_name,
+                        dpu_name = %m.dpu_cr_name,
                         label_value = %machine_id_str,
+                        label = DPU_MACHINE_ID_LABEL,
                         error = %e,
-                        "Outdated DPU has invalid {DPU_MACHINE_ID_LABEL} label; skipping"
+                        "Outdated DPU has invalid label; skipping"
                     );
                     continue;
                 }

@@ -41,6 +41,12 @@ pub struct NetworkSegmentStateHandler {
     pool_vni: Arc<ResourcePool<i32>>,
 }
 
+fn available_ip_metric_value(count: Option<u128>) -> usize {
+    count
+        .map(|count| usize::try_from(count).unwrap_or(usize::MAX))
+        .unwrap_or_default()
+}
+
 impl NetworkSegmentStateHandler {
     pub fn new(
         drain_period: chrono::Duration,
@@ -65,8 +71,10 @@ impl NetworkSegmentStateHandler {
             return;
         }
 
-        // The code below assumes that we have only one prefix of type IPV4
-        ctx.metrics.available_ips = state.prefixes[0].num_free_ips as usize;
+        // `NetworkSegmentMetrics` still exposes one prefix per segment, so preserve
+        // the legacy `prefixes[0]` selection. Dual-stack values therefore depend on
+        // prefix order until the metric schema can emit one series per address family.
+        ctx.metrics.available_ips = available_ip_metric_value(state.prefixes[0].num_free_ips);
         ctx.metrics.reserved_ips = state.prefixes[0].num_reserved as usize;
         ctx.metrics.seg_name = state.config.name.clone();
 
@@ -103,7 +111,7 @@ impl StateHandler for NetworkSegmentStateHandler {
         match controller_state {
             NetworkSegmentControllerState::Provisioning => {
                 let new_state = NetworkSegmentControllerState::Ready;
-                tracing::info!(%segment_id, state = ?new_state, "Network Segment state transition");
+                tracing::info!(network_segment_id = %segment_id, next_state = ?new_state, "Network Segment state transition");
                 Ok(StateHandlerOutcome::transition(new_state))
             }
             NetworkSegmentControllerState::Ready => {
@@ -116,7 +124,7 @@ impl StateHandler for NetworkSegmentStateHandler {
                             delete_at,
                         },
                     };
-                    tracing::info!(%segment_id, state = ?new_state, "Network Segment state transition");
+                    tracing::info!(network_segment_id = %segment_id, next_state = ?new_state, "Network Segment state transition");
                     Ok(StateHandlerOutcome::transition(new_state))
                 } else {
                     Ok(StateHandlerOutcome::do_nothing())
@@ -137,7 +145,7 @@ impl StateHandler for NetworkSegmentStateHandler {
                                 .unwrap_or_else(chrono::Utc::now);
                             tracing::info!(
                                 ?delete_at,
-                                %segment_id,
+                                network_segment_id = %segment_id,
                                 "Segment still has allocated IPs; waiting until the drain deadline to delete",
                             );
                             let new_state = NetworkSegmentControllerState::Deleting {
@@ -145,13 +153,13 @@ impl StateHandler for NetworkSegmentStateHandler {
                                     delete_at,
                                 },
                             };
-                            tracing::info!(%segment_id, state = ?new_state, "Network Segment state transition");
+                            tracing::info!(network_segment_id = %segment_id, next_state = ?new_state, "Network Segment state transition");
                             Ok(StateHandlerOutcome::transition(new_state).with_txn(txn))
                         } else if chrono::Utc::now() >= *delete_at {
                             let new_state = NetworkSegmentControllerState::Deleting {
                                 deletion_state: NetworkSegmentDeletionState::DBDelete,
                             };
-                            tracing::info!(%segment_id, state = ?new_state, "Network Segment state transition");
+                            tracing::info!(network_segment_id = %segment_id, next_state = ?new_state, "Network Segment state transition");
                             Ok(StateHandlerOutcome::transition(new_state).with_txn(txn))
                         } else {
                             Ok(StateHandlerOutcome::wait(format!(
@@ -171,7 +179,7 @@ impl StateHandler for NetworkSegmentStateHandler {
                                 .await?;
                         }
                         tracing::info!(
-                            %segment_id,
+                            network_segment_id = %segment_id,
                             "Network Segment getting removed from the database",
                         );
                         db::network_segment::final_delete(*segment_id, &mut txn).await?;
@@ -180,5 +188,29 @@ impl StateHandler for NetworkSegmentStateHandler {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use carbide_test_support::value_scenarios;
+
+    use super::available_ip_metric_value;
+
+    #[test]
+    fn available_ip_metric_preserves_or_saturates_counts() {
+        value_scenarios!(run = available_ip_metric_value;
+            "omitted count" {
+                None => 0,
+            }
+
+            "representable count" {
+                Some(42) => 42,
+            }
+
+            "overflowing count" {
+                Some(u128::MAX) => usize::MAX,
+            }
+        );
     }
 }

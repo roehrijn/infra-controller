@@ -15,6 +15,10 @@
  * limitations under the License.
  */
 
+// The deprecated flat fields on `rpc::forge::Machine` must still be read here for
+// backwards-compat until a follow-up PR migrates this crate to the new config/status sub-messages.
+#![allow(deprecated)]
+
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::Display;
 use std::sync::Arc;
@@ -68,7 +72,7 @@ impl ManagedHostMetadata {
             .await
             .map(|response| response.into_inner())
             .map_err(|e| {
-                warn!("Failed to get site exploration report: {:?}", e);
+                warn!(error = ?e, "failed to get site exploration report");
             })
             .unwrap_or_default();
 
@@ -429,7 +433,10 @@ pub fn get_managed_host_output(source: ManagedHostMetadata) -> Vec<ManagedHostOu
                         .remove(&id)
                         .map(|dpu| (id, dpu))
                         .or_else(|| {
-                            tracing::warn!("Could not find DPU for associated_dpu_machine_id {id}");
+                            tracing::warn!(
+                                dpu_machine_id = %id,
+                                "could not find associated DPU"
+                            );
                             None
                         })
                 })
@@ -575,11 +582,11 @@ pub fn to_time<M: Display>(t: Option<Timestamp>, machine_id: Option<M>) -> Optio
             }
             Err(err) => {
                 warn!(
-                    "get_managed_host_output {}, invalid timestamp: {}",
-                    machine_id
+                    machine_id = %machine_id
                         .map(|x| x.to_string())
                         .unwrap_or_else(|| "(no machine ID)".to_string()),
-                    err
+                    error = %err,
+                    "managed host has an invalid timestamp"
                 );
                 None
             }
