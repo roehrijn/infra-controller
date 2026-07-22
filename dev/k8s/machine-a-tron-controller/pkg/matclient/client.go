@@ -6,6 +6,7 @@ package matclient
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -37,6 +38,19 @@ func WithHTTPClient(c *http.Client) Option {
 func WithLogger(logger zerolog.Logger) Option {
 	return func(client *Client) {
 		client.logger = logger
+	}
+}
+
+// WithInsecureSkipVerify disables TLS certificate verification.
+// Use only for development with self-signed certificates.
+func WithInsecureSkipVerify() Option {
+	return func(client *Client) {
+		transport := &http.Transport{
+			TLSClientConfig: &tls.Config{
+				InsecureSkipVerify: true, //nolint:gosec // Intentional for dev/test with self-signed certs
+			},
+		}
+		client.httpClient.Transport = transport
 	}
 }
 

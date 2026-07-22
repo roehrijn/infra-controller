@@ -14,6 +14,7 @@ import (
 	"flag"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 	"time"
 
@@ -28,18 +29,20 @@ import (
 
 func main() {
 	// Flags
-	matURL := flag.String("mat-url", envOrDefault("MAT_URL", "http://machine-a-tron:8080"),
+	matURL := flag.String("mat-url", envOrDefault("MAT_URL", "https://nico-machine-a-tron-bmc-mock:1266"),
 		"Machine-a-tron base URL")
-	namespace := flag.String("namespace", envOrDefault("NAMESPACE", "default"),
+	namespace := flag.String("namespace", envOrDefault("NAMESPACE", "nico-system"),
 		"Kubernetes namespace for Services")
-	syncInterval := flag.Duration("sync-interval", parseDurationOrDefault("SYNC_INTERVAL", 10*time.Second),
+	syncInterval := flag.Duration("sync-interval", parseDurationOrDefault("SYNC_INTERVAL", 30*time.Second),
 		"Interval between reconciliation passes")
 	kubeconfig := flag.String("kubeconfig", os.Getenv("KUBECONFIG"),
 		"Path to kubeconfig (uses in-cluster config if empty)")
-	targetSelector := flag.String("target-selector", envOrDefault("TARGET_SELECTOR", "app=machine-a-tron"),
+	targetSelector := flag.String("target-selector", envOrDefault("TARGET_SELECTOR", "app.kubernetes.io/name=nico-machine-a-tron"),
 		"Pod selector for Services (comma-separated key=value pairs)")
 	clusterIPPrefix := flag.String("cluster-ip-prefix", os.Getenv("CLUSTER_IP_PREFIX"),
 		"Prefix for static ClusterIP assignment (e.g., 10.96)")
+	insecureSkipVerify := flag.Bool("insecure-skip-verify", envBoolOrDefault("INSECURE_SKIP_VERIFY", true),
+		"Skip TLS certificate verification (for self-signed certs)")
 	logLevel := flag.String("log-level", envOrDefault("LOG_LEVEL", "info"),
 		"Log level (debug, info, warn, error)")
 
@@ -63,10 +66,16 @@ func main() {
 		Dur("sync_interval", *syncInterval).
 		Str("target_selector", *targetSelector).
 		Str("cluster_ip_prefix", *clusterIPPrefix).
+		Bool("insecure_skip_verify", *insecureSkipVerify).
 		Msg("starting controller")
 
 	// Create machine-a-tron client
-	matClient, err := matclient.NewClient(*matURL, matclient.WithLogger(logger))
+	clientOpts := []matclient.Option{matclient.WithLogger(logger)}
+	if *insecureSkipVerify {
+		clientOpts = append(clientOpts, matclient.WithInsecureSkipVerify())
+	}
+
+	matClient, err := matclient.NewClient(*matURL, clientOpts...)
 	if err != nil {
 		logger.Fatal().Err(err).Msg("failed to create machine-a-tron client")
 	}
@@ -162,6 +171,15 @@ func runReconcile(ctx context.Context, r *controller.Reconciler, logger zerolog.
 func envOrDefault(key, defaultValue string) string {
 	if v := os.Getenv(key); v != "" {
 		return v
+	}
+	return defaultValue
+}
+
+func envBoolOrDefault(key string, defaultValue bool) bool {
+	if v := os.Getenv(key); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			return b
+		}
 	}
 	return defaultValue
 }
