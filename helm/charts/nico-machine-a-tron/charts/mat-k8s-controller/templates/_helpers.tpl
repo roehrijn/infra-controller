@@ -1,0 +1,77 @@
+{{/*
+Expand the name of the chart.
+*/}}
+{{- define "mat-k8s-controller.name" -}}
+{{- default .Chart.Name .Values.nameOverride | trunc 63 | trimSuffix "-" }}
+{{- end }}
+
+{{/*
+Create a default fully qualified app name.
+*/}}
+{{- define "mat-k8s-controller.fullname" -}}
+{{- $name := default .Chart.Name .Values.nameOverride }}
+{{- if .Values.fullnameOverride }}
+{{- .Values.fullnameOverride | trunc 63 | trimSuffix "-" }}
+{{- else }}
+{{- printf "%s-%s" .Release.Name $name | trunc 63 | trimSuffix "-" }}
+{{- end }}
+{{- end }}
+
+{{/*
+Create chart name and version as used by the chart label.
+*/}}
+{{- define "mat-k8s-controller.chart" -}}
+{{- printf "%s-%s" .Chart.Name .Chart.Version | replace "+" "_" | trunc 63 | trimSuffix "-" }}
+{{- end }}
+
+{{/*
+Common labels
+*/}}
+{{- define "mat-k8s-controller.labels" -}}
+helm.sh/chart: {{ include "mat-k8s-controller.chart" . }}
+{{ include "mat-k8s-controller.selectorLabels" . }}
+{{- if .Chart.AppVersion }}
+app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
+{{- end }}
+app.kubernetes.io/managed-by: {{ .Release.Service }}
+{{- end }}
+
+{{/*
+Selector labels
+*/}}
+{{- define "mat-k8s-controller.selectorLabels" -}}
+app.kubernetes.io/name: {{ include "mat-k8s-controller.name" . }}
+app.kubernetes.io/instance: {{ .Release.Name }}
+{{- end }}
+
+{{/*
+Create the name of the service account to use
+*/}}
+{{- define "mat-k8s-controller.serviceAccountName" -}}
+{{- if .Values.serviceAccount.create }}
+{{- default (include "mat-k8s-controller.fullname" .) .Values.serviceAccount.name }}
+{{- else }}
+{{- default "default" .Values.serviceAccount.name }}
+{{- end }}
+{{- end }}
+
+{{/*
+Namespace - inherited from parent release
+*/}}
+{{- define "mat-k8s-controller.namespace" -}}
+{{- .Release.Namespace }}
+{{- end }}
+
+{{/*
+Machine-a-tron URL - derived from parent chart's bmc-mock service
+*/}}
+{{- define "mat-k8s-controller.matUrl" -}}
+{{- printf "https://%s-bmc-mock.%s.svc.cluster.local:1266" .Release.Name .Release.Namespace }}
+{{- end }}
+
+{{/*
+Target selector - matches parent chart's machine-a-tron pods
+*/}}
+{{- define "mat-k8s-controller.targetSelector" -}}
+app.kubernetes.io/name=nico-machine-a-tron
+{{- end }}

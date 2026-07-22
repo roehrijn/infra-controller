@@ -1,4 +1,4 @@
-{{- if .Values.bmcServices.enabled }}
+{{- if and .Values.bmcServices.enabled (not (index .Values "mat-k8s-controller" "enabled")) }}
 {{- $root := . }}
 {{- $namespace := include "nico-machine-a-tron.namespace" . }}
 {{- $baseName := include "nico-machine-a-tron.name" . }}

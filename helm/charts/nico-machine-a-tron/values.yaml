@@ -354,3 +354,62 @@ configFiles:
   #     oob_dhcp_relay_address = "10.100.0.1"
   #     admin_dhcp_relay_address = "192.168.176.1"
   matConfigs: {}
+
+## =============================================================================
+## Machine-a-tron Kubernetes Controller (Subchart)
+## =============================================================================
+## When enabled, the controller dynamically creates BMC services based on
+## machine-a-tron's /machines/status API instead of static Helm-generated services.
+##
+## Benefits:
+##   - Services reflect actual machine state (annotations show power/API state)
+##   - Automatic cleanup when machines are removed
+##   - No need to pre-calculate BMC counts and CIDRs
+##
+## Requirements:
+##   - bmcServices.enabled must also be true (for ServiceCIDR allocation)
+##   - Controller image must be available in the cluster
+##
+## =============================================================================
+## Machine-a-tron Kubernetes Controller (Subchart)
+## =============================================================================
+## When enabled, the controller dynamically creates BMC services based on
+## machine-a-tron's /machines/status API instead of static Helm-generated services.
+##
+## Configuration is inherited from parent chart:
+##   - matUrl: derived from release name + bmc-mock service
+##   - namespace: inherited from release namespace
+##   - clusterIpPrefix: extracted from pods.*.cidr
+##
+## Requirements:
+##   - bmcServices.enabled must also be true (for ServiceCIDR allocation)
+##   - Controller image must be available in the cluster
+##
+## =============================================================================
+## Machine-a-tron Kubernetes Controller (Subchart)
+## =============================================================================
+## When enabled, the controller dynamically creates BMC services based on
+## machine-a-tron's /machines/status API instead of static Helm-generated services.
+##
+## Inherited automatically:
+##   - matUrl: https://<release>-bmc-mock.<namespace>.svc.cluster.local:1266
+##   - namespace: release namespace
+##   - targetSelector: app.kubernetes.io/name=nico-machine-a-tron
+##
+## Requirements:
+##   - Controller image must be available in the cluster
+##
+mat-k8s-controller:
+  enabled: false
+  
+  image:
+    repository: mat-k8s-controller
+    tag: latest
+    pullPolicy: IfNotPresent
+  
+  config:
+    syncInterval: "30s"
+    insecureSkipVerify: true
+    logLevel: "info"
+    ## Optional: set for predictable ClusterIPs (e.g., "10.96")
+    clusterIpPrefix: ""
