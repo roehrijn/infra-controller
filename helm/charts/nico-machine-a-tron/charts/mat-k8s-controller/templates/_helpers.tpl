@@ -9,10 +9,10 @@ Expand the name of the chart.
 Create a default fully qualified app name.
 */}}
 {{- define "mat-k8s-controller.fullname" -}}
-{{- $name := default .Chart.Name .Values.nameOverride }}
 {{- if .Values.fullnameOverride }}
 {{- .Values.fullnameOverride | trunc 63 | trimSuffix "-" }}
 {{- else }}
+{{- $name := default .Chart.Name .Values.nameOverride }}
 {{- printf "%s-%s" .Release.Name $name | trunc 63 | trimSuffix "-" }}
 {{- end }}
 {{- end }}
@@ -63,15 +63,19 @@ Namespace - inherited from parent release
 {{- end }}
 
 {{/*
-Machine-a-tron URL - derived from parent chart's bmc-mock service
+Machine-a-tron URL - configurable, defaults to release-based naming
 */}}
 {{- define "mat-k8s-controller.matUrl" -}}
+{{- if .Values.config.matUrl }}
+{{- .Values.config.matUrl }}
+{{- else }}
 {{- printf "https://%s-bmc-mock.%s.svc.cluster.local:1266" .Release.Name .Release.Namespace }}
+{{- end }}
 {{- end }}
 
 {{/*
 Target selector - matches parent chart's machine-a-tron pods
 */}}
 {{- define "mat-k8s-controller.targetSelector" -}}
-app.kubernetes.io/name=nico-machine-a-tron
+{{- default "app.kubernetes.io/name=nico-machine-a-tron" .Values.config.targetSelector }}
 {{- end }}

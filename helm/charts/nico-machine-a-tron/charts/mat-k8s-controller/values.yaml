@@ -1,16 +1,7 @@
-## =============================================================================
 ## mat-k8s-controller - Kubernetes controller for machine-a-tron BMC services
-## =============================================================================
 ##
 ## This controller dynamically creates/updates/deletes Kubernetes Services
 ## based on machine-a-tron's /machines/status API.
-##
-## Inherited from parent chart:
-##   - matUrl: derived from release name + bmc-mock service
-##   - namespace: inherited from release namespace
-##   - targetSelector: matches parent's machine-a-tron pods
-##
-## =============================================================================
 
 ## Enable/disable the controller
 enabled: false
@@ -31,18 +22,24 @@ resources:
 
 ## Controller configuration
 config:
+  ## Machine-a-tron URL (optional)
+  ## Default: https://<release-name>-bmc-mock.<namespace>.svc.cluster.local:1266
+  matUrl: ""
+
+  ## Target selector for Services (optional)
+  ## Default: app.kubernetes.io/name=nico-machine-a-tron
+  targetSelector: ""
+
   ## Reconciliation interval
   syncInterval: "30s"
-  
+
   ## Skip TLS certificate verification (for self-signed certs)
   insecureSkipVerify: true
-  
+
   ## Log level (debug, info, warn, error)
   logLevel: "info"
-  
+
   ## Optional: Prefix for static ClusterIP assignment
-  ## When set, controller assigns ClusterIPs using BMC IP's last two octets
-  ## Example: prefix "10.96" + BMC IP "172.20.0.20" = ClusterIP "10.96.0.20"
   ## Leave empty for Kubernetes auto-assigned ClusterIPs
   clusterIpPrefix: ""
 
@@ -55,3 +52,7 @@ serviceAccount:
 ## RBAC configuration
 rbac:
   create: true
+
+## Override names (useful when release name differs from chart name)
+nameOverride: ""
+fullnameOverride: ""
