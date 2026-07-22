@@ -1216,8 +1216,11 @@ func TerminateWorkflowOnTimeOut(echoCtx echo.Context, logger zerolog.Logger, tem
 	return cutil.NewAPIErrorResponse(echoCtx, http.StatusInternalServerError, fmt.Sprintf("Failed to perform %s %s - timeout occurred executing workflow on Site: %s", objectType, workflowName, originalError), nil)
 }
 
-func UnwrapWorkflowError(err error) (code int, unwrappedError error) {
+// UnwrapWorkflowError removes Temporal wrappers and maps backend errors to HTTP
+// status codes. ResourceExhausted is mapped only when enabled for an endpoint.
+func UnwrapWorkflowError(err error, additionalCodes ...codes.Code) (code int, unwrappedError error) {
 	code, unwrappedError = http.StatusInternalServerError, err
+	mapResourceExhausted := slices.Contains(additionalCodes, codes.ResourceExhausted)
 
 	// Attempt to unwrap our way through Temporal's WorkflowExecutionError
 	// and ActivityError layers to reach the underlying cause. These types
@@ -1261,6 +1264,10 @@ func UnwrapWorkflowError(err error) (code int, unwrappedError error) {
 			code = http.StatusPreconditionFailed
 		case codes.InvalidArgument:
 			code = http.StatusBadRequest
+		case codes.ResourceExhausted:
+			if mapResourceExhausted {
+				code = http.StatusTooManyRequests
+			}
 		}
 	}
 
@@ -1288,6 +1295,10 @@ func UnwrapWorkflowError(err error) (code int, unwrappedError error) {
 		code = http.StatusPreconditionFailed
 	case swe.ErrTypeNICoInvalidArgument, swe.ErrTypeCarbideInvalidArgument:
 		code = http.StatusBadRequest
+	case swe.ErrTypeNICoResourceExhausted:
+		if mapResourceExhausted {
+			code = http.StatusTooManyRequests
+		}
 	}
 
 	// if the error is an internal Temporal error it is mostly useless so we unwrap it but we keep

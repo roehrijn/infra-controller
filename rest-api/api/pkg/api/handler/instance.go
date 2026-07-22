@@ -19,6 +19,7 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	temporalClient "go.temporal.io/sdk/client"
 	tp "go.temporal.io/sdk/temporal"
+	"google.golang.org/grpc/codes"
 
 	validation "github.com/go-ozzo/ozzo-validation/v4"
 	"github.com/google/uuid"
@@ -76,6 +77,97 @@ func buildInstanceNetworkConfig(auto bool, interfaceConfigs []*corev1.InstanceIn
 	}
 
 	return nc
+}
+
+// loadInstanceInterfaceVpcs validates VPC-selection intent and returns each
+// requested REST VPC keyed by its REST ID.
+func loadInstanceInterfaceVpcs(ctx context.Context, logger *zerolog.Logger, dbSession *cdb.Session, interfaces []model.APIInterfaceCreateOrUpdateRequest, tenantID, siteID uuid.UUID) (map[uuid.UUID]*cdbm.Vpc, *cutil.APIError) {
+	requestedVpcIDs := make([]uuid.UUID, 0, len(interfaces))
+	seenVpcIDs := make(map[uuid.UUID]struct{}, len(interfaces))
+	for _, ifc := range interfaces {
+		if ifc.VpcID == nil {
+			continue
+		}
+
+		vpcID, err := uuid.Parse(*ifc.VpcID)
+		if err != nil {
+			return nil, cutil.NewAPIError(http.StatusBadRequest, fmt.Sprintf("VPC ID: %s specified in interfaces data in request is not valid", *ifc.VpcID), nil)
+		}
+		if _, ok := seenVpcIDs[vpcID]; !ok {
+			seenVpcIDs[vpcID] = struct{}{}
+			requestedVpcIDs = append(requestedVpcIDs, vpcID)
+		}
+	}
+
+	if len(requestedVpcIDs) == 0 {
+		return map[uuid.UUID]*cdbm.Vpc{}, nil
+	}
+
+	// A REST-side VPC or prefix lock was considered, but it would be held
+	// across the synchronous Core call. Core owns ordering, capacity, and locks.
+	vpcDAO := cdbm.NewVpcDAO(dbSession)
+	vpcs, _, err := vpcDAO.GetAll(ctx, nil, cdbm.VpcFilterInput{VpcIDs: requestedVpcIDs}, cdbp.PageInput{Limit: cutil.GetPtr(cdbp.TotalLimit)}, nil)
+	if err != nil {
+		logger.Error().Err(err).Msg("failed to retrieve VPCs from DB by IDs")
+		return nil, cutil.NewAPIError(http.StatusInternalServerError, "Failed to retrieve VPCs from DB by IDs", nil)
+	}
+
+	vpcByID := make(map[uuid.UUID]*cdbm.Vpc, len(vpcs))
+	for i := range vpcs {
+		vpcByID[vpcs[i].ID] = &vpcs[i]
+	}
+
+	for _, vpcID := range requestedVpcIDs {
+		vpc, ok := vpcByID[vpcID]
+		if !ok {
+			return nil, cutil.NewAPIError(http.StatusBadRequest, fmt.Sprintf("VPC: %v specified in Interface request data is not found in DB", vpcID), nil)
+		}
+		if vpc.TenantID != tenantID {
+			return nil, cutil.NewAPIError(http.StatusBadRequest, fmt.Sprintf("VPC: %v specified in Interface request is not owned by Tenant", vpcID), nil)
+		}
+		if vpc.SiteID != siteID {
+			return nil, cutil.NewAPIError(http.StatusBadRequest, fmt.Sprintf("VPC: %v specified in Interface request does not belong to Site", vpcID), nil)
+		}
+		if vpc.ControllerVpcID == nil || vpc.Status != cdbm.VpcStatusReady {
+			return nil, cutil.NewAPIError(http.StatusBadRequest, fmt.Sprintf("VPC: %v specified in Interface request data is not in Ready state", vpcID), nil)
+		}
+		if vpc.NetworkVirtualizationType == nil || *vpc.NetworkVirtualizationType != cdbm.VpcFNN {
+			return nil, cutil.NewAPIError(http.StatusBadRequest, fmt.Sprintf("VPC: %v specified in Interface request must have FNN network virtualization type", vpcID), nil)
+		}
+	}
+
+	return vpcByID, nil
+}
+
+// instanceInterfaceVpcSelection converts persisted REST VPC intent to the
+// Controller request shape and returns nil for non-VPC-selection interfaces.
+func instanceInterfaceVpcSelection(ifc *cdbm.Interface) (*corev1.InstanceInterfaceVpcSelection, error) {
+	if ifc.VpcID == nil {
+		return nil, nil
+	}
+	if ifc.Vpc == nil || ifc.Vpc.ControllerVpcID == nil {
+		return nil, fmt.Errorf("interface %s is missing its Controller VPC relation", ifc.ID)
+	}
+	if ifc.VpcIPFamilyMode == nil {
+		return nil, fmt.Errorf("interface %s is missing its VPC IP family mode", ifc.ID)
+	}
+
+	var familyMode corev1.InstanceInterfaceIpFamilyMode
+	switch *ifc.VpcIPFamilyMode {
+	case cdbm.InterfaceVpcIPFamilyModeIPv4Only:
+		familyMode = corev1.InstanceInterfaceIpFamilyMode_INSTANCE_INTERFACE_IP_FAMILY_MODE_IPV4_ONLY
+	case cdbm.InterfaceVpcIPFamilyModeIPv6Only:
+		familyMode = corev1.InstanceInterfaceIpFamilyMode_INSTANCE_INTERFACE_IP_FAMILY_MODE_IPV6_ONLY
+	case cdbm.InterfaceVpcIPFamilyModeDualStack:
+		familyMode = corev1.InstanceInterfaceIpFamilyMode_INSTANCE_INTERFACE_IP_FAMILY_MODE_DUAL_STACK
+	default:
+		return nil, fmt.Errorf("interface %s has unsupported VPC IP family mode %q", ifc.ID, *ifc.VpcIPFamilyMode)
+	}
+
+	return &corev1.InstanceInterfaceVpcSelection{
+		VpcId:      &corev1.VpcId{Value: ifc.Vpc.ControllerVpcID.String()},
+		FamilyMode: familyMode,
+	}, nil
 }
 
 // NewCreateInstanceHandler initializes and returns a new handler for creating Instance
@@ -246,7 +338,7 @@ func (cih CreateInstanceHandler) Handle(c echo.Context) error {
 	// 2. Request Validation
 	//    - Bind and validate request data
 	//    - Validate tenant, VPC, site
-	//    - Load and validate Interfaces (Subnets, VPC Prefixes)
+	//    - Load and validate Interfaces (Subnets, VPC Prefixes, or VPC selection)
 	//    - Load and validate DPU Extension Service Deployments
 	//    - Load and validate Network Security Groups
 	//    - Load and validate SSH Key Groups
@@ -404,7 +496,7 @@ func (cih CreateInstanceHandler) Handle(c echo.Context) error {
 	}
 
 	// Begin validating interfaces
-	// Fetch and validate Subnet or VPC Prefixes
+	// Fetch and validate Subnets, VPC Prefixes, and VPC selections
 	sbDAO := cdbm.NewSubnetDAO(cih.dbSession)
 	vpDAO := cdbm.NewVpcPrefixDAO(cih.dbSession)
 
@@ -460,10 +552,18 @@ func (cih CreateInstanceHandler) Handle(c echo.Context) error {
 		}
 	}
 
+	// Load VPCs only for interfaces using Core-managed prefix selection.
+	interfaceVpcIDMap, interfaceVpcErr := loadInstanceInterfaceVpcs(ctx, &logger, cih.dbSession, apiRequest.Interfaces, tenant.ID, site.ID)
+	if interfaceVpcErr != nil {
+		logger.Warn().Err(interfaceVpcErr).Msg("failed to validate VPCs specified by Instance interfaces")
+		return cutil.NewAPIErrorResponse(c, interfaceVpcErr.Code, interfaceVpcErr.Message, interfaceVpcErr.Data)
+	}
+
 	dbInterfaces := []cdbm.Interface{}
 	isInterfaceDeviceInfoPresent := false
 
 	pfWithinVPC := []uuid.UUID{}
+	primaryPhysicalInterfaceUsesVpcSelection := false
 	allFoundVpcIds := goset.NewSet[uuid.UUID]()
 
 	// Prepare the unique set of all VPC IDs for this instance.
@@ -616,8 +716,10 @@ func (cih CreateInstanceHandler) Handle(c echo.Context) error {
 				// is by definition not the primary.
 				if !isInterfaceDeviceInfoPresent {
 					pfWithinVPC = append(pfWithinVPC, vpcPrefix.VpcID)
+					primaryPhysicalInterfaceUsesVpcSelection = false
 				} else if ifc.DeviceInstance != nil && *ifc.DeviceInstance == 0 {
 					pfWithinVPC = []uuid.UUID{vpcPrefix.VpcID}
+					primaryPhysicalInterfaceUsesVpcSelection = false
 				}
 			}
 
@@ -650,6 +752,46 @@ func (cih CreateInstanceHandler) Handle(c echo.Context) error {
 				Status:               cdbm.InterfaceStatusPending,
 			})
 		}
+
+		if ifc.VpcID != nil {
+			interfaceVpcID := uuid.MustParse(*ifc.VpcID)
+			interfaceVpc := interfaceVpcIDMap[interfaceVpcID]
+			if vpc.NetworkVirtualizationType == nil || *vpc.NetworkVirtualizationType != cdbm.VpcFNN {
+				logger.Warn().Msg(fmt.Sprintf("VPC: %v specified in request must have FNN network virtualization type in order to create VPC based interfaces", vpc.ID))
+				return cutil.NewAPIErrorResponse(c, http.StatusBadRequest, fmt.Sprintf("VPC: %v specified in request must have FNN network virtualization type in order to create VPC based interfaces", vpc.ID), nil)
+			}
+
+			if !allRequestedVpcIds.Contains(interfaceVpcID) {
+				logger.Error().Msgf("One or more Interfaces specify VPC: %s which is not specified in 'vpcId' or 'secondaryVpcIds'", interfaceVpcID)
+				return cutil.NewAPIErrorResponse(c, http.StatusBadRequest, fmt.Sprintf("One or more Interfaces specify VPC: %s which is not specified in 'vpcId' or 'secondaryVpcIds'", interfaceVpcID), nil)
+			}
+
+			allFoundVpcIds.Add(interfaceVpcID)
+			if ifc.Device != nil && ifc.DeviceInstance != nil {
+				isInterfaceDeviceInfoPresent = true
+			}
+			if ifc.IsPhysical {
+				if !isInterfaceDeviceInfoPresent {
+					pfWithinVPC = append(pfWithinVPC, interfaceVpcID)
+					primaryPhysicalInterfaceUsesVpcSelection = true
+				} else if ifc.DeviceInstance != nil && *ifc.DeviceInstance == 0 {
+					pfWithinVPC = []uuid.UUID{interfaceVpcID}
+					primaryPhysicalInterfaceUsesVpcSelection = true
+				}
+			}
+
+			dbInterfaces = append(dbInterfaces, cdbm.Interface{
+				VpcID:                &interfaceVpcID,
+				Vpc:                  interfaceVpc,
+				VpcIPFamilyMode:      cutil.GetPtr(cdbm.InterfaceVpcIPFamilyModeIPv4Only),
+				InlineRoutingProfile: ifc.InlineRoutingProfile.ToDB(),
+				Device:               ifc.Device,
+				DeviceInstance:       ifc.DeviceInstance,
+				VirtualFunctionID:    ifc.VirtualFunctionID,
+				IsPhysical:           ifc.IsPhysical,
+				Status:               cdbm.InterfaceStatusPending,
+			})
+		}
 	}
 
 	// If there are ethernet interfaces for this Instance,
@@ -661,6 +803,14 @@ func (cih CreateInstanceHandler) Handle(c echo.Context) error {
 		// be possible at this point), or if the VPC of the first
 		// PF doesn't match the (primary) VPC of the instance.
 		if len(pfWithinVPC) == 0 || pfWithinVPC[0] != vpc.ID {
+			if primaryPhysicalInterfaceUsesVpcSelection || (len(pfWithinVPC) == 0 && len(interfaceVpcIDMap) > 0) {
+				logger.Error().Msg("the primary physical interface must use the Instance VPC")
+				if !isInterfaceDeviceInfoPresent {
+					return cutil.NewAPIErrorResponse(c, http.StatusBadRequest, "The primary physical Interface must use the VPC specified in `vpcId`", nil)
+				}
+				return cutil.NewAPIErrorResponse(c, http.StatusBadRequest, "The primary physical Interface for deviceInstance: 0 must use the VPC specified in `vpcId`", nil)
+			}
+
 			logger.Error().Msg("the primary physical interface must use a VPC prefix that matches with Instance VPC")
 
 			if !isInterfaceDeviceInfoPresent {
@@ -673,6 +823,10 @@ func (cih CreateInstanceHandler) Handle(c echo.Context) error {
 		// the reality of the VPC associations found based on interface
 		// definitions.
 		if allRequestedVpcIds.Cardinality() != allFoundVpcIds.Cardinality() {
+			if len(interfaceVpcIDMap) > 0 {
+				logger.Error().Msg("one or more VPCs specified in `vpcId` or `secondaryVpcIds` are not used by Interfaces in request data")
+				return cutil.NewAPIErrorResponse(c, http.StatusBadRequest, "One or more VPCs specified in `vpcId` or `secondaryVpcIds` are not used by Interfaces in request data", nil)
+			}
 			logger.Error().Msg("one or more Interfaces in request data specify VPC Prefixes that do not belong to VPCs specified in `vpcId` or `secondaryVpcIds`")
 			return cutil.NewAPIErrorResponse(c, http.StatusBadRequest, "One or more Interfaces in request data specify VPC Prefixes that do not belong to VPCs specified in `vpcId` or `secondaryVpcIds`", nil)
 		}
@@ -1402,6 +1556,8 @@ func (cih CreateInstanceHandler) Handle(c echo.Context) error {
 			input := cdbm.InterfaceCreateInput{
 				InstanceID:           instance.ID,
 				SubnetID:             dbifc.SubnetID,
+				VpcID:                dbifc.VpcID,
+				VpcIPFamilyMode:      dbifc.VpcIPFamilyMode,
 				VpcPrefixID:          dbifc.VpcPrefixID,
 				Device:               dbifc.Device,
 				DeviceInstance:       dbifc.DeviceInstance,
@@ -1420,6 +1576,7 @@ func (cih CreateInstanceHandler) Handle(c echo.Context) error {
 			}
 
 			ifc := *retifc
+			ifc.Vpc = dbifc.Vpc
 			ifc.VpcPrefix = dbifc.VpcPrefix // We created the interface in the DB based on the values in dbifc, so we can populate this as well.
 			ifcs = append(ifcs, ifc)
 
@@ -1439,8 +1596,15 @@ func (cih CreateInstanceHandler) Handle(c echo.Context) error {
 				}
 			}
 
-			// Assign InstanceInterfaceConfig_VpcPrefixId in case of VpcPrefix
-			if dbifc.VpcPrefixID != nil {
+			// Preserve unresolved VPC intent; otherwise use the explicit prefix.
+			vpcSelection, serr := instanceInterfaceVpcSelection(&dbifc)
+			if serr != nil {
+				logger.Error().Err(serr).Msg("failed to build VPC selection for Instance Interface")
+				return cutil.NewAPIError(http.StatusInternalServerError, "Failed to build VPC selection for Instance Interface", nil)
+			}
+			if vpcSelection != nil {
+				interfaceConfig.NetworkDetails = &corev1.InstanceInterfaceConfig_Vpc{Vpc: vpcSelection}
+			} else if dbifc.VpcPrefixID != nil {
 				interfaceConfig.NetworkDetails = &corev1.InstanceInterfaceConfig_VpcPrefixId{
 					VpcPrefixId: &corev1.VpcPrefixId{Value: dbifc.VpcPrefixID.String()},
 				}
@@ -1693,7 +1857,7 @@ func (cih CreateInstanceHandler) Handle(c echo.Context) error {
 				return cutil.NewAPIError(http.StatusInternalServerError, "Instance create workflow timed out", nil)
 			}
 
-			code, err := common.UnwrapWorkflowError(err)
+			code, err := common.UnwrapWorkflowError(err, codes.ResourceExhausted)
 			logger.Error().Err(err).Msg("failed to synchronously execute Temporal workflow to create Instance")
 			return cutil.NewAPIError(code, fmt.Sprintf("Failed to execute sync workflow to create Instance on Site: %s", err), nil)
 		}
@@ -2385,6 +2549,13 @@ func (uih UpdateInstanceHandler) Handle(c echo.Context) error {
 		}
 	}
 
+	// Load VPCs only for interfaces using Core-managed prefix selection.
+	interfaceVpcIDMap, interfaceVpcErr := loadInstanceInterfaceVpcs(ctx, &logger, uih.dbSession, apiRequest.Interfaces, tenant.ID, site.ID)
+	if interfaceVpcErr != nil {
+		logger.Warn().Err(interfaceVpcErr).Msg("failed to validate VPCs specified by Instance interfaces")
+		return cutil.NewAPIErrorResponse(c, interfaceVpcErr.Code, interfaceVpcErr.Message, interfaceVpcErr.Data)
+	}
+
 	existingSubnetIfcMap := map[uuid.UUID]int{}
 	existingVpcPrefixIfcMap := map[uuid.UUID]int{}
 	if len(apiRequest.Interfaces) > 0 {
@@ -2409,6 +2580,7 @@ func (uih UpdateInstanceHandler) Handle(c echo.Context) error {
 	dbInterfaces := []cdbm.Interface{}
 	isDeviceInfoPresent := false
 	pfWithinVPC := []uuid.UUID{}
+	primaryPhysicalInterfaceUsesVpcSelection := false
 	allFoundVpcIds := goset.NewSet[uuid.UUID]()
 
 	// Prepare the unique set of all VPC IDs for this instance update.
@@ -2559,8 +2731,10 @@ func (uih UpdateInstanceHandler) Handle(c echo.Context) error {
 				// is by definition not the primary.
 				if !isDeviceInfoPresent {
 					pfWithinVPC = append(pfWithinVPC, vpcPrefix.VpcID)
+					primaryPhysicalInterfaceUsesVpcSelection = false
 				} else if ifc.DeviceInstance != nil && *ifc.DeviceInstance == 0 {
 					pfWithinVPC = []uuid.UUID{vpcPrefix.VpcID}
+					primaryPhysicalInterfaceUsesVpcSelection = false
 				}
 			}
 
@@ -2570,7 +2744,7 @@ func (uih UpdateInstanceHandler) Handle(c echo.Context) error {
 			}
 
 			// Check if VPC Prefix is exhausted
-			incomingInterfaceIPs := vpcPrefixIfcMap[vpcPrefixID] - existingVpcPrefixIfcMap[vpcPrefixID]
+			incomingInterfaceIPs := max(vpcPrefixIfcMap[vpcPrefixID]-existingVpcPrefixIfcMap[vpcPrefixID], 0)
 			vpUsage := vpcPrefixUsageMap[vpcPrefixID]
 			if vpUsage != nil && vpUsage.AvailableIPs > 0 && vpUsage.AcquiredIPs+uint64(incomingInterfaceIPs)*2 > vpUsage.AvailableIPs {
 				msg := fmt.Sprintf(
@@ -2592,6 +2766,46 @@ func (uih UpdateInstanceHandler) Handle(c echo.Context) error {
 				IsPhysical:           ifc.IsPhysical,
 				Status:               cdbm.InterfaceStatusPending})
 		}
+
+		if ifc.VpcID != nil {
+			interfaceVpcID := uuid.MustParse(*ifc.VpcID)
+			interfaceVpc := interfaceVpcIDMap[interfaceVpcID]
+			if vpc.NetworkVirtualizationType == nil || *vpc.NetworkVirtualizationType != cdbm.VpcFNN {
+				logger.Warn().Msg(fmt.Sprintf("VPC: %v specified in request must have FNN network virtualization type in order to create VPC based interfaces", instance.VpcID))
+				return cutil.NewAPIErrorResponse(c, http.StatusBadRequest, fmt.Sprintf("VPC: %v specified in request must have FNN network virtualization type in order to create VPC based interfaces", instance.VpcID), nil)
+			}
+
+			if !allRequestedVpcIds.Contains(interfaceVpcID) {
+				logger.Error().Msgf("One or more Interfaces specify VPC: %s which is not specified in 'vpcId' or 'secondaryVpcIds'", interfaceVpcID)
+				return cutil.NewAPIErrorResponse(c, http.StatusBadRequest, fmt.Sprintf("One or more Interfaces specify VPC: %s which is not specified in 'vpcId' or 'secondaryVpcIds'", interfaceVpcID), nil)
+			}
+
+			allFoundVpcIds.Add(interfaceVpcID)
+			if ifc.Device != nil && ifc.DeviceInstance != nil {
+				isDeviceInfoPresent = true
+			}
+			if ifc.IsPhysical {
+				if !isDeviceInfoPresent {
+					pfWithinVPC = append(pfWithinVPC, interfaceVpcID)
+					primaryPhysicalInterfaceUsesVpcSelection = true
+				} else if ifc.DeviceInstance != nil && *ifc.DeviceInstance == 0 {
+					pfWithinVPC = []uuid.UUID{interfaceVpcID}
+					primaryPhysicalInterfaceUsesVpcSelection = true
+				}
+			}
+
+			dbInterfaces = append(dbInterfaces, cdbm.Interface{
+				VpcID:                &interfaceVpcID,
+				Vpc:                  interfaceVpc,
+				VpcIPFamilyMode:      cutil.GetPtr(cdbm.InterfaceVpcIPFamilyModeIPv4Only),
+				InlineRoutingProfile: ifc.InlineRoutingProfile.ToDB(),
+				Device:               ifc.Device,
+				DeviceInstance:       ifc.DeviceInstance,
+				VirtualFunctionID:    ifc.VirtualFunctionID,
+				IsPhysical:           ifc.IsPhysical,
+				Status:               cdbm.InterfaceStatusPending,
+			})
+		}
 	}
 
 	// If there are ethernet interfaces for this Instance,
@@ -2600,6 +2814,14 @@ func (uih UpdateInstanceHandler) Handle(c echo.Context) error {
 		vpc.NetworkVirtualizationType != nil &&
 		*vpc.NetworkVirtualizationType == cdbm.VpcFNN {
 		if len(pfWithinVPC) == 0 || pfWithinVPC[0] != vpc.ID {
+			if primaryPhysicalInterfaceUsesVpcSelection || (len(pfWithinVPC) == 0 && len(interfaceVpcIDMap) > 0) {
+				logger.Error().Msg("the physical interface must use the Instance VPC")
+				if !isDeviceInfoPresent {
+					return cutil.NewAPIErrorResponse(c, http.StatusBadRequest, "The physical Interface must use the VPC specified in `vpcId`", nil)
+				}
+				return cutil.NewAPIErrorResponse(c, http.StatusBadRequest, "The physical Interface for deviceInstance: 0 must use the VPC specified in `vpcId`", nil)
+			}
+
 			logger.Error().Msg("the primary physical interface must use a VPC prefix that matches with Instance VPC")
 
 			if !isDeviceInfoPresent {
@@ -2609,6 +2831,10 @@ func (uih UpdateInstanceHandler) Handle(c echo.Context) error {
 			}
 		}
 		if allRequestedVpcIds.Cardinality() != allFoundVpcIds.Cardinality() {
+			if len(interfaceVpcIDMap) > 0 {
+				logger.Error().Msg("one or more VPCs specified in `vpcId` or `secondaryVpcIds` are not used by Interfaces in request data")
+				return cutil.NewAPIErrorResponse(c, http.StatusBadRequest, "One or more VPCs specified in `vpcId` or `secondaryVpcIds` are not used by Interfaces in request data", nil)
+			}
 			logger.Error().Msg("one or more Interfaces in request data specify VPC Prefixes that do not belong to VPCs specified in `vpcId` or `secondaryVpcIds`")
 			return cutil.NewAPIErrorResponse(c, http.StatusBadRequest, "One or more Interfaces in request data specify VPC Prefixes that do not belong to VPCs specified in `vpcId` or `secondaryVpcIds`", nil)
 		}
@@ -3133,7 +3359,7 @@ func (uih UpdateInstanceHandler) Handle(c echo.Context) error {
 		// OrderAscending is our best-effort to make sure we send
 		// NICo the interfaces in the order it originally received them
 		// so the config doesn't get rejected.
-		existingIfcs, _, derr = ifcDAO.GetAll(ctx, tx, cdbm.InterfaceFilterInput{InstanceIDs: []uuid.UUID{instance.ID}}, cdbp.PageInput{OrderBy: &cdbp.OrderBy{Field: cdbm.InterfaceOrderByCreated, Order: cdbp.OrderAscending}}, []string{cdbm.SubnetRelationName, cdbm.VpcPrefixRelationName})
+		existingIfcs, _, derr = ifcDAO.GetAll(ctx, tx, cdbm.InterfaceFilterInput{InstanceIDs: []uuid.UUID{instance.ID}}, cdbp.PageInput{OrderBy: &cdbp.OrderBy{Field: cdbm.InterfaceOrderByCreated, Order: cdbp.OrderAscending}}, []string{cdbm.SubnetRelationName, cdbm.VpcRelationName, cdbm.VpcPrefixRelationName})
 		if derr != nil {
 			logger.Error().Err(derr).Msg("failed to retrieve current Ethernet Interfaces details for Instance")
 			return cutil.NewAPIError(http.StatusInternalServerError, "Failed to retrieve current Ethernet Interfaces for Instance, DB error", nil)
@@ -3167,6 +3393,8 @@ func (uih UpdateInstanceHandler) Handle(c echo.Context) error {
 				input := cdbm.InterfaceCreateInput{
 					InstanceID:           instance.ID,
 					SubnetID:             dbifc.SubnetID,
+					VpcID:                dbifc.VpcID,
+					VpcIPFamilyMode:      dbifc.VpcIPFamilyMode,
 					VpcPrefixID:          dbifc.VpcPrefixID,
 					Device:               dbifc.Device,
 					DeviceInstance:       dbifc.DeviceInstance,
@@ -3185,6 +3413,7 @@ func (uih UpdateInstanceHandler) Handle(c echo.Context) error {
 				}
 
 				ifc := *newDbifc
+				ifc.Vpc = dbifc.Vpc
 				ifc.VpcPrefix = dbifc.VpcPrefix // We created the interface in the DB based on the values in dbifc, so we can populate this as well.
 				// Add the new Interface to the list of new Interfaces
 				newdbIfcs = append(newdbIfcs, ifc)
@@ -3551,7 +3780,8 @@ func (uih UpdateInstanceHandler) Handle(c echo.Context) error {
 		}
 
 		interfaceConfigs := make([]*corev1.InstanceInterfaceConfig, len(newdbIfcs))
-		for i, ifc := range newdbIfcs {
+		for i := range newdbIfcs {
+			ifc := &newdbIfcs[i]
 			if ifc.Status == cdbm.InterfaceStatusDeleting {
 				// NOTE: Don't send any Interfaces that are being deleted
 				continue
@@ -3568,7 +3798,14 @@ func (uih UpdateInstanceHandler) Handle(c echo.Context) error {
 				}
 			}
 
-			if ifc.VpcPrefixID != nil {
+			vpcSelection, serr := instanceInterfaceVpcSelection(ifc)
+			if serr != nil {
+				logger.Error().Err(serr).Msg("failed to build VPC selection for Instance Interface")
+				return cutil.NewAPIError(http.StatusInternalServerError, "Failed to build VPC selection for Instance Interface", nil)
+			}
+			if vpcSelection != nil {
+				interfaceConfig.NetworkDetails = &corev1.InstanceInterfaceConfig_Vpc{Vpc: vpcSelection}
+			} else if ifc.VpcPrefixID != nil {
 				interfaceConfig.NetworkDetails = &corev1.InstanceInterfaceConfig_VpcPrefixId{
 					VpcPrefixId: &corev1.VpcPrefixId{Value: ifc.VpcPrefixID.String()},
 				}
@@ -3730,7 +3967,7 @@ func (uih UpdateInstanceHandler) Handle(c echo.Context) error {
 				return cutil.NewAPIError(http.StatusInternalServerError, "Instance update workflow timed out", nil)
 			}
 
-			code, unwrapped := common.UnwrapWorkflowError(wferr)
+			code, unwrapped := common.UnwrapWorkflowError(wferr, codes.ResourceExhausted)
 			logger.Error().Err(unwrapped).Msg("failed to synchronously execute Temporal workflow to update Instance")
 			return cutil.NewAPIError(code, fmt.Sprintf("Failed to execute sync workflow to update Instance on Site: %s", unwrapped), nil)
 		}
@@ -3794,7 +4031,9 @@ func AttachVpcNsgPropagationDetailsToApiInstance(c echo.Context, ctx context.Con
 	// the list with that.
 	vpcIDs := goset.NewSet[uuid.UUID]()
 	for _, ifc := range interfaces {
-		if ifc.VpcPrefix != nil {
+		if ifc.VpcID != nil {
+			vpcIDs.Add(*ifc.VpcID)
+		} else if ifc.VpcPrefix != nil {
 			vpcIDs.Add(ifc.VpcPrefix.VpcID)
 		}
 
@@ -4540,7 +4779,10 @@ func (gaih GetAllInstanceHandler) Handle(c echo.Context) error {
 
 			// Collect the sets of _all_ VPC IDs for the instances so we can use
 			// it later for determining NSG propagation.
-			if ifc.VpcPrefix != nil {
+			if ifc.VpcID != nil {
+				vpcsByInstance[ifc.InstanceID].Add(*ifc.VpcID)
+				inheritVpcIDs.Add(*ifc.VpcID)
+			} else if ifc.VpcPrefix != nil {
 				vpcsByInstance[ifc.InstanceID].Add(ifc.VpcPrefix.VpcID)
 				inheritVpcIDs.Add(ifc.VpcPrefix.VpcID)
 			}

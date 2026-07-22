@@ -43,6 +43,85 @@ type ManageInstance struct {
 	cfg            *config.Config
 }
 
+// vpcInterfaceInventoryMatcher aligns Core VPC selectors with persisted REST
+// interface intent. Interfaces without a device are consumed in creation order
+// because multiple selectors for the same VPC are otherwise indistinguishable.
+type vpcInterfaceInventoryMatcher struct {
+	byDevice map[string]*cdbm.Interface
+	queues   map[string][]*cdbm.Interface
+}
+
+// interfaceDeviceIdentity returns the stable device identity shared by REST
+// interface rows and Core interface configs.
+func interfaceDeviceIdentity(device string, deviceInstance int, isPhysical bool, virtualFunctionID *int) (string, bool) {
+	deviceIdentity := fmt.Sprintf("%s-%d", device, deviceInstance)
+	if isPhysical {
+		return fmt.Sprintf("%s-physical", deviceIdentity), true
+	}
+	if virtualFunctionID == nil {
+		return "", false
+	}
+	return fmt.Sprintf("%s-virtual-%d", deviceIdentity, *virtualFunctionID), true
+}
+
+// add records a persisted VPC-selection interface using its Controller VPC ID.
+func (m *vpcInterfaceInventoryMatcher) add(ifc *cdbm.Interface) {
+	if ifc.VpcID == nil || ifc.Vpc == nil || ifc.Vpc.ControllerVpcID == nil {
+		return
+	}
+
+	vpcID := ifc.Vpc.ControllerVpcID.String()
+	if ifc.Device == nil {
+		m.queues[vpcID] = append(m.queues[vpcID], ifc)
+		return
+	}
+
+	deviceInstance := 0
+	if ifc.DeviceInstance != nil {
+		deviceInstance = *ifc.DeviceInstance
+	}
+	deviceIdentity, ok := interfaceDeviceIdentity(*ifc.Device, deviceInstance, ifc.IsPhysical, ifc.VirtualFunctionID)
+	if !ok {
+		return
+	}
+	m.byDevice[vpcID+":"+deviceIdentity] = ifc
+}
+
+// match returns the persisted interface represented by a Core VPC selector.
+func (m *vpcInterfaceInventoryMatcher) match(interfaceConfig *corev1.InstanceInterfaceConfig, selection *corev1.InstanceInterfaceVpcSelection) (*cdbm.Interface, bool) {
+	if selection == nil || selection.VpcId == nil {
+		return nil, false
+	}
+
+	vpcID := selection.VpcId.Value
+	if interfaceConfig.Device != nil {
+		var virtualFunctionID *int
+		if interfaceConfig.VirtualFunctionId != nil {
+			value := int(*interfaceConfig.VirtualFunctionId)
+			virtualFunctionID = &value
+		}
+		deviceIdentity, ok := interfaceDeviceIdentity(
+			*interfaceConfig.Device,
+			int(interfaceConfig.DeviceInstance),
+			interfaceConfig.FunctionType == corev1.InterfaceFunctionType_PHYSICAL_FUNCTION,
+			virtualFunctionID,
+		)
+		if !ok {
+			return nil, false
+		}
+		ifc, ok := m.byDevice[vpcID+":"+deviceIdentity]
+		return ifc, ok
+	}
+
+	queue := m.queues[vpcID]
+	if len(queue) == 0 {
+		return nil, false
+	}
+	ifc := queue[0]
+	m.queues[vpcID] = queue[1:]
+	return ifc, true
+}
+
 // Activity functions
 
 // UpdateInstancesInDB is a Temporal activity that takes a collection of Instance data pushed by Site Agent and updates the DB
@@ -322,17 +401,30 @@ func (mi ManageInstance) UpdateInstancesInDB(ctx context.Context, siteID uuid.UU
 		}
 
 		// Process/update Ethernet Interfaces in DB
-		// Process Interface type of VpcPrefix as well as Subnet
+		// Process Interface types of VPC selection, VpcPrefix, and Subnet.
 		if controllerInstance.Config.Network != nil && controllerInstance.Status.Network != nil {
 			interfaceDAO := cdbm.NewInterfaceDAO(mi.dbSession)
-			interfaces, _, serr := interfaceDAO.GetAll(ctx, nil, cdbm.InterfaceFilterInput{InstanceIDs: []uuid.UUID{instance.ID}}, cdbp.PageInput{Limit: cwutil.GetPtr(cdbp.TotalLimit)}, []string{cdbm.SubnetRelationName, cdbm.VpcPrefixRelationName})
+			interfaces, _, serr := interfaceDAO.GetAll(
+				ctx,
+				nil,
+				cdbm.InterfaceFilterInput{InstanceIDs: []uuid.UUID{instance.ID}},
+				cdbp.PageInput{
+					Limit:   cwutil.GetPtr(cdbp.TotalLimit),
+					OrderBy: &cdbp.OrderBy{Field: cdbm.InterfaceOrderByCreated, Order: cdbp.OrderAscending},
+				},
+				[]string{cdbm.SubnetRelationName, cdbm.VpcRelationName, cdbm.VpcPrefixRelationName},
+			)
 			if serr != nil {
 				slogger.Error().Err(serr).Msg("failed to get Interfaces for Instance from DB")
 				continue
 			}
 
-			// Build either Subnet or VpcPrefix Map
+			// Build lookup maps from persisted interface intent.
 			interfaceMap := map[string]*cdbm.Interface{}
+			vpcInterfaceMatcher := &vpcInterfaceInventoryMatcher{
+				byDevice: map[string]*cdbm.Interface{},
+				queues:   map[string][]*cdbm.Interface{},
+			}
 			for _, ifc := range interfaces {
 				curIfc := ifc
 
@@ -343,6 +435,8 @@ func (mi ManageInstance) UpdateInstancesInDB(ctx context.Context, siteID uuid.UU
 						continue
 					}
 				} else {
+					vpcInterfaceMatcher.add(&curIfc)
+
 					// Build multi DPU interface map where same VPC prefix can have multiple interfaces
 					if ifc.VpcPrefixID != nil && ifc.Device != nil {
 						// Multi DPU interface
@@ -379,10 +473,11 @@ func (mi ManageInstance) UpdateInstancesInDB(ctx context.Context, siteID uuid.UU
 			for idx, interfaceConfig := range controllerInstance.Config.Network.Interfaces {
 				var ok bool
 				var ifc *cdbm.Interface
+				usesVpcSelection := false
 
-				// Parse the VpcPrefix if it is specified
+				// Match the controller config to its persisted REST interface intent.
 				if interfaceConfig.NetworkDetails != nil {
-					switch interfaceConfig.NetworkDetails.(type) {
+					switch networkDetails := interfaceConfig.NetworkDetails.(type) {
 					case *corev1.InstanceInterfaceConfig_VpcPrefixId:
 						if interfaceConfig.Device != nil {
 							// Multi DPU interface
@@ -395,10 +490,13 @@ func (mi ManageInstance) UpdateInstancesInDB(ctx context.Context, siteID uuid.UU
 							ifc, ok = interfaceMap[deviceInstanceId]
 						} else {
 							// FNN interface
-							ifc, ok = interfaceMap[interfaceConfig.NetworkDetails.(*corev1.InstanceInterfaceConfig_VpcPrefixId).VpcPrefixId.Value]
+							ifc, ok = interfaceMap[networkDetails.VpcPrefixId.Value]
 						}
 					case *corev1.InstanceInterfaceConfig_SegmentId:
-						ifc, ok = interfaceMap[interfaceConfig.NetworkDetails.(*corev1.InstanceInterfaceConfig_SegmentId).SegmentId.Value]
+						ifc, ok = interfaceMap[networkDetails.SegmentId.Value]
+					case *corev1.InstanceInterfaceConfig_Vpc:
+						usesVpcSelection = true
+						ifc, ok = vpcInterfaceMatcher.match(interfaceConfig, networkDetails.Vpc)
 					}
 				} else {
 					if interfaceConfig.NetworkSegmentId != nil {
@@ -410,9 +508,15 @@ func (mi ManageInstance) UpdateInstancesInDB(ctx context.Context, siteID uuid.UU
 					continue
 				}
 
+				// Config and status interface indices are aligned by Core. A partial
+				// inventory must not panic or shift status onto a different interface.
+				if idx >= len(controllerInstance.Status.Network.Interfaces) {
+					slogger.Warn().Int("Interface Index", idx).Msg("Site Controller Instance is missing matching Interface status")
+					continue
+				}
 				interfaceStatus := controllerInstance.Status.Network.Interfaces[idx]
 				if interfaceStatus != nil {
-					// Update Instance Subnet attributes and status in DB
+					// Update Instance Interface attributes and status in DB
 					var vfID *int
 					if interfaceStatus.VirtualFunctionId != nil {
 						vfID = cwutil.GetPtr(int(*interfaceStatus.VirtualFunctionId))
@@ -438,14 +542,34 @@ func (mi ManageInstance) UpdateInstancesInDB(ctx context.Context, siteID uuid.UU
 						inlineRoutingProfile.FromProto(interfaceConfig.RoutingProfile)
 					}
 
+					// A VPC selector remains the desired intent; synchronize Core's
+					// resolved IPv4 prefix from the aligned status.
+					var vpcPrefixID *uuid.UUID
+					clearResolvedVpcPrefix := false
+					if usesVpcSelection {
+						if interfaceStatus.ResolvedVpcPrefixes == nil ||
+							interfaceStatus.ResolvedVpcPrefixes.Ipv4VpcPrefixId == nil {
+							clearResolvedVpcPrefix = controllerInstance.Status.Network.ConfigsSynced == corev1.SyncState_SYNCED &&
+								ifc.VpcPrefixID != nil
+						} else {
+							resolvedPrefixID, prefixErr := uuid.Parse(interfaceStatus.ResolvedVpcPrefixes.Ipv4VpcPrefixId.Value)
+							if prefixErr != nil {
+								slogger.Error().Err(prefixErr).Str("Interface ID", ifc.ID.String()).Msg("failed to parse resolved IPv4 VPC Prefix ID")
+							} else {
+								vpcPrefixID = &resolvedPrefixID
+							}
+						}
+					}
+
 					clearInput := cdbm.InterfaceClearInput{InterfaceID: ifc.ID}
+					clearInput.VpcPrefixID = clearResolvedVpcPrefix
 					if ifc.RequestedIpAddress != nil && interfaceConfig.IpAddress == nil {
 						clearInput.RequestedIpAddress = true
 					}
 					if ifc.InlineRoutingProfile != nil && interfaceConfig.RoutingProfile == nil {
 						clearInput.InlineRoutingProfile = true
 					}
-					if clearInput.RequestedIpAddress || clearInput.InlineRoutingProfile {
+					if clearInput.VpcPrefixID || clearInput.RequestedIpAddress || clearInput.InlineRoutingProfile {
 						_, serr := interfaceDAO.Clear(ctx, nil, clearInput)
 						if serr != nil {
 							slogger.Error().Err(serr).Str("Interface ID", ifc.ID.String()).Msg("failed to update Interface in DB")
@@ -458,9 +582,20 @@ func (mi ManageInstance) UpdateInstancesInDB(ctx context.Context, siteID uuid.UU
 						status = cwutil.GetPtr(cdbm.InterfaceStatusReady)
 					}
 
-					_, serr := interfaceDAO.Update(ctx, nil, cdbm.InterfaceUpdateInput{InterfaceID: ifc.ID, Device: device, DeviceInstance: deviceInstance, VirtualFunctionID: vfID, RequestedIpAddress: requestedIpAddress, InlineRoutingProfile: inlineRoutingProfile, MacAddress: macAddress, IpAddresses: ipAddresses, Status: status})
-					if serr != nil {
-						slogger.Error().Err(serr).Str("Interface ID", ifc.ID.String()).Msg("failed to update Interface in DB")
+					_, updateErr := interfaceDAO.Update(ctx, nil, cdbm.InterfaceUpdateInput{
+						InterfaceID:          ifc.ID,
+						VpcPrefixID:          vpcPrefixID,
+						Device:               device,
+						DeviceInstance:       deviceInstance,
+						VirtualFunctionID:    vfID,
+						RequestedIpAddress:   requestedIpAddress,
+						InlineRoutingProfile: inlineRoutingProfile,
+						MacAddress:           macAddress,
+						IpAddresses:          ipAddresses,
+						Status:               status,
+					})
+					if updateErr != nil {
+						slogger.Error().Err(updateErr).Str("Interface ID", ifc.ID.String()).Msg("failed to update Interface in DB")
 					}
 				}
 			}

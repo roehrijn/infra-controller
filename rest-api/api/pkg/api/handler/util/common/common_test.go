@@ -394,12 +394,16 @@ func TestUnwrapWorkflowError(t *testing.T) {
 	causeErr := errors.New("other error")
 	grpcPerm := status.Error(codes.PermissionDenied, "forbidden")
 	grpcInvalid := status.Error(codes.InvalidArgument, "Maximum Limit of Infiniband partitions had been reached")
+	grpcResourceExhausted := status.Error(codes.ResourceExhausted, "VPC prefix capacity exhausted")
+	wrappedResourceExhausted := swe.WrapErr(grpcResourceExhausted)
 
 	tests := []struct {
-		name     string
-		err      error
-		wantCode int
-		wantErr  error
+		name                     string
+		err                      error
+		additionalCodes          []codes.Code
+		wantCode                 int
+		wantErr                  error
+		wantApplicationErrorType string
 	}{
 		{
 			name:     "unwraps Temporal cause",
@@ -426,10 +430,37 @@ func TestUnwrapWorkflowError(t *testing.T) {
 			wantErr:  grpcInvalid,
 		},
 		{
+			name:     "does not map gRPC resource exhausted by default",
+			err:      temporal.NewApplicationErrorWithCause("wrapper", "error", grpcResourceExhausted),
+			wantCode: http.StatusInternalServerError,
+			wantErr:  grpcResourceExhausted,
+		},
+		{
+			name:            "maps opted-in gRPC resource exhausted",
+			err:             temporal.NewApplicationErrorWithCause("wrapper", "error", grpcResourceExhausted),
+			additionalCodes: []codes.Code{codes.ResourceExhausted},
+			wantCode:        http.StatusTooManyRequests,
+			wantErr:         grpcResourceExhausted,
+		},
+		{
 			name:     "maps non-gRPC error with collected invalid argument (nvbugs 5778658)",
 			err:      temporal.NewApplicationErrorWithCause("wrapper", swe.ErrTypeNICoInvalidArgument, causeErr),
 			wantCode: http.StatusBadRequest,
 			wantErr:  causeErr,
+		},
+		{
+			name:     "does not map wrapped gRPC resource exhausted by default",
+			err:      wrappedResourceExhausted,
+			wantCode: http.StatusInternalServerError,
+			wantErr:  grpcResourceExhausted,
+		},
+		{
+			name:                     "maps opted-in wrapped gRPC resource exhausted",
+			err:                      wrappedResourceExhausted,
+			additionalCodes:          []codes.Code{codes.ResourceExhausted},
+			wantCode:                 http.StatusTooManyRequests,
+			wantErr:                  grpcResourceExhausted,
+			wantApplicationErrorType: swe.ErrTypeNICoResourceExhausted,
 		},
 		{
 			name:     "unwraps ApplicationError wrapped in generic error chain",
@@ -441,7 +472,14 @@ func TestUnwrapWorkflowError(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			code, gotErr := UnwrapWorkflowError(tt.err)
+			if tt.wantApplicationErrorType != "" {
+				var applicationErr *temporal.ApplicationError
+				require.ErrorAs(t, tt.err, &applicationErr)
+				assert.Equal(t, tt.wantApplicationErrorType, applicationErr.Type())
+				assert.True(t, applicationErr.NonRetryable())
+			}
+
+			code, gotErr := UnwrapWorkflowError(tt.err, tt.additionalCodes...)
 			assert.Equal(t, tt.wantCode, code)
 			assert.Equal(t, tt.wantErr, gotErr)
 		})
