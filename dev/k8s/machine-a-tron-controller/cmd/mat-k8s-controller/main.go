@@ -88,6 +88,10 @@ func main() {
 		logger.Fatal().Err(err).Msg("failed to create Kubernetes config")
 	}
 
+	// Increase rate limits for bulk operations
+	k8sConfig.QPS = 100
+	k8sConfig.Burst = 200
+
 	clientset, err := kubernetes.NewForConfig(k8sConfig)
 	if err != nil {
 		logger.Fatal().Err(err).Msg("failed to create Kubernetes clientset")
