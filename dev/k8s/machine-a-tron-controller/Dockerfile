@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # Build stage
-FROM golang:1.26.4-alpine@sha256:4cfbe7d6f07723e1efe21b4251ccf17d92a8c2a9e6f9e88d3f3f5026e5db8f7d AS builder
+FROM golang:1.26.4-alpine@sha256:3ad57304ad93bbec8548a0437ad9e06a455660655d9af011d58b993f6f615648 AS builder
 
 WORKDIR /app
 
@@ -13,7 +13,7 @@ COPY . .
 RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o mat-k8s-controller ./cmd/mat-k8s-controller
 
 # Runtime stage
-FROM gcr.io/distroless/static:nonroot@sha256:9ecc53c269509f63c69a266168b81a2f4c9d10c2f03e0d53dce6b8a2f9e1c1f1
+FROM gcr.io/distroless/static:nonroot@sha256:f7f8f729987ad0fdf6b05eeeae94b26e6a0f613bdf46feea7fc40f7bd72953e6
 
 COPY --from=builder /app/mat-k8s-controller /mat-k8s-controller
 
