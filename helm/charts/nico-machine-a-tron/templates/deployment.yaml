@@ -14,7 +14,7 @@ Count pods that should be deployed:
 {{- $activePods = add $activePods 1 }}
 {{- end }}
 {{- else }}
-{{- if $podConfig.machines }}
+{{- if and $podConfig.machines (gt (len $podConfig.machines) 0) }}
 {{- $activePods = add $activePods 1 }}
 {{- end }}
 {{- end }}
@@ -24,14 +24,14 @@ Count pods that should be deployed:
 {{/*
 Skip conditions:
 - When bmcServices.enabled: skip pods without CIDR
-- Otherwise: skip pods without machines
+- Otherwise: skip pods without machines (or empty machines)
 */}}
 {{- if $root.Values.bmcServices.enabled }}
 {{- if not $podConfig.cidr }}
 {{- continue }}
 {{- end }}
 {{- else }}
-{{- if not $podConfig.machines }}
+{{- if not (and $podConfig.machines (gt (len $podConfig.machines) 0)) }}
 {{- continue }}
 {{- end }}
 {{- end }}

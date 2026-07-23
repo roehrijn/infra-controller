@@ -22,8 +22,8 @@ spec:
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           args:
-            - --mat-url={{ include "mat-k8s-controller.matUrl" . }}
             - --namespace={{ include "mat-k8s-controller.namespace" . }}
+            - --discovery-selector={{ include "mat-k8s-controller.discoverySelector" . }}
             - --sync-interval={{ .Values.config.syncInterval }}
             - --insecure-skip-verify={{ .Values.config.insecureSkipVerify }}
             - --log-level={{ .Values.config.logLevel }}

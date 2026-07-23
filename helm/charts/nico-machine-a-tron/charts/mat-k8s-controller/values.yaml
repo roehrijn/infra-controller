@@ -1,7 +1,7 @@
-## mat-k8s-controller - Kubernetes controller for machine-a-tron BMC services
+## mat-k8s-controller - Kubernetes controller for machine-a-tron services
 ##
-## This controller dynamically creates/updates/deletes Kubernetes Services
-## based on machine-a-tron's /machines/status API.
+## This controller auto-discovers machine-a-tron pods via their bmc-mock Services
+## and creates/updates/deletes Kubernetes Services for each endpoint.
 
 ## Enable/disable the controller
 enabled: false
@@ -22,9 +22,11 @@ resources:
 
 ## Controller configuration
 config:
-  ## Default: https://<release-name>-bmc-mock.<namespace>.svc.cluster.local:1266
-  matUrl: ""
+  ## Label selector for discovering machine-a-tron Services
+  ## Default: machine-a-tron.nvidia.com/service=true
+  discoverySelector: ""
 
+  ## Pod selector for created Services (routes traffic to mat pods)
   ## Default: app.kubernetes.io/name=nico-machine-a-tron
   targetSelector: ""
 

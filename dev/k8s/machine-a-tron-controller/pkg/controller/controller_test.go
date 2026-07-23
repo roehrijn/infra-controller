@@ -388,10 +388,10 @@ func TestComputeServiceDiff(t *testing.T) {
 	}
 }
 
-func TestReconciler_Reconcile(t *testing.T) {
+func TestReconcileLogic(t *testing.T) {
 	ctx := context.Background()
 
-	mockClient := &mockK8sClient{
+	mockK8s := &mockK8sClient{
 		services: make(map[string]*corev1.Service),
 	}
 
@@ -402,58 +402,53 @@ func TestReconciler_Reconcile(t *testing.T) {
 		},
 	}
 
-	matClient := &mockMatClient{
-		status: &matclient.MachinesStatusResponse{
-			Machines: []matclient.MachineStatus{
-				{
-					MatID:      "host-1234",
-					APIState:   "Ready",
-					PowerState: "On",
-					BMC: matclient.BMCStatus{
-						IP: ptr("192.168.1.100"),
-						Redfish: matclient.EndpointStatus{
-							ReachablePort: 443,
-							ListenPort:    8443,
-						},
+	status := &matclient.MachinesStatusResponse{
+		Machines: []matclient.MachineStatus{
+			{
+				MatID:      "host-1234",
+				APIState:   "Ready",
+				PowerState: "On",
+				BMC: matclient.BMCStatus{
+					IP: ptr("192.168.1.100"),
+					Redfish: matclient.EndpointStatus{
+						ReachablePort: 443,
+						ListenPort:    8443,
 					},
 				},
 			},
 		},
 	}
 
-	reconciler := NewReconciler(nil, builder, mockClient)
-	reconciler.matClient = nil // We'll use the mock
-
 	// First reconcile: should create service
-	result := reconcileWithMockMatClient(ctx, reconciler, mockClient, matClient.status)
+	result := runTestReconcile(ctx, builder, mockK8s, status)
 	assert.Equal(t, 1, result.Created)
 	assert.Equal(t, 0, result.Updated)
 	assert.Equal(t, 0, result.Deleted)
 	assert.Empty(t, result.Errors)
-	assert.Len(t, mockClient.services, 1)
+	assert.Len(t, mockK8s.services, 1)
 
 	// Second reconcile with same state: no changes
-	result = reconcileWithMockMatClient(ctx, reconciler, mockClient, matClient.status)
+	result = runTestReconcile(ctx, builder, mockK8s, status)
 	assert.Equal(t, 0, result.Created)
 	assert.Equal(t, 0, result.Updated)
 	assert.Equal(t, 0, result.Deleted)
 
 	// Third reconcile with empty status: should delete
-	result = reconcileWithMockMatClient(ctx, reconciler, mockClient, &matclient.MachinesStatusResponse{})
+	result = runTestReconcile(ctx, builder, mockK8s, &matclient.MachinesStatusResponse{})
 	assert.Equal(t, 0, result.Created)
 	assert.Equal(t, 0, result.Updated)
 	assert.Equal(t, 1, result.Deleted)
-	assert.Empty(t, mockClient.services)
+	assert.Empty(t, mockK8s.services)
 }
 
-// Helper function to run reconcile with mock mat client
-func reconcileWithMockMatClient(ctx context.Context, r *Reconciler, k8s *mockK8sClient, status *matclient.MachinesStatusResponse) ReconcileResult {
+// runTestReconcile tests the reconciliation logic without discovery.
+func runTestReconcile(ctx context.Context, builder *ServiceBuilder, k8s *mockK8sClient, status *matclient.MachinesStatusResponse) ReconcileResult {
 	result := ReconcileResult{}
 
-	desired := r.serviceBuilder.BuildServicesFromStatus(status)
+	desired := builder.BuildServicesFromStatus(status)
 
 	selector := LabelManagedBy + "=" + LabelManagedByValue
-	existing, _ := k8s.List(ctx, r.serviceBuilder.Namespace, selector)
+	existing, _ := k8s.List(ctx, builder.Namespace, selector)
 
 	diff := ComputeServiceDiff(desired, existing)
 
@@ -474,7 +469,7 @@ func reconcileWithMockMatClient(ctx context.Context, r *Reconciler, k8s *mockK8s
 	}
 
 	for _, name := range diff.Delete {
-		if err := k8s.Delete(ctx, r.serviceBuilder.Namespace, name); err != nil {
+		if err := k8s.Delete(ctx, builder.Namespace, name); err != nil {
 			result.Errors = append(result.Errors, err)
 		} else {
 			result.Deleted++
@@ -542,15 +537,6 @@ func (m *mockK8sClient) Update(ctx context.Context, svc *corev1.Service) error {
 func (m *mockK8sClient) Delete(ctx context.Context, namespace, name string) error {
 	delete(m.services, name)
 	return nil
-}
-
-type mockMatClient struct {
-	status *matclient.MachinesStatusResponse
-	err    error
-}
-
-func (m *mockMatClient) GetMachinesStatus(ctx context.Context) (*matclient.MachinesStatusResponse, error) {
-	return m.status, m.err
 }
 
 func ptr[T any](v T) *T {

@@ -4,9 +4,9 @@
 // mat-k8s-controller is a Kubernetes controller that reconciles Services
 // for machine-a-tron mock BMC endpoints.
 //
-// It polls the machine-a-tron /machines/status API and creates/updates/deletes
-// Kubernetes Services to expose Redfish (and optionally IPMI) endpoints for
-// each mock BMC.
+// It discovers machine-a-tron pods via their bmc-mock Services, polls each
+// pod's /machines/status API, and creates/updates/deletes Kubernetes Services
+// to expose Redfish (and optionally IPMI) endpoints for each mock BMC.
 package main
 
 import (
@@ -15,6 +15,7 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -29,10 +30,10 @@ import (
 
 func main() {
 	// Flags
-	matURL := flag.String("mat-url", envOrDefault("MAT_URL", "https://nico-machine-a-tron-bmc-mock:1266"),
-		"Machine-a-tron base URL")
 	namespace := flag.String("namespace", envOrDefault("NAMESPACE", "nico-system"),
-		"Kubernetes namespace for Services")
+		"Kubernetes namespace for Services and machine-a-tron discovery")
+	discoverySelector := flag.String("discovery-selector", envOrDefault("DISCOVERY_SELECTOR", "machine-a-tron.nvidia.com/service=true"),
+		"Label selector for discovering machine-a-tron bmc-mock Services")
 	syncInterval := flag.Duration("sync-interval", parseDurationOrDefault("SYNC_INTERVAL", 30*time.Second),
 		"Interval between reconciliation passes")
 	kubeconfig := flag.String("kubeconfig", os.Getenv("KUBECONFIG"),
@@ -43,6 +44,8 @@ func main() {
 		"Skip TLS certificate verification (for self-signed certs)")
 	logLevel := flag.String("log-level", envOrDefault("LOG_LEVEL", "info"),
 		"Log level (debug, info, warn, error)")
+	bmcMockPort := flag.Int("bmc-mock-port", envIntOrDefault("BMC_MOCK_PORT", 1266),
+		"Port number for bmc-mock service")
 
 	flag.Parse()
 
@@ -59,23 +62,13 @@ func main() {
 		Logger()
 
 	logger.Info().
-		Str("mat_url", *matURL).
 		Str("namespace", *namespace).
+		Str("discovery_selector", *discoverySelector).
 		Dur("sync_interval", *syncInterval).
 		Str("target_selector", *targetSelector).
+		Int("bmc_mock_port", *bmcMockPort).
 		Bool("insecure_skip_verify", *insecureSkipVerify).
 		Msg("starting controller")
-
-	// Create machine-a-tron client
-	clientOpts := []matclient.Option{matclient.WithLogger(logger)}
-	if *insecureSkipVerify {
-		clientOpts = append(clientOpts, matclient.WithInsecureSkipVerify())
-	}
-
-	matClient, err := matclient.NewClient(*matURL, clientOpts...)
-	if err != nil {
-		logger.Fatal().Err(err).Msg("failed to create machine-a-tron client")
-	}
 
 	// Create Kubernetes client
 	var k8sConfig *rest.Config
@@ -93,6 +86,12 @@ func main() {
 		logger.Fatal().Err(err).Msg("failed to create Kubernetes clientset")
 	}
 
+	// Create machine-a-tron client options
+	clientOpts := []matclient.Option{matclient.WithLogger(logger)}
+	if *insecureSkipVerify {
+		clientOpts = append(clientOpts, matclient.WithInsecureSkipVerify())
+	}
+
 	// Parse target selector
 	selector := parseSelector(*targetSelector)
 
@@ -102,9 +101,10 @@ func main() {
 		TargetSelector: selector,
 	}
 
-	// Create reconciler
+	// Create discovery and reconciler
+	discovery := controller.NewMatPodDiscovery(clientset, *namespace, *bmcMockPort, *discoverySelector)
 	k8sClient := controller.NewRealK8sServiceClient(clientset)
-	reconciler := controller.NewReconciler(matClient, builder, k8sClient)
+	reconciler := controller.NewReconciler(discovery, builder, k8sClient, clientOpts, logger)
 
 	// Setup signal handling
 	ctx, cancel := context.WithCancel(context.Background())
@@ -180,6 +180,15 @@ func envBoolOrDefault(key string, defaultValue bool) bool {
 	return defaultValue
 }
 
+func envIntOrDefault(key string, defaultValue int) int {
+	if v := os.Getenv(key); v != "" {
+		if i, err := strconv.Atoi(v); err == nil {
+			return i
+		}
+	}
+	return defaultValue
+}
+
 func parseDurationOrDefault(envKey string, defaultValue time.Duration) time.Duration {
 	if v := os.Getenv(envKey); v != "" {
 		if d, err := time.ParseDuration(v); err == nil {
@@ -195,32 +204,10 @@ func parseSelector(s string) map[string]string {
 		return result
 	}
 
-	// Simple parser for key=value,key2=value2 format
-	pairs := splitPairs(s, ',')
-	for _, pair := range pairs {
-		kv := splitPairs(pair, '=')
-		if len(kv) == 2 {
+	for _, pair := range strings.Split(s, ",") {
+		if kv := strings.SplitN(pair, "=", 2); len(kv) == 2 {
 			result[kv[0]] = kv[1]
 		}
-	}
-	return result
-}
-
-func splitPairs(s string, sep rune) []string {
-	var result []string
-	var current string
-	for _, r := range s {
-		if r == sep {
-			if current != "" {
-				result = append(result, current)
-			}
-			current = ""
-		} else {
-			current += string(r)
-		}
-	}
-	if current != "" {
-		result = append(result, current)
 	}
 	return result
 }

@@ -63,14 +63,10 @@ Namespace - inherited from parent release
 {{- end }}
 
 {{/*
-Machine-a-tron URL - configurable, defaults to release-based naming
+Discovery selector - finds machine-a-tron bmc-mock Services
 */}}
-{{- define "mat-k8s-controller.matUrl" -}}
-{{- if .Values.config.matUrl }}
-{{- .Values.config.matUrl }}
-{{- else }}
-{{- printf "https://%s-bmc-mock.%s.svc.cluster.local:1266" .Release.Name .Release.Namespace }}
-{{- end }}
+{{- define "mat-k8s-controller.discoverySelector" -}}
+{{- default "machine-a-tron.nvidia.com/service=true" .Values.config.discoverySelector }}
 {{- end }}
 
 {{/*

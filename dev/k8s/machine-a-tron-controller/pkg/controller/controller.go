@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"strconv"
 
+	"github.com/rs/zerolog"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
@@ -61,13 +62,11 @@ type ServiceBuilder struct {
 	// Namespace is the target namespace for Services.
 	Namespace string
 	// TargetSelector is the pod selector that Services should target.
-	// This should match the machine-a-tron pod labels.
 	TargetSelector map[string]string
 }
 
 // BuildServiceName generates a consistent service name for a machine.
 func BuildServiceName(machineType, matID string) string {
-	// Use first 8 chars of mat-id for reasonable length
 	shortID := matID
 	if len(matID) > 8 {
 		shortID = matID[:8]
@@ -94,19 +93,15 @@ func (b *ServiceBuilder) BuildService(machine *matclient.MachineStatus, machineT
 	if machine.MachineID != nil {
 		labels[LabelMachineID] = *machine.MachineID
 	}
-
 	if parentMatID != "" {
 		labels[LabelParentMatID] = parentMatID
 	}
-
 	if machine.BMC.IP != nil {
 		annotations[AnnotationBMCIP] = *machine.BMC.IP
 	}
-
 	if machine.HardwareType != nil {
 		annotations[AnnotationHardwareType] = *machine.HardwareType
 	}
-
 	if machine.BMC.IPMI != nil {
 		annotations[AnnotationIPMIListenPort] = strconv.Itoa(int(machine.BMC.IPMI.ListenPort))
 	}
@@ -144,7 +139,6 @@ func (b *ServiceBuilder) BuildService(machine *matclient.MachineStatus, machineT
 	}
 
 	// Use BMC IP directly as ClusterIP
-	// Requires machine-a-tron oobDhcpRelayAddress to be within K8s ServiceCIDR
 	if machine.BMC.IP != nil {
 		svc.Spec.ClusterIP = *machine.BMC.IP
 	}
@@ -158,12 +152,9 @@ func (b *ServiceBuilder) BuildServicesFromStatus(status *matclient.MachinesStatu
 
 	for i := range status.Machines {
 		machine := &status.Machines[i]
-
-		// Build service for the host BMC
 		svc := b.BuildService(machine, MachineTypeHost, "")
 		services = append(services, svc)
 
-		// Build services for DPU BMCs
 		for j := range machine.DPUs {
 			dpu := &machine.DPUs[j]
 			dpuSvc := b.BuildService(dpu, MachineTypeDPU, machine.MatID)
@@ -178,7 +169,7 @@ func (b *ServiceBuilder) BuildServicesFromStatus(status *matclient.MachinesStatu
 type ServiceDiff struct {
 	Create []*corev1.Service
 	Update []*corev1.Service
-	Delete []string // service names to delete
+	Delete []string
 }
 
 // ComputeServiceDiff calculates what changes need to be made.
@@ -201,9 +192,7 @@ func ComputeServiceDiff(desired []*corev1.Service, existing []*corev1.Service) S
 		}
 
 		if needsUpdate(svc, existingSvc) {
-			// Copy ResourceVersion for update
 			svc.ResourceVersion = existingSvc.ResourceVersion
-			// Preserve ClusterIP if not explicitly set
 			if svc.Spec.ClusterIP == "" {
 				svc.Spec.ClusterIP = existingSvc.Spec.ClusterIP
 			}
@@ -211,7 +200,6 @@ func ComputeServiceDiff(desired []*corev1.Service, existing []*corev1.Service) S
 		}
 	}
 
-	// Find services to delete (exist but not in desired)
 	for name, svc := range existingByName {
 		if !desiredNames[name] && isManagedByController(svc) {
 			diff.Delete = append(diff.Delete, name)
@@ -221,9 +209,7 @@ func ComputeServiceDiff(desired []*corev1.Service, existing []*corev1.Service) S
 	return diff
 }
 
-// needsUpdate checks if a service needs to be updated.
 func needsUpdate(desired, existing *corev1.Service) bool {
-	// Check port changes
 	if len(desired.Spec.Ports) != len(existing.Spec.Ports) {
 		return true
 	}
@@ -243,14 +229,12 @@ func needsUpdate(desired, existing *corev1.Service) bool {
 		}
 	}
 
-	// Check label changes (except for managed-by which should always be set)
 	for k, v := range desired.Labels {
 		if existing.Labels[k] != v {
 			return true
 		}
 	}
 
-	// Check annotation changes
 	for k, v := range desired.Annotations {
 		if existing.Annotations[k] != v {
 			return true
@@ -260,16 +244,8 @@ func needsUpdate(desired, existing *corev1.Service) bool {
 	return false
 }
 
-// isManagedByController checks if a service is managed by this controller.
 func isManagedByController(svc *corev1.Service) bool {
 	return svc.Labels[LabelManagedBy] == LabelManagedByValue
-}
-
-// Reconciler handles the reconciliation loop.
-type Reconciler struct {
-	matClient      *matclient.Client
-	serviceBuilder *ServiceBuilder
-	k8sClient      K8sServiceClient
 }
 
 // K8sServiceClient is an interface for Kubernetes Service operations.
@@ -280,15 +256,6 @@ type K8sServiceClient interface {
 	Delete(ctx context.Context, namespace, name string) error
 }
 
-// NewReconciler creates a new Reconciler.
-func NewReconciler(matClient *matclient.Client, builder *ServiceBuilder, k8sClient K8sServiceClient) *Reconciler {
-	return &Reconciler{
-		matClient:      matClient,
-		serviceBuilder: builder,
-		k8sClient:      k8sClient,
-	}
-}
-
 // ReconcileResult contains the result of a reconciliation.
 type ReconcileResult struct {
 	Created int
@@ -297,19 +264,70 @@ type ReconcileResult struct {
 	Errors  []error
 }
 
-// Reconcile performs a single reconciliation pass.
+// Reconciler discovers machine-a-tron pods and reconciles Services.
+type Reconciler struct {
+	discovery      *MatPodDiscovery
+	serviceBuilder *ServiceBuilder
+	k8sClient      K8sServiceClient
+	clientOpts     []matclient.Option
+	logger         zerolog.Logger
+}
+
+// NewReconciler creates a new Reconciler.
+func NewReconciler(
+	discovery *MatPodDiscovery,
+	builder *ServiceBuilder,
+	k8sClient K8sServiceClient,
+	clientOpts []matclient.Option,
+	logger zerolog.Logger,
+) *Reconciler {
+	return &Reconciler{
+		discovery:      discovery,
+		serviceBuilder: builder,
+		k8sClient:      k8sClient,
+		clientOpts:     clientOpts,
+		logger:         logger,
+	}
+}
+
+// Reconcile performs a reconciliation pass across all discovered machine-a-tron instances.
 func (r *Reconciler) Reconcile(ctx context.Context) ReconcileResult {
 	result := ReconcileResult{}
 
-	// Fetch current machine status
-	status, err := r.matClient.GetMachinesStatus(ctx)
+	// Discover machine-a-tron URLs
+	urls, err := r.discovery.DiscoverURLs(ctx)
 	if err != nil {
-		result.Errors = append(result.Errors, fmt.Errorf("fetching machine status: %w", err))
+		result.Errors = append(result.Errors, fmt.Errorf("discovering machine-a-tron instances: %w", err))
 		return result
 	}
 
-	// Build desired services
-	desired := r.serviceBuilder.BuildServicesFromStatus(status)
+	if len(urls) == 0 {
+		r.logger.Warn().Msg("no machine-a-tron instances discovered")
+		return result
+	}
+
+	r.logger.Debug().Strs("urls", urls).Msg("discovered machine-a-tron instances")
+
+	// Collect all machines from all instances
+	var allDesired []*corev1.Service
+
+	for _, url := range urls {
+		client, err := matclient.NewClient(url, r.clientOpts...)
+		if err != nil {
+			result.Errors = append(result.Errors, fmt.Errorf("creating client for %s: %w", url, err))
+			continue
+		}
+
+		status, err := client.GetMachinesStatus(ctx)
+		if err != nil {
+			result.Errors = append(result.Errors, fmt.Errorf("fetching status from %s: %w", url, err))
+			continue
+		}
+
+		services := r.serviceBuilder.BuildServicesFromStatus(status)
+		r.logger.Debug().Str("url", url).Int("machines", len(services)).Msg("fetched machines from instance")
+		allDesired = append(allDesired, services...)
+	}
 
 	// List existing managed services
 	selector := fmt.Sprintf("%s=%s", LabelManagedBy, LabelManagedByValue)
@@ -319,10 +337,9 @@ func (r *Reconciler) Reconcile(ctx context.Context) ReconcileResult {
 		return result
 	}
 
-	// Compute diff
-	diff := ComputeServiceDiff(desired, existing)
+	// Compute and apply diff
+	diff := ComputeServiceDiff(allDesired, existing)
 
-	// Apply creates
 	for _, svc := range diff.Create {
 		if err := r.k8sClient.Create(ctx, svc); err != nil {
 			result.Errors = append(result.Errors, fmt.Errorf("creating service %s: %w", svc.Name, err))
@@ -331,7 +348,6 @@ func (r *Reconciler) Reconcile(ctx context.Context) ReconcileResult {
 		}
 	}
 
-	// Apply updates
 	for _, svc := range diff.Update {
 		if err := r.k8sClient.Update(ctx, svc); err != nil {
 			result.Errors = append(result.Errors, fmt.Errorf("updating service %s: %w", svc.Name, err))
@@ -340,7 +356,6 @@ func (r *Reconciler) Reconcile(ctx context.Context) ReconcileResult {
 		}
 	}
 
-	// Apply deletes
 	for _, name := range diff.Delete {
 		if err := r.k8sClient.Delete(ctx, r.serviceBuilder.Namespace, name); err != nil {
 			result.Errors = append(result.Errors, fmt.Errorf("deleting service %s: %w", name, err))
