@@ -63,15 +63,23 @@ Namespace - inherited from parent release
 {{- end }}
 
 {{/*
-Discovery selector - finds machine-a-tron bmc-mock Services
+Discovery selector - finds machine-a-tron bmc-mock Services scoped to this release
 */}}
 {{- define "mat-k8s-controller.discoverySelector" -}}
-{{- default "machine-a-tron.nvidia.com/service=true" .Values.config.discoverySelector }}
+{{- if .Values.config.discoverySelector }}
+{{- .Values.config.discoverySelector }}
+{{- else }}
+{{- printf "machine-a-tron.nvidia.com/service=true,app.kubernetes.io/instance=%s" .Release.Name }}
+{{- end }}
 {{- end }}
 
 {{/*
-Target selector - matches parent chart's machine-a-tron pods
+Target selector - matches this release's machine-a-tron pods
 */}}
 {{- define "mat-k8s-controller.targetSelector" -}}
-{{- default "app.kubernetes.io/name=nico-machine-a-tron" .Values.config.targetSelector }}
+{{- if .Values.config.targetSelector }}
+{{- .Values.config.targetSelector }}
+{{- else }}
+{{- printf "app.kubernetes.io/name=nico-machine-a-tron,app.kubernetes.io/instance=%s" .Release.Name }}
+{{- end }}
 {{- end }}

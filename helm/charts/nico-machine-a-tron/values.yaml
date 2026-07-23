@@ -378,5 +378,5 @@ mat-k8s-controller:
 
   config:
     syncInterval: "30s"
-    insecureSkipVerify: true
+    insecureSkipVerify: false
     logLevel: "info"

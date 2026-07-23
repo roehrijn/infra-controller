@@ -1,25 +1,14 @@
 # Machine-a-tron Kubernetes Controller
 
-A Kubernetes controller that auto-discovers machine-a-tron pods and creates Services for mock BMC endpoints.
-
-## Overview
-
-In multi-pod machine-a-tron deployments, each pod simulates different machines with unique BMC endpoints. This controller:
-
-1. **Discovers** all machine-a-tron bmc-mock Services in the namespace
-2. **Polls** each pod's `/machines/status` API
-3. **Creates** one Kubernetes Service per BMC with:
-   - Redfish TCP port (443 → internal listen port)
-   - IPMI UDP port (623 → internal listen port) when enabled
-4. **Updates** Services when machine status changes
-5. **Deletes** stale Services when machines disappear
+Kubernetes controller that auto-discovers machine-a-tron pods and creates Services for mock BMC endpoints.
 
 ## Features
 
-- **Auto-discovery**: Finds all machine-a-tron pods automatically
-- **Multi-pod support**: Aggregates machines from all pods
-- **Direct BMC IP as ClusterIP**: Services use BMC IP as ClusterIP (requires oobDhcpRelayAddress within K8s ServiceCIDR)
-- **Automatic cleanup**: Removes Services for deleted machines
+- Auto-discovers machine-a-tron pods via `machine-a-tron.nvidia.com/service=true` label
+- Creates ClusterIP Services with BMC IP for each mock BMC
+- Supports Redfish (TCP 443) ports
+- Multi-pod deployments with pod-specific routing
+- Automatic cleanup of stale Services
 
 ## Build
 
@@ -32,96 +21,88 @@ kind load docker-image mat-k8s-controller:latest --name <cluster>
 
 | Flag | Env Var | Default | Description |
 |------|---------|---------|-------------|
-| `--namespace` | `NAMESPACE` | `nico-system` | Namespace for Services and discovery |
+| `--namespace` | `NAMESPACE` | `nico-system` | Kubernetes namespace |
+| `--discovery-selector` | `DISCOVERY_SELECTOR` | `machine-a-tron.nvidia.com/service=true` | Label selector for discovery |
 | `--sync-interval` | `SYNC_INTERVAL` | `30s` | Reconciliation interval |
 | `--target-selector` | `TARGET_SELECTOR` | `app.kubernetes.io/name=nico-machine-a-tron` | Pod selector for Services |
-| `--bmc-mock-port` | `BMC_MOCK_PORT` | `1266` | BMC mock service port |
-| `--insecure-skip-verify` | `INSECURE_SKIP_VERIFY` | `true` | Skip TLS verification |
+| `--insecure-skip-verify` | `INSECURE_SKIP_VERIFY` | `false` | Skip TLS verification (dev only) |
 | `--log-level` | `LOG_LEVEL` | `info` | Log level |
+| `--bmc-mock-port` | `BMC_MOCK_PORT` | `1266` | BMC mock service port |
+| `--kubeconfig` | `KUBECONFIG` | (empty) | Path to kubeconfig (dev only, uses in-cluster config if empty) |
 
 ## Helm Deployment
 
-Enable in your values:
+Enable in parent chart:
 
 ```yaml
-nico-machine-a-tron:
-  mat-k8s-controller:
-    enabled: true
-    image:
-      repository: mat-k8s-controller
-      tag: latest
-      pullPolicy: Never
-    config:
-      logLevel: debug
+mat-k8s-controller:
+  enabled: true
+  image:
+    pullPolicy: Never  # For local images
+  config:
+    insecureSkipVerify: true  # Only for dev with self-signed certs
 ```
 
 ## Service Structure
 
-Each created Service has:
+Created Services have:
 
 **Labels:**
 - `app.kubernetes.io/managed-by: mat-k8s-controller`
 - `machine-a-tron.nvidia.com/mat-id: <uuid>`
 - `machine-a-tron.nvidia.com/machine-type: host|dpu`
+- `nvidia-infra-controller/pod-name: <pod>` (multi-pod)
 
 **Annotations:**
-- `machine-a-tron.nvidia.com/bmc-ip: <ip>`
-- `machine-a-tron.nvidia.com/api-state: <state>`
-- `machine-a-tron.nvidia.com/power-state: <state>`
-
-**Ports:**
-- `redfish`: TCP 443 → targetPort (listen port)
-- `ipmi`: UDP 623 → targetPort (listen port) - when IPMI enabled
-
-## Troubleshooting
-
-### No machine-a-tron instances discovered
-
-Check that machine-a-tron pods have bmc-mock Services:
-
-```bash
-kubectl -n nico-system get svc -l app.kubernetes.io/name=nico-machine-a-tron
-```
-
-### ClusterIP already allocated
-
-The BMC IP is already used by another Service. Options:
-
-1. Reserve a ServiceCIDR for machine-a-tron (K8s 1.29+)
-2. Use a different oobDhcpRelayAddress range
-3. Delete conflicting Services
+- `machine-a-tron.nvidia.com/bmc-ip`
+- `machine-a-tron.nvidia.com/api-state`
+- `machine-a-tron.nvidia.com/power-state`
+- `machine-a-tron.nvidia.com/hardware-type`
 
 ## Development
 
 ```bash
-# Build
-go build ./...
-
-# Test
-go test ./...
-
-# Run locally
-go run ./cmd/mat-k8s-controller --kubeconfig ~/.kube/config --log-level debug
+make build
+make test
+make run KUBECONFIG=~/.kube/config
 ```
+
+## Troubleshooting
+
+### ClusterIP already allocated
+
+BMC IP is outside ServiceCIDR or already in use.
+
+**Solutions:**
+1. Reserve a ServiceCIDR for machine-a-tron (K8s 1.29+)
+2. Use a CIDR within the cluster's ServiceCIDR
+3. Delete conflicting Services
+
+### ClusterIP change detected
+
+BMC IP changed but ClusterIP is immutable. Controller will delete and recreate the Service.
 
 ## Architecture
 
 ```mermaid
 flowchart LR
-    subgraph K8s[Kubernetes]
-        Controller[mat-k8s-controller]
-        subgraph MAT[machine-a-tron pods]
-            MAT0[mat-0-bmc-mock]
-            MAT1[mat-1-bmc-mock]
-        end
-        subgraph Services[Created Services]
-            Svc1[mat-bmc-host-xxx]
-            Svc2[mat-bmc-dpu-yyy]
-        end
+    subgraph MAT[machine-a-tron pods]
+        MAT0[mat-0/bmc-mock]
+        MAT1[mat-1/bmc-mock]
     end
 
-    Controller -->|discovers| MAT
-    Controller -->|polls /machines/status| MAT0
-    Controller -->|polls /machines/status| MAT1
-    Controller -->|creates/updates/deletes| Services
+    subgraph Controller
+        Discovery[Service Discovery]
+        Reconciler[Reconciler]
+    end
+
+    subgraph K8s[Kubernetes Services]
+        SVC1[mat-bmc-host-xxx]
+        SVC2[mat-bmc-dpu-yyy]
+    end
+
+    Discovery -->|discovers| MAT0
+    Discovery -->|discovers| MAT1
+    Reconciler -->|polls /machines/status| MAT
+    Reconciler -->|creates/updates/deletes| K8s
 ```

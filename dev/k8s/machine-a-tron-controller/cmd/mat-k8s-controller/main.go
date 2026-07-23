@@ -37,11 +37,11 @@ func main() {
 	syncInterval := flag.Duration("sync-interval", parseDurationOrDefault("SYNC_INTERVAL", 30*time.Second),
 		"Interval between reconciliation passes")
 	kubeconfig := flag.String("kubeconfig", os.Getenv("KUBECONFIG"),
-		"Path to kubeconfig (uses in-cluster config if empty)")
+		"Path to kubeconfig file (uses in-cluster config if empty, development only)")
 	targetSelector := flag.String("target-selector", envOrDefault("TARGET_SELECTOR", "app.kubernetes.io/name=nico-machine-a-tron"),
 		"Pod selector for Services (comma-separated key=value pairs)")
-	insecureSkipVerify := flag.Bool("insecure-skip-verify", envBoolOrDefault("INSECURE_SKIP_VERIFY", true),
-		"Skip TLS certificate verification (for self-signed certs)")
+	insecureSkipVerify := flag.Bool("insecure-skip-verify", envBoolOrDefault("INSECURE_SKIP_VERIFY", false),
+		"Skip TLS certificate verification (use only for development with self-signed certs)")
 	logLevel := flag.String("log-level", envOrDefault("LOG_LEVEL", "info"),
 		"Log level (debug, info, warn, error)")
 	bmcMockPort := flag.Int("bmc-mock-port", envIntOrDefault("BMC_MOCK_PORT", 1266),
@@ -97,7 +97,7 @@ func main() {
 
 	// Create service builder
 	builder := &controller.ServiceBuilder{
-		Namespace:      *namespace,
+		Namespace:    *namespace,
 		BaseSelector: selector,
 	}
 
@@ -206,7 +206,7 @@ func parseSelector(s string) map[string]string {
 
 	for _, pair := range strings.Split(s, ",") {
 		if kv := strings.SplitN(pair, "=", 2); len(kv) == 2 {
-			result[kv[0]] = kv[1]
+			result[strings.TrimSpace(kv[0])] = strings.TrimSpace(kv[1])
 		}
 	}
 	return result

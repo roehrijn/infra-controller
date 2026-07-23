@@ -12,16 +12,25 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strings"
 	"time"
 
 	"github.com/rs/zerolog"
 )
 
+const (
+	// maxResponseSize is the maximum allowed response body size (10 MB).
+	maxResponseSize = 10 * 1024 * 1024
+	// maxErrorBodySize is the maximum error body size to include in error messages.
+	maxErrorBodySize = 1024
+)
+
 // Client is an HTTP client for the machine-a-tron API.
 type Client struct {
-	baseURL    string
-	httpClient *http.Client
-	logger     zerolog.Logger
+	baseURL            string
+	httpClient         *http.Client
+	logger             zerolog.Logger
+	insecureSkipVerify bool
 }
 
 // Option configures a Client.
@@ -45,23 +54,38 @@ func WithLogger(logger zerolog.Logger) Option {
 // Use only for development with self-signed certificates.
 func WithInsecureSkipVerify() Option {
 	return func(client *Client) {
-		transport := &http.Transport{
-			TLSClientConfig: &tls.Config{
-				InsecureSkipVerify: true, //nolint:gosec // Intentional for dev/test with self-signed certs
-			},
-		}
-		client.httpClient.Transport = transport
+		client.insecureSkipVerify = true
 	}
 }
 
 // NewClient creates a new machine-a-tron API client.
+// baseURL must be an absolute HTTP(S) URL with a host.
 func NewClient(baseURL string, opts ...Option) (*Client, error) {
-	if _, err := url.Parse(baseURL); err != nil {
+	parsed, err := url.Parse(baseURL)
+	if err != nil {
 		return nil, fmt.Errorf("invalid base URL: %w", err)
 	}
 
+	// Validate URL is absolute with proper scheme and host
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return nil, fmt.Errorf("invalid base URL: scheme must be http or https, got %q", parsed.Scheme)
+	}
+	if parsed.Host == "" {
+		return nil, fmt.Errorf("invalid base URL: missing host")
+	}
+	if parsed.RawQuery != "" {
+		return nil, fmt.Errorf("invalid base URL: query string not allowed")
+	}
+	if parsed.Fragment != "" {
+		return nil, fmt.Errorf("invalid base URL: fragment not allowed")
+	}
+
+	// Normalize: rebuild from parsed components, trim trailing slash
+	parsed.Path = strings.TrimSuffix(parsed.Path, "/")
+	normalizedURL := parsed.String()
+
 	c := &Client{
-		baseURL: baseURL,
+		baseURL: normalizedURL,
 		httpClient: &http.Client{
 			Timeout: 30 * time.Second,
 		},
@@ -72,7 +96,30 @@ func NewClient(baseURL string, opts ...Option) (*Client, error) {
 		opt(c)
 	}
 
+	// Apply insecure TLS after all options to preserve existing transport settings
+	if c.insecureSkipVerify {
+		c.applyInsecureTLS()
+	}
+
 	return c, nil
+}
+
+// applyInsecureTLS configures the client to skip TLS verification while preserving
+// existing transport settings.
+func (c *Client) applyInsecureTLS() {
+	transport, ok := c.httpClient.Transport.(*http.Transport)
+	if !ok || transport == nil {
+		transport = http.DefaultTransport.(*http.Transport).Clone()
+	} else {
+		transport = transport.Clone()
+	}
+
+	if transport.TLSClientConfig == nil {
+		transport.TLSClientConfig = &tls.Config{}
+	}
+	transport.TLSClientConfig.InsecureSkipVerify = true //nolint:gosec // Intentional for dev/test with self-signed certs
+
+	c.httpClient.Transport = transport
 }
 
 // GetMachinesStatus fetches the current machine status from machine-a-tron.
@@ -94,17 +141,28 @@ func (c *Client) GetMachinesStatus(ctx context.Context) (*MachinesStatusResponse
 	}
 	defer resp.Body.Close()
 
+	// Limit response body size to prevent memory exhaustion
+	limitedReader := io.LimitReader(resp.Body, maxResponseSize)
+
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("unexpected status %d: %s", resp.StatusCode, string(body))
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, maxErrorBodySize))
+		return nil, fmt.Errorf("unexpected status %d: %s", resp.StatusCode, truncateString(string(body), maxErrorBodySize))
 	}
 
 	var result MachinesStatusResponse
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+	if err := json.NewDecoder(limitedReader).Decode(&result); err != nil {
 		return nil, fmt.Errorf("decoding response: %w", err)
 	}
 
 	c.logger.Debug().Int("machine_count", len(result.Machines)).Msg("fetched machine status")
 
 	return &result, nil
+}
+
+// truncateString truncates a string to maxLen and adds "..." if truncated.
+func truncateString(s string, maxLen int) string {
+	if len(s) <= maxLen {
+		return s
+	}
+	return s[:maxLen-3] + "..."
 }

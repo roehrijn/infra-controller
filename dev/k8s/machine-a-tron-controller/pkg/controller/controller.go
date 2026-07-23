@@ -184,9 +184,10 @@ func (b *ServiceBuilder) BuildServicesFromStatus(status *matclient.MachinesStatu
 
 // ServiceDiff represents changes between desired and existing services.
 type ServiceDiff struct {
-	Create []*corev1.Service
-	Update []*corev1.Service
-	Delete []string
+	Create  []*corev1.Service
+	Update  []*corev1.Service
+	Delete  []string
+	Recreate []*corev1.Service // Services that need delete+create due to immutable field changes
 }
 
 // ComputeServiceDiff calculates what changes need to be made.
@@ -205,6 +206,13 @@ func ComputeServiceDiff(desired []*corev1.Service, existing []*corev1.Service) S
 		existingSvc, exists := existingByName[svc.Name]
 		if !exists {
 			diff.Create = append(diff.Create, svc)
+			continue
+		}
+
+		// Check if ClusterIP changed - this requires recreate since ClusterIP is immutable
+		if svc.Spec.ClusterIP != "" && existingSvc.Spec.ClusterIP != "" &&
+			svc.Spec.ClusterIP != existingSvc.Spec.ClusterIP {
+			diff.Recreate = append(diff.Recreate, svc)
 			continue
 		}
 
@@ -246,16 +254,26 @@ func needsUpdate(desired, existing *corev1.Service) bool {
 		}
 	}
 
+	// Check for added or changed labels
 	for k, v := range desired.Labels {
 		if existing.Labels[k] != v {
 			return true
 		}
 	}
+	// Check for removed labels
+	if len(desired.Labels) != len(existing.Labels) {
+		return true
+	}
 
+	// Check for added or changed annotations
 	for k, v := range desired.Annotations {
 		if existing.Annotations[k] != v {
 			return true
 		}
+	}
+	// Check for removed annotations
+	if len(desired.Annotations) != len(existing.Annotations) {
+		return true
 	}
 
 	// Check selector changes (important for multi-pod)
@@ -263,6 +281,9 @@ func needsUpdate(desired, existing *corev1.Service) bool {
 		if existing.Spec.Selector[k] != v {
 			return true
 		}
+	}
+	if len(desired.Spec.Selector) != len(existing.Spec.Selector) {
+		return true
 	}
 
 	return false
@@ -282,10 +303,11 @@ type K8sServiceClient interface {
 
 // ReconcileResult contains the result of a reconciliation.
 type ReconcileResult struct {
-	Created int
-	Updated int
-	Deleted int
-	Errors  []error
+	Created   int
+	Updated   int
+	Deleted   int
+	Recreated int
+	Errors    []error
 }
 
 // Reconciler discovers machine-a-tron pods and reconciles Services.
@@ -334,17 +356,20 @@ func (r *Reconciler) Reconcile(ctx context.Context) ReconcileResult {
 
 	// Collect all machines from all instances
 	var allDesired []*corev1.Service
+	fetchFailed := false
 
 	for _, instance := range instances {
 		client, err := matclient.NewClient(instance.URL, r.clientOpts...)
 		if err != nil {
 			result.Errors = append(result.Errors, fmt.Errorf("creating client for %s: %w", instance.URL, err))
+			fetchFailed = true
 			continue
 		}
 
 		status, err := client.GetMachinesStatus(ctx)
 		if err != nil {
 			result.Errors = append(result.Errors, fmt.Errorf("fetching status from %s: %w", instance.URL, err))
+			fetchFailed = true
 			continue
 		}
 
@@ -368,6 +393,40 @@ func (r *Reconciler) Reconcile(ctx context.Context) ReconcileResult {
 	// Compute and apply diff
 	diff := ComputeServiceDiff(allDesired, existing)
 
+	// Process deletes first (needed for recreate to work)
+	// Skip deletions if any fetch failed to prevent spurious Service removal
+	if fetchFailed {
+		r.logger.Warn().Msg("skipping deletions due to partial status-fetch failures")
+	}
+	for _, name := range diff.Delete {
+		if fetchFailed {
+			continue
+		}
+		if err := r.k8sClient.Delete(ctx, r.serviceBuilder.Namespace, name); err != nil {
+			result.Errors = append(result.Errors, fmt.Errorf("deleting service %s: %w", name, err))
+		} else {
+			result.Deleted++
+		}
+	}
+
+	// Process recreates (delete then create for immutable field changes like ClusterIP)
+	// Skip recreates if any fetch failed to prevent spurious Service removal
+	for _, svc := range diff.Recreate {
+		if fetchFailed {
+			continue
+		}
+		if err := r.k8sClient.Delete(ctx, r.serviceBuilder.Namespace, svc.Name); err != nil {
+			result.Errors = append(result.Errors, fmt.Errorf("deleting service %s for recreate: %w", svc.Name, err))
+			continue
+		}
+		if err := r.k8sClient.Create(ctx, svc); err != nil {
+			result.Errors = append(result.Errors, fmt.Errorf("recreating service %s: %w", svc.Name, err))
+		} else {
+			result.Recreated++
+		}
+	}
+
+	// Process creates
 	for _, svc := range diff.Create {
 		if err := r.k8sClient.Create(ctx, svc); err != nil {
 			result.Errors = append(result.Errors, fmt.Errorf("creating service %s: %w", svc.Name, err))
@@ -376,19 +435,12 @@ func (r *Reconciler) Reconcile(ctx context.Context) ReconcileResult {
 		}
 	}
 
+	// Process updates
 	for _, svc := range diff.Update {
 		if err := r.k8sClient.Update(ctx, svc); err != nil {
 			result.Errors = append(result.Errors, fmt.Errorf("updating service %s: %w", svc.Name, err))
 		} else {
 			result.Updated++
-		}
-	}
-
-	for _, name := range diff.Delete {
-		if err := r.k8sClient.Delete(ctx, r.serviceBuilder.Namespace, name); err != nil {
-			result.Errors = append(result.Errors, fmt.Errorf("deleting service %s: %w", name, err))
-		} else {
-			result.Deleted++
 		}
 	}
 
