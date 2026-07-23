@@ -24,9 +24,14 @@ use crate::bmc_state::BmcState;
 use crate::injection::InjectionStore;
 use crate::redfish::manager::ManagerState;
 use crate::{
-    Callbacks, HostHardwareType, MachineInfo, SystemPowerControl, auth_router, middleware_router,
-    redfish,
+    Callbacks, HostHardwareType, MachineInfo, SystemPowerControl, VirtualMediaDeviceConfig,
+    auth_router, middleware_router, redfish,
 };
+
+#[derive(Debug, Default)]
+pub struct MachineRouterOptions {
+    pub virtual_media_devices: Vec<VirtualMediaDeviceConfig>,
+}
 
 #[derive(Debug)]
 pub enum BmcCommand {
@@ -67,12 +72,30 @@ pub fn machine_router(
     mat_host_id: String,
     redfish_auth: bool,
 ) -> (Router, BmcState) {
-    machine_router_with_injection_store(
+    machine_router_inner(
         machine_info,
         callbacks,
         mat_host_id,
         redfish_auth,
         Arc::new(InjectionStore::new()),
+        MachineRouterOptions::default(),
+    )
+}
+
+pub fn machine_router_with_options(
+    machine_info: &MachineInfo,
+    callbacks: Arc<dyn Callbacks>,
+    mat_host_id: String,
+    redfish_auth: bool,
+    options: MachineRouterOptions,
+) -> (Router, BmcState) {
+    machine_router_inner(
+        machine_info,
+        callbacks,
+        mat_host_id,
+        redfish_auth,
+        Arc::new(InjectionStore::new()),
+        options,
     )
 }
 
@@ -83,6 +106,24 @@ pub fn machine_router_with_injection_store(
     mat_host_id: String,
     redfish_auth: bool,
     injection: Arc<InjectionStore>,
+) -> (Router, BmcState) {
+    machine_router_inner(
+        machine_info,
+        callbacks,
+        mat_host_id,
+        redfish_auth,
+        injection,
+        MachineRouterOptions::default(),
+    )
+}
+
+fn machine_router_inner(
+    machine_info: &MachineInfo,
+    callbacks: Arc<dyn Callbacks>,
+    mat_host_id: String,
+    redfish_auth: bool,
+    injection: Arc<InjectionStore>,
+    options: MachineRouterOptions,
 ) -> (Router, BmcState) {
     let system_config = machine_info.system_config(callbacks.clone());
     let chassis_config = machine_info.chassis_config();
@@ -103,6 +144,7 @@ pub fn machine_router_with_injection_store(
         .add_routes(crate::redfish::account_service::add_routes)
         .add_routes(crate::redfish::session_service::add_routes)
         .add_routes(|routes| crate::redfish::computer_system::add_routes(routes, bmc_vendor))
+        .add_routes(crate::redfish::virtual_media::add_routes)
         .add_routes(crate::ipmi::add_routes);
     let router = match machine_info {
         MachineInfo::Dpu(_) => {
@@ -113,9 +155,12 @@ pub fn machine_router_with_injection_store(
             .add_routes(crate::redfish::oem::supermicro::manager::add_routes),
     };
     let manager = Arc::new(ManagerState::new(&machine_info.manager_config()));
-    let system_state = Arc::new(crate::redfish::computer_system::SystemState::from_config(
-        system_config,
-    ));
+    let system_state = Arc::new(
+        crate::redfish::computer_system::SystemState::from_config_with_virtual_media(
+            system_config,
+            options.virtual_media_devices,
+        ),
+    );
     let chassis_state = Arc::new(crate::redfish::chassis::ChassisState::from_config(
         chassis_config,
     ));

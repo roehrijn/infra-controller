@@ -101,7 +101,7 @@ pub async fn bmc_for_machine(machine_info: MachineInfo) -> TestBmcHandle {
     .await
 }
 
-fn host_info(hw_type: HostHardwareType) -> MachineInfo {
+pub(crate) fn host_info(hw_type: HostHardwareType) -> MachineInfo {
     let ndpu = hw_type.fixed_number_of_dpu().unwrap_or(0);
     let mut pool = TEST_MAC_POOL.lock().unwrap();
     let ranges_config = pool.allocate_range_config().unwrap();

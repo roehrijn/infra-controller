@@ -172,6 +172,7 @@ pub struct BootSourceOverride {
 
 pub struct SingleSystemState {
     config: SingleSystemConfig,
+    virtual_media: Option<redfish::virtual_media::VirtualMediaState>,
     boot_order_override: Mutex<Option<Vec<String>>>,
     boot_source_override: Mutex<BootSourceOverride>,
     secure_boot_enabled: Arc<AtomicBool>,
@@ -199,7 +200,14 @@ pub enum Oem {
 
 impl SystemState {
     pub fn from_config(config: Config) -> Self {
-        Self::from_configs(config.systems)
+        Self::from_configs(config.systems, Vec::new())
+    }
+
+    pub(crate) fn from_config_with_virtual_media(
+        config: Config,
+        virtual_media_devices: Vec<redfish::virtual_media::DeviceConfig>,
+    ) -> Self {
+        Self::from_configs(config.systems, virtual_media_devices)
     }
 
     pub fn systems(&self) -> &[SingleSystemState] {
@@ -212,9 +220,30 @@ impl SystemState {
             .find(|system| system.config.id.as_ref() == system_id)
     }
 
-    fn from_configs(configs: Vec<SingleSystemConfig>) -> Self {
-        let systems = configs.into_iter().map(SingleSystemState::new).collect();
+    fn from_configs(
+        configs: Vec<SingleSystemConfig>,
+        virtual_media_devices: Vec<redfish::virtual_media::DeviceConfig>,
+    ) -> Self {
+        let mut virtual_media = (!virtual_media_devices.is_empty())
+            .then(|| redfish::virtual_media::VirtualMediaState::new(virtual_media_devices));
+        let systems = configs
+            .into_iter()
+            .map(|config| {
+                let virtual_media = if config.callbacks.is_some() {
+                    virtual_media.take()
+                } else {
+                    None
+                };
+                SingleSystemState::new(config, virtual_media)
+            })
+            .collect();
         Self { systems }
+    }
+
+    pub(crate) fn controlled_system(&self) -> Option<&SingleSystemState> {
+        self.systems
+            .iter()
+            .find(|system| system.config.callbacks.is_some())
     }
 
     pub fn resolve_current_boot_selection(&self) -> Option<BootOptionKind> {
@@ -229,9 +258,13 @@ impl SystemState {
 }
 
 impl SingleSystemState {
-    fn new(config: SingleSystemConfig) -> Self {
+    fn new(
+        config: SingleSystemConfig,
+        virtual_media: Option<redfish::virtual_media::VirtualMediaState>,
+    ) -> Self {
         Self {
             config,
+            virtual_media,
             boot_order_override: Mutex::new(None),
             boot_source_override: Mutex::new(BootSourceOverride::default()),
             secure_boot_enabled: Arc::new(AtomicBool::new(false)),
@@ -268,6 +301,58 @@ impl SingleSystemState {
 
     fn boot_order_override(&self) -> Option<Vec<String>> {
         self.boot_order_override.lock().unwrap().clone()
+    }
+
+    pub(crate) fn virtual_media(&self) -> Option<&redfish::virtual_media::VirtualMediaState> {
+        self.virtual_media.as_ref()
+    }
+
+    pub(crate) fn boot_source_override(&self) -> serde_json::Value {
+        let boot_source_override = self.boot_source_override.lock().unwrap();
+        let mut value = serde_json::Map::new();
+        if let Some(mode) = &boot_source_override.mode {
+            value.insert(
+                "BootSourceOverrideMode".to_string(),
+                serde_json::Value::String(mode.clone()),
+            );
+        }
+        if let Some(enabled) = &boot_source_override.enabled {
+            value.insert(
+                "BootSourceOverrideEnabled".to_string(),
+                serde_json::Value::String(enabled.clone()),
+            );
+        }
+        if let Some(target) = &boot_source_override.target {
+            value.insert(
+                "BootSourceOverrideTarget".to_string(),
+                serde_json::Value::String(target.clone()),
+            );
+        }
+        serde_json::Value::Object(value)
+    }
+
+    fn apply_boot_source_override(&self, boot: &serde_json::Value) {
+        let has_override = [
+            "BootSourceOverrideMode",
+            "BootSourceOverrideEnabled",
+            "BootSourceOverrideTarget",
+        ]
+        .iter()
+        .any(|field| boot.get(field).is_some());
+        if !has_override {
+            return;
+        }
+
+        let mut boot_source_override = self.boot_source_override.lock().unwrap();
+        if let Some(value) = boot.get("BootSourceOverrideMode") {
+            boot_source_override.mode = value.as_str().map(ToString::to_string);
+        }
+        if let Some(value) = boot.get("BootSourceOverrideEnabled") {
+            boot_source_override.enabled = value.as_str().map(ToString::to_string);
+        }
+        if let Some(value) = boot.get("BootSourceOverrideTarget") {
+            boot_source_override.target = value.as_str().map(ToString::to_string);
+        }
     }
 
     fn resolve_current_boot_selection(&self) -> Option<BootOptionKind> {
@@ -358,6 +443,18 @@ async fn get_system(State(state): State<BmcState>, Path(system_id): Path<String>
                     .collect::<Vec<_>>(),
             );
         }
+    }
+
+    let boot_source_override = system_state.boot_source_override();
+    if boot_source_override
+        .as_object()
+        .is_some_and(|value| !value.is_empty())
+    {
+        b = b.boot_source_override(boot_source_override);
+    }
+
+    if system_state.virtual_media().is_some() {
+        b = b.virtual_media(&redfish::virtual_media::collection(&system_id));
     }
 
     b = match config.oem {
@@ -492,27 +589,7 @@ async fn patch_settings(
                 }
             }
         }
-        boot.get("BootSourceOverrideMode").inspect(|v| {
-            if let Some(v) = v.as_str() {
-                system_state.boot_source_override.lock().unwrap().mode = Some(v.to_string())
-            } else {
-                system_state.boot_source_override.lock().unwrap().mode = None
-            }
-        });
-        boot.get("BootSourceOverrideEnabled").inspect(|v| {
-            if let Some(v) = v.as_str() {
-                system_state.boot_source_override.lock().unwrap().enabled = Some(v.to_string())
-            } else {
-                system_state.boot_source_override.lock().unwrap().enabled = None
-            }
-        });
-        boot.get("BootSourceOverrideTarget").inspect(|v| {
-            if let Some(v) = v.as_str() {
-                system_state.boot_source_override.lock().unwrap().target = Some(v.to_string())
-            } else {
-                system_state.boot_source_override.lock().unwrap().target = None
-            }
-        });
+        system_state.apply_boot_source_override(boot);
     }
     json!({}).into_ok_response()
 }
@@ -525,8 +602,8 @@ async fn patch_system(
     let Some(system_state) = state.system_state.find(&system_id) else {
         return http::not_found();
     };
-    if let Some(new_boot_order) = patch_system
-        .get("Boot")
+    let boot = patch_system.get("Boot");
+    let response = if let Some(new_boot_order) = boot
         .and_then(|obj| obj.get("BootOrder"))
         .and_then(serde_json::Value::as_array)
         .map(|arr| {
@@ -534,13 +611,12 @@ async fn patch_system(
                 .filter_map(serde_json::Value::as_str)
                 .map(ToString::to_string)
                 .collect()
-        })
-    {
+        }) {
         match system_state.config.boot_order_mode {
             BootOrderMode::OrderedCollection => {
                 system_state.set_boot_order_override(new_boot_order);
                 if matches!(&state.oem_state, redfish::oem::State::DellIdrac(_)) {
-                    redfish::oem::dell::idrac::create_job_with_location(state)
+                    redfish::oem::dell::idrac::create_job_with_location(state.clone())
                 } else {
                     json!({}).into_ok_response()
                 }
@@ -554,7 +630,11 @@ async fn patch_system(
         }
     } else {
         json!({}).into_ok_response()
+    };
+    if let Some(boot) = boot {
+        system_state.apply_boot_source_override(boot);
     }
+    response
 }
 
 async fn post_reset_system(
@@ -921,6 +1001,14 @@ impl SystemBuilder {
 
     pub fn boot_options(self, boot_options: &redfish::Collection<'_>) -> Self {
         self.apply_patch(json!({"Boot": boot_options.nav_property("BootOptions")}))
+    }
+
+    pub fn boot_source_override(self, value: serde_json::Value) -> Self {
+        self.apply_patch(json!({"Boot": value}))
+    }
+
+    pub fn virtual_media(self, value: &redfish::Collection<'_>) -> Self {
+        self.apply_patch(value.nav_property("VirtualMedia"))
     }
 
     pub fn secure_boot(self, secure_boot: &redfish::Resource<'_>) -> Self {
