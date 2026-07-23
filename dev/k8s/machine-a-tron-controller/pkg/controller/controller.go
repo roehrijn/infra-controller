@@ -9,6 +9,8 @@ import (
 	"context"
 	"fmt"
 	"strconv"
+	"sync"
+	"sync/atomic"
 
 	"github.com/rs/zerolog"
 	corev1 "k8s.io/api/core/v1"
@@ -31,40 +33,41 @@ const (
 	LabelMatID = "nvidia-infra-controller/mat-id"
 	// LabelMachineID is the NICo machine ID label.
 	LabelMachineID = "nvidia-infra-controller/mat-machine-id"
-	// LabelMachineType indicates if this is a host or DPU.
+	// LabelMachineType distinguishes host vs dpu.
 	LabelMachineType = "nvidia-infra-controller/mat-machine-type"
-	// LabelParentMatID is the parent host's mat-id for DPU services.
+	// LabelParentMatID links DPUs to their parent host.
 	LabelParentMatID = "nvidia-infra-controller/mat-parent-id"
 
-	// AnnotationBMCIP stores the BMC IP address.
+	// AnnotationBMCIP is the BMC IP address annotation.
 	AnnotationBMCIP = "nvidia-infra-controller/mat-bmc-ip"
-	// AnnotationAPIState stores the machine's API state.
+	// AnnotationAPIState is the API state annotation.
 	AnnotationAPIState = "nvidia-infra-controller/mat-api-state"
-	// AnnotationPowerState stores the machine's power state.
+	// AnnotationPowerState is the power state annotation.
 	AnnotationPowerState = "nvidia-infra-controller/mat-power-state"
-	// AnnotationHardwareType stores the hardware type.
+	// AnnotationHardwareType is the hardware type annotation.
 	AnnotationHardwareType = "nvidia-infra-controller/mat-hardware-type"
-	// AnnotationRedfishListenPort stores the internal Redfish listen port.
+	// AnnotationRedfishListenPort is the Redfish listen port annotation.
 	AnnotationRedfishListenPort = "nvidia-infra-controller/mat-redfish-listen-port"
-	// AnnotationIPMIListenPort stores the internal IPMI listen port.
+	// AnnotationIPMIListenPort is the IPMI listen port annotation.
 	AnnotationIPMIListenPort = "nvidia-infra-controller/mat-ipmi-listen-port"
 
-	// MachineTypeHost indicates a host machine.
+	// MachineTypeHost is the machine type for hosts.
 	MachineTypeHost = "host"
-	// MachineTypeDPU indicates a DPU.
+	// MachineTypeDPU is the machine type for DPUs.
 	MachineTypeDPU = "dpu"
 
-	// PortNameRedfish is the name of the Redfish port in the Service.
+	// PortNameRedfish is the name of the Redfish port.
 	PortNameRedfish = "redfish"
-	// PortNameIPMI is the name of the IPMI port in the Service.
+	// PortNameIPMI is the name of the IPMI port.
 	PortNameIPMI = "ipmi"
+
+	// DefaultConcurrency is the default number of concurrent workers for K8s API calls.
+	DefaultConcurrency = 50
 )
 
 // ServiceBuilder builds Kubernetes Services from machine status.
 type ServiceBuilder struct {
-	// Namespace is the target namespace for Services.
-	Namespace string
-	// BaseSelector is the base pod selector (e.g., app.kubernetes.io/name=nico-machine-a-tron).
+	Namespace    string
 	BaseSelector map[string]string
 }
 
@@ -87,30 +90,23 @@ func (b *ServiceBuilder) BuildService(machine *matclient.MachineStatus, machineT
 		LabelMatID:       machine.MatID,
 		LabelMachineType: machineType,
 	}
-
-	annotations := map[string]string{
-		AnnotationAPIState:          machine.APIState,
-		AnnotationPowerState:        machine.PowerState,
-		AnnotationRedfishListenPort: strconv.Itoa(int(machine.BMC.Redfish.ListenPort)),
-	}
-
 	if machine.MachineID != nil {
 		labels[LabelMachineID] = *machine.MachineID
 	}
 	if parentMatID != "" {
 		labels[LabelParentMatID] = parentMatID
 	}
-	if podName != "" {
-		labels[LabelPodName] = podName
+
+	annotations := map[string]string{
+		AnnotationAPIState:          machine.APIState,
+		AnnotationPowerState:        machine.PowerState,
+		AnnotationRedfishListenPort: strconv.Itoa(int(machine.BMC.Redfish.ListenPort)),
 	}
 	if machine.BMC.IP != nil {
 		annotations[AnnotationBMCIP] = *machine.BMC.IP
 	}
 	if machine.HardwareType != nil {
 		annotations[AnnotationHardwareType] = *machine.HardwareType
-	}
-	if machine.BMC.IPMI != nil {
-		annotations[AnnotationIPMIListenPort] = strconv.Itoa(int(machine.BMC.IPMI.ListenPort))
 	}
 
 	ports := []corev1.ServicePort{
@@ -122,6 +118,7 @@ func (b *ServiceBuilder) BuildService(machine *matclient.MachineStatus, machineT
 		},
 	}
 
+	// Add IPMI port if available
 	if machine.BMC.IPMI != nil {
 		ports = append(ports, corev1.ServicePort{
 			Name:       PortNameIPMI,
@@ -129,9 +126,10 @@ func (b *ServiceBuilder) BuildService(machine *matclient.MachineStatus, machineT
 			Port:       int32(machine.BMC.IPMI.ReachablePort),
 			TargetPort: intstr.FromInt32(int32(machine.BMC.IPMI.ListenPort)),
 		})
+		annotations[AnnotationIPMIListenPort] = strconv.Itoa(int(machine.BMC.IPMI.ListenPort))
 	}
 
-	// Build selector: base selector + pod-specific selector for multi-pod
+	// Build selector - include pod name for multi-pod deployments
 	selector := make(map[string]string)
 	for k, v := range b.BaseSelector {
 		selector[k] = v
@@ -154,7 +152,7 @@ func (b *ServiceBuilder) BuildService(machine *matclient.MachineStatus, machineT
 		},
 	}
 
-	// Use BMC IP directly as ClusterIP
+	// Set ClusterIP to BMC IP for direct addressing
 	if machine.BMC.IP != nil {
 		svc.Spec.ClusterIP = *machine.BMC.IP
 	}
@@ -162,19 +160,19 @@ func (b *ServiceBuilder) BuildService(machine *matclient.MachineStatus, machineT
 	return svc
 }
 
-// BuildServicesFromStatus generates all Services from a machines status response.
-// podName identifies which machine-a-tron pod these machines belong to.
+// BuildServicesFromStatus builds Services for all machines in the status response.
+// podName is used to create pod-specific selectors for multi-pod deployments.
 func (b *ServiceBuilder) BuildServicesFromStatus(status *matclient.MachinesStatusResponse, podName string) []*corev1.Service {
 	var services []*corev1.Service
 
-	for i := range status.Machines {
-		machine := &status.Machines[i]
-		svc := b.BuildService(machine, MachineTypeHost, "", podName)
+	for _, machine := range status.Machines {
+		// Build service for the host
+		svc := b.BuildService(&machine, MachineTypeHost, "", podName)
 		services = append(services, svc)
 
-		for j := range machine.DPUs {
-			dpu := &machine.DPUs[j]
-			dpuSvc := b.BuildService(dpu, MachineTypeDPU, machine.MatID, podName)
+		// Build services for DPUs
+		for _, dpu := range machine.DPUs {
+			dpuSvc := b.BuildService(&dpu, MachineTypeDPU, machine.MatID, podName)
 			services = append(services, dpuSvc)
 		}
 	}
@@ -182,118 +180,122 @@ func (b *ServiceBuilder) BuildServicesFromStatus(status *matclient.MachinesStatu
 	return services
 }
 
-// ServiceDiff represents changes between desired and existing services.
+// ServiceDiff represents the differences between desired and existing services.
 type ServiceDiff struct {
-	Create  []*corev1.Service
-	Update  []*corev1.Service
-	Delete  []string
+	Create   []*corev1.Service
+	Update   []*corev1.Service
 	Recreate []*corev1.Service // Services that need delete+create due to immutable field changes
+	Delete   []string
 }
 
-// ComputeServiceDiff calculates what changes need to be made.
+// ComputeServiceDiff calculates the differences between desired and existing services.
 func ComputeServiceDiff(desired []*corev1.Service, existing []*corev1.Service) ServiceDiff {
-	var diff ServiceDiff
+	diff := ServiceDiff{}
 
-	existingByName := make(map[string]*corev1.Service)
+	existingMap := make(map[string]*corev1.Service)
 	for _, svc := range existing {
-		existingByName[svc.Name] = svc
+		existingMap[svc.Name] = svc
 	}
 
-	desiredNames := make(map[string]bool)
+	desiredMap := make(map[string]*corev1.Service)
 	for _, svc := range desired {
-		desiredNames[svc.Name] = true
+		desiredMap[svc.Name] = svc
+	}
 
-		existingSvc, exists := existingByName[svc.Name]
+	// Find services to create or update
+	for _, svc := range desired {
+		existingSvc, exists := existingMap[svc.Name]
 		if !exists {
 			diff.Create = append(diff.Create, svc)
-			continue
-		}
-
-		// Check if ClusterIP changed - this requires recreate since ClusterIP is immutable
-		if svc.Spec.ClusterIP != "" && existingSvc.Spec.ClusterIP != "" &&
-			svc.Spec.ClusterIP != existingSvc.Spec.ClusterIP {
-			diff.Recreate = append(diff.Recreate, svc)
-			continue
-		}
-
-		if needsUpdate(svc, existingSvc) {
+		} else if needsUpdate(svc, existingSvc) {
 			svc.ResourceVersion = existingSvc.ResourceVersion
-			if svc.Spec.ClusterIP == "" {
-				svc.Spec.ClusterIP = existingSvc.Spec.ClusterIP
+			// Check if ClusterIP is changing (immutable field)
+			if svc.Spec.ClusterIP != "" && existingSvc.Spec.ClusterIP != "" &&
+				svc.Spec.ClusterIP != existingSvc.Spec.ClusterIP {
+				// ClusterIP changed - need to delete and recreate
+				diff.Recreate = append(diff.Recreate, svc)
+			} else {
+				// Preserve existing ClusterIP if not explicitly set
+				if svc.Spec.ClusterIP == "" {
+					svc.Spec.ClusterIP = existingSvc.Spec.ClusterIP
+				}
+				diff.Update = append(diff.Update, svc)
 			}
-			diff.Update = append(diff.Update, svc)
 		}
 	}
 
-	for name, svc := range existingByName {
-		if !desiredNames[name] && isManagedByController(svc) {
-			diff.Delete = append(diff.Delete, name)
+	// Find services to delete (managed by us but no longer desired)
+	for _, existing := range existing {
+		if _, wanted := desiredMap[existing.Name]; !wanted {
+			// Only delete if we manage this service
+			if existing.Labels[LabelManagedBy] == LabelManagedByValue {
+				diff.Delete = append(diff.Delete, existing.Name)
+			}
 		}
 	}
 
 	return diff
 }
 
+// needsUpdate checks if a service needs to be updated.
 func needsUpdate(desired, existing *corev1.Service) bool {
+	// Check ports
 	if len(desired.Spec.Ports) != len(existing.Spec.Ports) {
 		return true
 	}
-
-	existingPorts := make(map[string]corev1.ServicePort)
-	for _, p := range existing.Spec.Ports {
-		existingPorts[p.Name] = p
-	}
-
-	for _, dp := range desired.Spec.Ports {
-		ep, ok := existingPorts[dp.Name]
-		if !ok {
+	for i, port := range desired.Spec.Ports {
+		if i >= len(existing.Spec.Ports) {
 			return true
 		}
-		if dp.Port != ep.Port || dp.TargetPort != ep.TargetPort || dp.Protocol != ep.Protocol {
+		existingPort := existing.Spec.Ports[i]
+		if port.Name != existingPort.Name ||
+			port.Port != existingPort.Port ||
+			port.Protocol != existingPort.Protocol ||
+			port.TargetPort.IntValue() != existingPort.TargetPort.IntValue() {
 			return true
 		}
 	}
 
-	// Check for added or changed labels
-	for k, v := range desired.Labels {
-		if existing.Labels[k] != v {
-			return true
-		}
-	}
-	// Check for removed labels
-	if len(desired.Labels) != len(existing.Labels) {
+	// Check selector
+	if len(desired.Spec.Selector) != len(existing.Spec.Selector) {
 		return true
 	}
-
-	// Check for added or changed annotations
-	for k, v := range desired.Annotations {
-		if existing.Annotations[k] != v {
-			return true
-		}
-	}
-	// Check for removed annotations
-	if len(desired.Annotations) != len(existing.Annotations) {
-		return true
-	}
-
-	// Check selector changes (important for multi-pod)
 	for k, v := range desired.Spec.Selector {
 		if existing.Spec.Selector[k] != v {
 			return true
 		}
 	}
-	if len(desired.Spec.Selector) != len(existing.Spec.Selector) {
+
+	// Check labels
+	if len(desired.Labels) != len(existing.Labels) {
+		return true
+	}
+	for k, v := range desired.Labels {
+		if existing.Labels[k] != v {
+			return true
+		}
+	}
+
+	// Check annotations
+	if len(desired.Annotations) != len(existing.Annotations) {
+		return true
+	}
+	for k, v := range desired.Annotations {
+		if existing.Annotations[k] != v {
+			return true
+		}
+	}
+
+	// Check ClusterIP change
+	if desired.Spec.ClusterIP != "" && existing.Spec.ClusterIP != "" &&
+		desired.Spec.ClusterIP != existing.Spec.ClusterIP {
 		return true
 	}
 
 	return false
 }
 
-func isManagedByController(svc *corev1.Service) bool {
-	return svc.Labels[LabelManagedBy] == LabelManagedByValue
-}
-
-// K8sServiceClient is an interface for Kubernetes Service operations.
+// K8sServiceClient defines the interface for Kubernetes service operations.
 type K8sServiceClient interface {
 	List(ctx context.Context, namespace string, labelSelector string) ([]*corev1.Service, error)
 	Create(ctx context.Context, svc *corev1.Service) error
@@ -301,7 +303,7 @@ type K8sServiceClient interface {
 	Delete(ctx context.Context, namespace, name string) error
 }
 
-// ReconcileResult contains the result of a reconciliation.
+// ReconcileResult holds the results of a reconciliation cycle.
 type ReconcileResult struct {
 	Created   int
 	Updated   int
@@ -310,40 +312,49 @@ type ReconcileResult struct {
 	Errors    []error
 }
 
-// Reconciler discovers machine-a-tron pods and reconciles Services.
+// Reconciler reconciles Kubernetes Services with machine-a-tron machine status.
 type Reconciler struct {
 	discovery      *MatPodDiscovery
 	serviceBuilder *ServiceBuilder
 	k8sClient      K8sServiceClient
 	clientOpts     []matclient.Option
 	logger         zerolog.Logger
+	concurrency    int
 }
 
 // NewReconciler creates a new Reconciler.
 func NewReconciler(
 	discovery *MatPodDiscovery,
-	builder *ServiceBuilder,
+	serviceBuilder *ServiceBuilder,
 	k8sClient K8sServiceClient,
 	clientOpts []matclient.Option,
 	logger zerolog.Logger,
 ) *Reconciler {
 	return &Reconciler{
 		discovery:      discovery,
-		serviceBuilder: builder,
+		serviceBuilder: serviceBuilder,
 		k8sClient:      k8sClient,
 		clientOpts:     clientOpts,
 		logger:         logger,
+		concurrency:    DefaultConcurrency,
 	}
 }
 
-// Reconcile performs a reconciliation pass across all discovered machine-a-tron instances.
+// SetConcurrency sets the number of concurrent workers for K8s API calls.
+func (r *Reconciler) SetConcurrency(n int) {
+	if n > 0 {
+		r.concurrency = n
+	}
+}
+
+// Reconcile performs a full reconciliation cycle.
 func (r *Reconciler) Reconcile(ctx context.Context) ReconcileResult {
 	result := ReconcileResult{}
 
 	// Discover machine-a-tron instances
 	instances, err := r.discovery.Discover(ctx)
 	if err != nil {
-		result.Errors = append(result.Errors, fmt.Errorf("discovering machine-a-tron instances: %w", err))
+		result.Errors = append(result.Errors, fmt.Errorf("discovering instances: %w", err))
 		return result
 	}
 
@@ -352,9 +363,11 @@ func (r *Reconciler) Reconcile(ctx context.Context) ReconcileResult {
 		return result
 	}
 
-	r.logger.Debug().Int("count", len(instances)).Msg("discovered machine-a-tron instances")
+	r.logger.Debug().
+		Int("count", len(instances)).
+		Msg("discovered machine-a-tron instances")
 
-	// Collect all machines from all instances
+	// Collect all desired services from all instances
 	var allDesired []*corev1.Service
 	fetchFailed := false
 
@@ -366,6 +379,10 @@ func (r *Reconciler) Reconcile(ctx context.Context) ReconcileResult {
 			continue
 		}
 
+		r.logger.Debug().
+			Str("url", instance.URL).
+			Msg("fetching machine status")
+
 		status, err := client.GetMachinesStatus(ctx)
 		if err != nil {
 			result.Errors = append(result.Errors, fmt.Errorf("fetching status from %s: %w", instance.URL, err))
@@ -373,18 +390,23 @@ func (r *Reconciler) Reconcile(ctx context.Context) ReconcileResult {
 			continue
 		}
 
-		services := r.serviceBuilder.BuildServicesFromStatus(status, instance.PodName)
 		r.logger.Debug().
 			Str("url", instance.URL).
 			Str("pod", instance.PodName).
-			Int("machines", len(services)).
-			Msg("fetched machines from instance")
+			Int("machines", len(status.Machines)).
+			Msg("fetched machine status")
+
+		services := r.serviceBuilder.BuildServicesFromStatus(status, instance.PodName)
 		allDesired = append(allDesired, services...)
 	}
 
-	// List existing managed services
-	selector := fmt.Sprintf("%s=%s", LabelManagedBy, LabelManagedByValue)
-	existing, err := r.k8sClient.List(ctx, r.serviceBuilder.Namespace, selector)
+	r.logger.Info().
+		Int("total_services", len(allDesired)).
+		Msg("built desired services from all instances")
+
+	// List existing services
+	existing, err := r.k8sClient.List(ctx, r.serviceBuilder.Namespace,
+		fmt.Sprintf("%s=%s", LabelManagedBy, LabelManagedByValue))
 	if err != nil {
 		result.Errors = append(result.Errors, fmt.Errorf("listing existing services: %w", err))
 		return result
@@ -393,56 +415,189 @@ func (r *Reconciler) Reconcile(ctx context.Context) ReconcileResult {
 	// Compute and apply diff
 	diff := ComputeServiceDiff(allDesired, existing)
 
+	r.logger.Info().
+		Int("create", len(diff.Create)).
+		Int("update", len(diff.Update)).
+		Int("delete", len(diff.Delete)).
+		Int("recreate", len(diff.Recreate)).
+		Msg("computed service diff")
+
 	// Process deletes first (needed for recreate to work)
 	// Skip deletions if any fetch failed to prevent spurious Service removal
 	if fetchFailed {
 		r.logger.Warn().Msg("skipping deletions due to partial status-fetch failures")
 	}
-	for _, name := range diff.Delete {
-		if fetchFailed {
-			continue
-		}
-		if err := r.k8sClient.Delete(ctx, r.serviceBuilder.Namespace, name); err != nil {
-			result.Errors = append(result.Errors, fmt.Errorf("deleting service %s: %w", name, err))
-		} else {
-			result.Deleted++
-		}
+
+	// Process deletes concurrently
+	if !fetchFailed && len(diff.Delete) > 0 {
+		deleted := r.processDeletesConcurrently(ctx, diff.Delete)
+		result.Deleted = deleted
 	}
 
 	// Process recreates (delete then create for immutable field changes like ClusterIP)
 	// Skip recreates if any fetch failed to prevent spurious Service removal
-	for _, svc := range diff.Recreate {
-		if fetchFailed {
-			continue
-		}
-		if err := r.k8sClient.Delete(ctx, r.serviceBuilder.Namespace, svc.Name); err != nil {
-			result.Errors = append(result.Errors, fmt.Errorf("deleting service %s for recreate: %w", svc.Name, err))
-			continue
-		}
-		if err := r.k8sClient.Create(ctx, svc); err != nil {
-			result.Errors = append(result.Errors, fmt.Errorf("recreating service %s: %w", svc.Name, err))
-		} else {
-			result.Recreated++
-		}
+	if !fetchFailed && len(diff.Recreate) > 0 {
+		recreated := r.processRecreatesConcurrently(ctx, diff.Recreate, &result)
+		result.Recreated = recreated
 	}
 
-	// Process creates
-	for _, svc := range diff.Create {
-		if err := r.k8sClient.Create(ctx, svc); err != nil {
-			result.Errors = append(result.Errors, fmt.Errorf("creating service %s: %w", svc.Name, err))
-		} else {
-			result.Created++
-		}
+	// Process creates concurrently
+	if len(diff.Create) > 0 {
+		created := r.processCreatesConcurrently(ctx, diff.Create, &result)
+		result.Created = created
 	}
 
-	// Process updates
-	for _, svc := range diff.Update {
-		if err := r.k8sClient.Update(ctx, svc); err != nil {
-			result.Errors = append(result.Errors, fmt.Errorf("updating service %s: %w", svc.Name, err))
-		} else {
-			result.Updated++
-		}
+	// Process updates concurrently
+	if len(diff.Update) > 0 {
+		updated := r.processUpdatesConcurrently(ctx, diff.Update, &result)
+		result.Updated = updated
 	}
 
 	return result
+}
+
+// processDeletesConcurrently deletes services using a worker pool.
+func (r *Reconciler) processDeletesConcurrently(ctx context.Context, names []string) int {
+	var deleted int64
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, r.concurrency)
+
+	for i, name := range names {
+		if i > 0 && i%100 == 0 {
+			r.logger.Info().
+				Int("progress", i).
+				Int("total", len(names)).
+				Msg("delete progress")
+		}
+
+		wg.Add(1)
+		sem <- struct{}{}
+
+		go func(name string) {
+			defer wg.Done()
+			defer func() { <-sem }()
+
+			if err := r.k8sClient.Delete(ctx, r.serviceBuilder.Namespace, name); err != nil {
+				r.logger.Error().Err(err).Str("service", name).Msg("failed to delete service")
+			} else {
+				atomic.AddInt64(&deleted, 1)
+			}
+		}(name)
+	}
+
+	wg.Wait()
+	return int(deleted)
+}
+
+// processRecreatesConcurrently handles services that need delete+create.
+func (r *Reconciler) processRecreatesConcurrently(ctx context.Context, services []*corev1.Service, result *ReconcileResult) int {
+	var recreated int64
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, r.concurrency)
+
+	for i, svc := range services {
+		if i > 0 && i%100 == 0 {
+			r.logger.Info().
+				Int("progress", i).
+				Int("total", len(services)).
+				Msg("recreate progress")
+		}
+
+		wg.Add(1)
+		sem <- struct{}{}
+
+		go func(svc *corev1.Service) {
+			defer wg.Done()
+			defer func() { <-sem }()
+
+			if err := r.k8sClient.Delete(ctx, r.serviceBuilder.Namespace, svc.Name); err != nil {
+				r.logger.Error().Err(err).Str("service", svc.Name).Msg("failed to delete service for recreate")
+				return
+			}
+			// Clear ResourceVersion for create
+			svc.ResourceVersion = ""
+			if err := r.k8sClient.Create(ctx, svc); err != nil {
+				r.logger.Error().Err(err).Str("service", svc.Name).Msg("failed to create service after delete")
+			} else {
+				atomic.AddInt64(&recreated, 1)
+			}
+		}(svc)
+	}
+
+	wg.Wait()
+	return int(recreated)
+}
+
+// processCreatesConcurrently creates services using a worker pool.
+func (r *Reconciler) processCreatesConcurrently(ctx context.Context, services []*corev1.Service, result *ReconcileResult) int {
+	var created int64
+	var wg sync.WaitGroup
+	var errMu sync.Mutex
+	sem := make(chan struct{}, r.concurrency)
+
+	for i, svc := range services {
+		if i > 0 && i%100 == 0 {
+			r.logger.Info().
+				Int("progress", i).
+				Int("total", len(services)).
+				Int64("created", atomic.LoadInt64(&created)).
+				Msg("create progress")
+		}
+
+		wg.Add(1)
+		sem <- struct{}{}
+
+		go func(svc *corev1.Service) {
+			defer wg.Done()
+			defer func() { <-sem }()
+
+			if err := r.k8sClient.Create(ctx, svc); err != nil {
+				errMu.Lock()
+				result.Errors = append(result.Errors, fmt.Errorf("creating service %s: %w", svc.Name, err))
+				errMu.Unlock()
+			} else {
+				atomic.AddInt64(&created, 1)
+			}
+		}(svc)
+	}
+
+	wg.Wait()
+	return int(created)
+}
+
+// processUpdatesConcurrently updates services using a worker pool.
+func (r *Reconciler) processUpdatesConcurrently(ctx context.Context, services []*corev1.Service, result *ReconcileResult) int {
+	var updated int64
+	var wg sync.WaitGroup
+	var errMu sync.Mutex
+	sem := make(chan struct{}, r.concurrency)
+
+	for i, svc := range services {
+		if i > 0 && i%100 == 0 {
+			r.logger.Info().
+				Int("progress", i).
+				Int("total", len(services)).
+				Int64("updated", atomic.LoadInt64(&updated)).
+				Msg("update progress")
+		}
+
+		wg.Add(1)
+		sem <- struct{}{}
+
+		go func(svc *corev1.Service) {
+			defer wg.Done()
+			defer func() { <-sem }()
+
+			if err := r.k8sClient.Update(ctx, svc); err != nil {
+				errMu.Lock()
+				result.Errors = append(result.Errors, fmt.Errorf("updating service %s: %w", svc.Name, err))
+				errMu.Unlock()
+			} else {
+				atomic.AddInt64(&updated, 1)
+			}
+		}(svc)
+	}
+
+	wg.Wait()
+	return int(updated)
 }
