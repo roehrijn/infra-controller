@@ -25,12 +25,12 @@ func TestBuildServiceName(t *testing.T) {
 		{
 			machineType: MachineTypeHost,
 			matID:       "12345678-1234-1234-1234-123456789abc",
-			want:        "mat-bmc-host-12345678",
+			want:        "mat-bmc-host-12345678-123",
 		},
 		{
 			machineType: MachineTypeDPU,
 			matID:       "abcdefgh-1234-1234-1234-123456789abc",
-			want:        "mat-bmc-dpu-abcdefgh",
+			want:        "mat-bmc-dpu-abcdefgh-123",
 		},
 		{
 			machineType: MachineTypeHost,
@@ -73,7 +73,7 @@ func TestServiceBuilder_BuildService(t *testing.T) {
 	svc := builder.BuildService(machine, MachineTypeHost, "", "")
 
 	// Check basic metadata
-	assert.Equal(t, "mat-bmc-host-host-uui", svc.Name)
+	assert.Equal(t, "mat-bmc-host-host-uuid-12", svc.Name)
 	assert.Equal(t, "test-ns", svc.Namespace)
 
 	// Check labels

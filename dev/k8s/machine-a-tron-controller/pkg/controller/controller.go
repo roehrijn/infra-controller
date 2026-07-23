@@ -71,8 +71,8 @@ type ServiceBuilder struct {
 // BuildServiceName generates a consistent service name for a machine.
 func BuildServiceName(machineType, matID string) string {
 	shortID := matID
-	if len(matID) > 8 {
-		shortID = matID[:8]
+	if len(matID) > 12 {
+		shortID = matID[:12]
 	}
 	return fmt.Sprintf("mat-bmc-%s-%s", machineType, shortID)
 }
