@@ -32,6 +32,7 @@ use crate::db_read::DbReader;
 use crate::{DatabaseError, DatabaseResult};
 
 const SQL_VIOLATION_DUPLICATE_MAC: &str = "expected_machines_bmc_mac_address_key";
+const CONFIG_MUTATION_LOCK_KEY: &str = "expected_machines:config_mutations";
 
 pub async fn find_by_bmc_mac_address(
     txn: impl DbReader<'_>,
@@ -90,18 +91,180 @@ pub async fn find_many_by_bmc_mac_address(
 
 // the expected machines table needs host mac addresses to control dhcp vending of ip's
 // since the carbide dhcp server in some cases is not authoritative on a large network.
-// search in the host_nics field before vending an ip.
+// Search and lock the host_nics field before vending an IP. Holding this row
+// lock through interface preallocation serializes readers with ExpectedMachine
+// updates and deletion.
 pub async fn find_by_host_mac_address(
     txn: &mut PgConnection,
     host_mac_address: MacAddress,
 ) -> DatabaseResult<Option<ExpectedMachine>> {
-    let query = "SELECT * FROM expected_machines WHERE host_nics @> $1::jsonb";
+    let query = "SELECT *
+        FROM expected_machines
+        WHERE bmc_mac_address = $1
+           OR host_nics @> $2::jsonb
+        ORDER BY bmc_mac_address
+        FOR SHARE";
+    find_by_host_mac_address_with_query(txn, host_mac_address, query).await
+}
+
+/// Repeat an initially empty nested-interface lookup after locking its MAC.
+///
+/// The caller must hold the transaction-scoped
+/// `expected_machine_interface.<mac>` advisory lock. This deliberately uses a
+/// plain `SELECT`: taking an ExpectedMachine row lock after the MAC lock would
+/// invert the row-then-MAC order used by configuration updates.
+pub async fn find_by_host_mac_address_after_interface_lock(
+    txn: &mut PgConnection,
+    host_mac_address: MacAddress,
+) -> DatabaseResult<Option<ExpectedMachine>> {
+    let query = "SELECT *
+        FROM expected_machines
+        WHERE bmc_mac_address = $1
+           OR host_nics @> $2::jsonb
+        ORDER BY bmc_mac_address";
+    find_by_host_mac_address_with_query(txn, host_mac_address, query).await
+}
+
+async fn find_by_host_mac_address_with_query(
+    txn: &mut PgConnection,
+    host_mac_address: MacAddress,
+    query: &'static str,
+) -> DatabaseResult<Option<ExpectedMachine>> {
     let mac_address = serde_json::json!([{ "mac_address": host_mac_address.to_string() }]);
-    sqlx::query_as(query)
+    let mut machines: Vec<ExpectedMachine> = sqlx::query_as(query)
+        .bind(host_mac_address)
         .bind(sqlx::types::Json(mac_address))
+        .fetch_all(txn)
+        .await
+        .map_err(|err| DatabaseError::query(query, err))?;
+    let top_level_matches = machines
+        .iter()
+        .filter(|machine| machine.bmc_mac_address == host_mac_address)
+        .count();
+    let nested_matches = machines
+        .iter()
+        .flat_map(|machine| &machine.data.host_nics)
+        .filter(|interface| interface.mac_address == host_mac_address)
+        .count();
+    if top_level_matches > 0 && nested_matches > 0 {
+        return Err(DatabaseError::InvalidArgument(format!(
+            "mac address {host_mac_address} is declared as both an ExpectedMachine BMC and nested interface",
+        )));
+    }
+    match nested_matches {
+        0 => Ok(None),
+        1 => Ok(machines.drain(..).find(|machine| {
+            machine
+                .data
+                .host_nics
+                .iter()
+                .any(|interface| interface.mac_address == host_mac_address)
+        })),
+        _ => Err(DatabaseError::InvalidArgument(format!(
+            "multiple ExpectedMachine interface declarations use MAC address {host_mac_address}",
+        ))),
+    }
+}
+
+/// `lock_config_mutations_shared` lets ordinary ExpectedMachine writes run
+/// together while serializing them with `ReplaceAll` and `DeleteAll`.
+///
+/// Callers take this before any ExpectedMachine lookup or lock. The complete
+/// order is this set lock, ExpectedMachine rows and identity MACs,
+/// interface-MAC advisory locks, and all relevant network-segment locks in
+/// sorted order before machine-interface or address rows. Shared-segment
+/// static and IPv4 flows also take per-address locks before conflicting row
+/// writes. Stateful IPv6 is serialized by its exclusive segment lock and may
+/// take address locks later. Taking the set lock inside `create`, `update`, or
+/// `delete` would be too late for callers that already performed a lookup.
+pub async fn lock_config_mutations_shared(txn: &mut PgConnection) -> DatabaseResult<()> {
+    let query = "SELECT pg_advisory_xact_lock_shared(hashtextextended($1::text, 0))";
+    sqlx::query(query)
+        .bind(CONFIG_MUTATION_LOCK_KEY)
+        .execute(txn)
+        .await
+        .map(|_| ())
+        .map_err(|error| DatabaseError::query(query, error))
+}
+
+/// `lock_config_mutations_exclusive` keeps a set-wide replacement or deletion
+/// stable from its first ExpectedMachine lookup through commit.
+pub async fn lock_config_mutations_exclusive(txn: &mut PgConnection) -> DatabaseResult<()> {
+    let query = "SELECT pg_advisory_xact_lock(hashtextextended($1::text, 0))";
+    sqlx::query(query)
+        .bind(CONFIG_MUTATION_LOCK_KEY)
+        .execute(txn)
+        .await
+        .map(|_| ())
+        .map_err(|error| DatabaseError::query(query, error))
+}
+
+/// Serialize ExpectedMachine identity changes by MAC in a stable order.
+pub async fn lock_identity_macs(
+    txn: &mut PgConnection,
+    identity_macs: impl IntoIterator<Item = MacAddress>,
+) -> DatabaseResult<()> {
+    let mut identity_macs = identity_macs.into_iter().collect::<Vec<_>>();
+    identity_macs.sort_by_key(ToString::to_string);
+    identity_macs.dedup();
+
+    let lock_query = "SELECT pg_advisory_xact_lock(
+        hashtextextended('expected_machine_identity.' || $1::text, 0)
+    )";
+    for mac_address in &identity_macs {
+        sqlx::query(lock_query)
+            .bind(mac_address)
+            .execute(&mut *txn)
+            .await
+            .map_err(|error| DatabaseError::query(lock_query, error))?;
+    }
+    Ok(())
+}
+
+/// Reject a new or identity-changing ExpectedMachine when any of its BMC or
+/// nested interface MACs is already declared by another ExpectedMachine.
+/// `current_bmc_mac_address` identifies the update target even when its legacy
+/// database row has no ID.
+pub async fn validate_identity_macs_available(
+    txn: &mut PgConnection,
+    machine: &ExpectedMachine,
+    current_bmc_mac_address: Option<MacAddress>,
+) -> DatabaseResult<()> {
+    let identity_macs = machine
+        .data
+        .host_nics
+        .iter()
+        .map(|interface| interface.mac_address)
+        .chain(std::iter::once(machine.bmc_mac_address))
+        .collect::<Vec<_>>();
+    lock_identity_macs(&mut *txn, identity_macs.iter().copied()).await?;
+
+    let query = "SELECT bmc_mac_address
+        FROM expected_machines
+        WHERE bmc_mac_address IS DISTINCT FROM $1::macaddr
+          AND (
+              bmc_mac_address = ANY($2::macaddr[])
+              OR EXISTS (
+                  SELECT 1
+                  FROM jsonb_array_elements(host_nics) AS declared_interface
+                  WHERE (declared_interface->>'mac_address')::macaddr = ANY($2::macaddr[])
+              )
+          )
+        ORDER BY bmc_mac_address
+        LIMIT 1";
+    if let Some(conflicting_bmc_mac) = sqlx::query_scalar::<_, MacAddress>(query)
+        .bind(current_bmc_mac_address)
+        .bind(&identity_macs)
         .fetch_optional(txn)
         .await
-        .map_err(|err| DatabaseError::query(query, err))
+        .map_err(|error| DatabaseError::query(query, error))?
+    {
+        return Err(DatabaseError::InvalidArgument(format!(
+            "expected machine identity MAC conflicts with the machine whose BMC MAC is {conflicting_bmc_mac}",
+        )));
+    }
+
+    Ok(())
 }
 
 pub async fn find_one_linked(
@@ -318,6 +481,50 @@ pub async fn find(
     }
 }
 
+/// Find and lock an ExpectedMachine for an update transaction.
+pub async fn find_for_update(
+    txn: &mut PgConnection,
+    req: &ExpectedMachineRequest,
+) -> DatabaseResult<Option<ExpectedMachine>> {
+    let (sql, id, mac) = if let Some(id) = req.id {
+        (
+            "SELECT * FROM expected_machines WHERE id=$1 FOR UPDATE",
+            Some(id),
+            None,
+        )
+    } else if let Some(mac) = req.bmc_mac_address {
+        (
+            "SELECT * FROM expected_machines WHERE bmc_mac_address=$1 FOR UPDATE",
+            None,
+            Some(mac),
+        )
+    } else {
+        return Err(DatabaseError::InvalidArgument(
+            "either id or bmc_mac_address must be provided".into(),
+        ));
+    };
+
+    let mut query = sqlx::query_as(sql);
+    if let Some(id) = id {
+        query = query.bind(id);
+    } else if let Some(mac) = mac {
+        query = query.bind(mac);
+    }
+    query
+        .fetch_optional(txn)
+        .await
+        .map_err(|error| DatabaseError::query(sql, error))
+}
+
+/// Find and lock every ExpectedMachine in stable MAC-address order.
+pub async fn find_all_for_update(txn: &mut PgConnection) -> DatabaseResult<Vec<ExpectedMachine>> {
+    let sql = "SELECT * FROM expected_machines ORDER BY bmc_mac_address FOR UPDATE";
+    sqlx::query_as(sql)
+        .fetch_all(txn)
+        .await
+        .map_err(|error| DatabaseError::query(sql, error))
+}
+
 /// delete deletes an expected machine by id if provided, otherwise by bmc_mac_address.
 pub async fn delete(txn: &mut PgConnection, req: &ExpectedMachineRequest) -> DatabaseResult<()> {
     if let Some(id) = req.id {
@@ -451,6 +658,9 @@ pub async fn update(txn: &mut PgConnection, machine: &ExpectedMachine) -> Databa
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod test_allocation_state_migration;
 
 #[cfg(test)]
 mod tests;

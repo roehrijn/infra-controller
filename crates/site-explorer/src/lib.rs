@@ -32,6 +32,7 @@ use carbide_secrets::credentials::CredentialManager;
 use carbide_utils::none_if_empty::NoneIfEmpty;
 use carbide_utils::periodic_timer::PeriodicTimer;
 use carbide_uuid::machine::MachineType;
+use carbide_uuid::network::NetworkSegmentId;
 use carbide_uuid::power_shelf::{PowerShelfIdSource, PowerShelfType};
 use chrono::Utc;
 use config::SiteExplorerConfig;
@@ -87,7 +88,7 @@ use db::ObjectColumnFilter;
 use db::work_lock_manager::WorkLockManagerHandle;
 pub use managed_host::is_endpoint_in_managed_host;
 use model::DpuModel;
-use model::expected_machine::HostDpuPolicy;
+use model::expected_machine::{ExpectedHostNic, ExpectedMachineRequest, HostDpuPolicy};
 use model::firmware::FirmwareComponentType;
 use model::network_segment::NetworkSegmentType;
 mod switch_creator;
@@ -110,6 +111,36 @@ use self::metrics::{
 };
 use crate::config::SiteExplorerExploreMode;
 use crate::explored_endpoint_index::ExploredEndpointIndex;
+
+fn is_expected_data_only_interface(interface: &ExpectedHostNic) -> bool {
+    // `role` did not exist in older `host_nics`, so legacy `bmc`/`oob`
+    // entries look like host data interfaces after deserialization. Leave
+    // them out of this set so their anonymous Underlay rows remain Redfish
+    // scan candidates, just like they were before interface roles existed.
+    // A typed segment makes `nic_type` informational rather than a legacy hint.
+    let has_legacy_bmc_hint = interface.network_segment_type.is_none()
+        && interface.role.is_host()
+        && interface.nic_type.as_deref().is_some_and(|nic_type| {
+            nic_type.eq_ignore_ascii_case("bmc") || nic_type.eq_ignore_ascii_case("oob")
+        });
+
+    interface.role.interface_type() == InterfaceType::Data && !has_legacy_bmc_hint
+}
+
+fn is_scannable_interface(
+    interface: &MachineInterfaceSnapshot,
+    underlay_segments: &[NetworkSegmentId],
+    host_inband_segments: &[NetworkSegmentId],
+    expected_data_interface_macs: &HashSet<MacAddress>,
+) -> bool {
+    let is_bmc = interface.interface_type == InterfaceType::Bmc;
+    let underlay = underlay_segments.contains(&interface.segment_id)
+        && (is_bmc
+            || (interface.machine_id.is_none()
+                && !expected_data_interface_macs.contains(&interface.mac_address)));
+    let host_inband = host_inband_segments.contains(&interface.segment_id) && is_bmc;
+    underlay || host_inband
+}
 
 pub fn new_bmc_explorer(
     redfish_client_pool: Arc<dyn RedfishClientPool>,
@@ -2001,36 +2032,19 @@ impl SiteExplorer {
                 device_type,
             );
 
-            if let Some(bmc_ip) = expected_machine.data.bmc_ip_address {
-                try_preallocate_one(
-                    &self.database_connection,
-                    expected_machine.bmc_mac_address,
-                    bmc_ip,
-                    InterfaceType::Bmc,
-                    "expected_machine BMC",
-                    self.config.retained_boot_interface_window,
-                )
-                .await;
-            } else if expected_machine
-                .data
-                .bmc_ip_allocation
-                .retains_dynamic_ip(false)
-            {
-                // No operator-specified BMC IP, but the host's bmc_ip_allocation
-                // retains its auto-allocated address: pin the BMC interface's
-                // DHCP lease as Static so it survives lease expiry.
-                try_retain_bmc(&self.database_connection, expected_machine.bmc_mac_address).await;
-            }
+            try_reconcile_expected_machine_bmc(
+                &self.database_connection,
+                expected_machine.bmc_mac_address,
+                self.config.retained_boot_interface_window,
+            )
+            .await;
             for nic in &expected_machine.data.host_nics {
-                let Some(ip) = nic.fixed_ip else {
+                if nic.fixed_ip.is_none() {
                     continue;
-                };
-                try_preallocate_one(
+                }
+                try_preallocate_expected_interface(
                     &self.database_connection,
                     nic.mac_address,
-                    ip,
-                    InterfaceType::Data,
-                    "expected_machine host NIC",
                     self.config.retained_boot_interface_window,
                 )
                 .await;
@@ -2038,44 +2052,12 @@ impl SiteExplorer {
         }
 
         for expected_switch in &expected_switches {
-            if let Some(bmc_ip) = expected_switch.bmc_ip_address {
-                try_preallocate_one(
-                    &self.database_connection,
-                    expected_switch.bmc_mac_address,
-                    bmc_ip,
-                    InterfaceType::Bmc,
-                    "expected_switch BMC",
-                    self.config.retained_boot_interface_window,
-                )
-                .await;
-            }
-            // NVOS static IP: handler-side validation pairs `nvos_ip_address` with
-            // exactly one `nvos_mac_addresses` entry (the single wired NVOS port).
-            // ...but re-check here just incase, with the failure case being a
-            // log and skip for this pass.
-            if let Some(nvos_ip) = expected_switch.nvos_ip_address {
-                match expected_switch.nvos_mac_addresses.as_slice() {
-                    [nvos_mac] => {
-                        try_preallocate_one(
-                            &self.database_connection,
-                            *nvos_mac,
-                            nvos_ip,
-                            InterfaceType::Data,
-                            "expected_switch NVOS",
-                            self.config.retained_boot_interface_window,
-                        )
-                        .await;
-                    }
-                    macs => {
-                        tracing::warn!(
-                            bmc_mac_address = %expected_switch.bmc_mac_address,
-                            nvos_ip_address = %nvos_ip,
-                            nvos_mac_address_count = macs.len(),
-                            "Skipping NVOS preallocation: nvos_ip_address requires exactly one nvos_mac_addresses entry"
-                        );
-                    }
-                }
-            }
+            try_reconcile_expected_switch_addresses(
+                &self.database_connection,
+                expected_switch.bmc_mac_address,
+                self.config.retained_boot_interface_window,
+            )
+            .await;
         }
 
         for expected_power_shelf in &expected_power_shelves {
@@ -2097,6 +2079,12 @@ impl SiteExplorer {
         );
 
         let expected_count = expected_machines.len();
+        let expected_data_interface_macs = expected_machines
+            .iter()
+            .flat_map(|machine| &machine.data.host_nics)
+            .filter(|interface| is_expected_data_only_interface(interface))
+            .map(|interface| interface.mac_address)
+            .collect::<HashSet<_>>();
 
         // We don't have to scan anything that is on the Tenant or Admin Segments,
         // since we know what those Segments are used for (Forge allocated the IPs on the segments
@@ -2121,16 +2109,13 @@ impl SiteExplorer {
         let build_index_start = Instant::now();
         let scannable_interfaces: Vec<MachineInterfaceSnapshot> = interfaces
             .into_iter()
-            .filter(|iface| {
-                let is_bmc = iface.interface_type == InterfaceType::Bmc;
-                // On Underlay an unadopted interface is a BMC to explore, and adopted BMCs
-                // stay visible too.
-                let underlay = underlay_segments.contains(&iface.segment_id)
-                    && (iface.machine_id.is_none() || is_bmc);
-                // On HostInband only scan BMCs. The host in-band NIC also DHCPs here with no
-                // machine_id and is not a Redfish endpoint.
-                let host_inband = host_inband_segments.contains(&iface.segment_id) && is_bmc;
-                underlay || host_inband
+            .filter(|interface| {
+                is_scannable_interface(
+                    interface,
+                    &underlay_segments,
+                    &host_inband_segments,
+                    &expected_data_interface_macs,
+                )
             })
             .collect();
         let scannable_interface_count = scannable_interfaces.len();
@@ -3559,6 +3544,274 @@ impl SiteExplorer {
     }
 }
 
+/// Reconcile the current legacy BMC policy for one ExpectedMachine.
+///
+/// Site Explorer calls this with a MAC from its detached iteration snapshot.
+/// The helper locks and reloads the ExpectedMachine before deciding whether
+/// to preallocate a fixed address or retain a DHCP address. Configuration
+/// removed after the snapshot was loaded is therefore a no-op.
+pub async fn try_reconcile_expected_machine_bmc(
+    pool: &PgPool,
+    bmc_mac_address: MacAddress,
+    retained_window: Option<chrono::Duration>,
+) {
+    let mut txn = match db::Transaction::begin(pool).await {
+        Ok(txn) => txn,
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                %bmc_mac_address,
+                "Site-explorer expected-machine BMC reconcile: txn_begin failed"
+            );
+            return;
+        }
+    };
+
+    if let Err(error) = db::expected_machine::lock_config_mutations_shared(txn.as_pgconn()).await {
+        tracing::warn!(
+            %error,
+            %bmc_mac_address,
+            "Site-explorer expected-machine BMC reconcile skipped"
+        );
+        return;
+    }
+    let expected_machine = match db::expected_machine::find_for_update(
+        txn.as_pgconn(),
+        &ExpectedMachineRequest {
+            id: None,
+            bmc_mac_address: Some(bmc_mac_address),
+        },
+    )
+    .await
+    {
+        Ok(Some(expected_machine)) => expected_machine,
+        Ok(None) => return,
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                %bmc_mac_address,
+                "Site-explorer expected-machine BMC reconcile skipped"
+            );
+            return;
+        }
+    };
+
+    let result = if let Some(ip_address) = expected_machine.data.bmc_ip_address {
+        db::machine_interface::preallocate_machine_interface_with_type(
+            txn.as_pgconn(),
+            expected_machine.bmc_mac_address,
+            ip_address,
+            InterfaceType::Bmc,
+            retained_window,
+        )
+        .await
+    } else if expected_machine
+        .data
+        .bmc_ip_allocation
+        .retains_dynamic_ip(false)
+    {
+        db::machine_interface::retain_bmc_address_by_mac(
+            txn.as_pgconn(),
+            expected_machine.bmc_mac_address,
+        )
+        .await
+    } else {
+        Ok(())
+    };
+
+    if let Err(error) = result {
+        tracing::warn!(
+            %error,
+            %bmc_mac_address,
+            "Site-explorer expected-machine BMC reconcile skipped"
+        );
+        return;
+    }
+    if let Err(error) = txn.commit().await {
+        tracing::warn!(
+            %error,
+            %bmc_mac_address,
+            "Site-explorer expected-machine BMC reconcile: commit failed"
+        );
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ExpectedSwitchStaticTarget {
+    mac_address: MacAddress,
+    ip_address: IpAddr,
+    interface_type: InterfaceType,
+    kind: &'static str,
+}
+
+async fn preallocate_expected_switch_target(
+    txn: &mut sqlx::PgConnection,
+    target: ExpectedSwitchStaticTarget,
+    retained_window: Option<chrono::Duration>,
+) -> Result<(), DatabaseError> {
+    let mut savepoint = db::Transaction::begin_inner(txn).await?;
+    match db::machine_interface::preallocate_machine_interface_with_type(
+        savepoint.as_pgconn(),
+        target.mac_address,
+        target.ip_address,
+        target.interface_type,
+        retained_window,
+    )
+    .await
+    {
+        Ok(()) => savepoint.commit().await,
+        Err(error) => {
+            savepoint.rollback().await?;
+            Err(error)
+        }
+    }
+}
+
+/// Reconcile the current BMC and NVOS addresses for one ExpectedSwitch.
+///
+/// The ExpectedSwitch writer lock keeps the reloaded row stable through
+/// address reconciliation. All MAC, segment, and address locks are acquired
+/// as batches before either interface row is changed.
+pub async fn try_reconcile_expected_switch_addresses(
+    pool: &PgPool,
+    bmc_mac_address: MacAddress,
+    retained_window: Option<chrono::Duration>,
+) {
+    let mut txn = match db::Transaction::begin(pool).await {
+        Ok(txn) => txn,
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                %bmc_mac_address,
+                "Site-explorer expected-switch address reconcile: txn_begin failed"
+            );
+            return;
+        }
+    };
+
+    if let Err(error) = db::expected_switch::lock_writes(txn.as_pgconn()).await {
+        tracing::warn!(
+            %error,
+            %bmc_mac_address,
+            "Site-explorer expected-switch address reconcile skipped"
+        );
+        return;
+    }
+    let expected_switch = match db::expected_switch::find_by_bmc_mac_address(
+        txn.as_pgconn(),
+        bmc_mac_address,
+    )
+    .await
+    {
+        Ok(Some(expected_switch)) => expected_switch,
+        Ok(None) => return,
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                %bmc_mac_address,
+                "Site-explorer expected-switch address reconcile skipped"
+            );
+            return;
+        }
+    };
+
+    let mut targets = Vec::with_capacity(2);
+    if let Some(ip_address) = expected_switch.bmc_ip_address {
+        targets.push(ExpectedSwitchStaticTarget {
+            mac_address: expected_switch.bmc_mac_address,
+            ip_address,
+            interface_type: InterfaceType::Bmc,
+            kind: "expected_switch BMC",
+        });
+    }
+    if let Some(ip_address) = expected_switch.nvos_ip_address {
+        match expected_switch.nvos_mac_addresses.as_slice() {
+            [mac_address] => targets.push(ExpectedSwitchStaticTarget {
+                mac_address: *mac_address,
+                ip_address,
+                interface_type: InterfaceType::Data,
+                kind: "expected_switch NVOS",
+            }),
+            mac_addresses => {
+                tracing::warn!(
+                    bmc_mac_address = %expected_switch.bmc_mac_address,
+                    nvos_ip_address = %ip_address,
+                    nvos_mac_address_count = mac_addresses.len(),
+                    "Skipping NVOS preallocation: nvos_ip_address requires exactly one nvos_mac_addresses entry"
+                );
+            }
+        }
+    }
+
+    if let Err(error) = db::machine_interface::lock_expected_machine_interface_macs(
+        txn.as_pgconn(),
+        targets.iter().map(|target| target.mac_address),
+    )
+    .await
+    {
+        tracing::warn!(
+            %error,
+            %bmc_mac_address,
+            "Site-explorer expected-switch address reconcile skipped"
+        );
+        return;
+    }
+
+    let mut resolved_targets = Vec::with_capacity(targets.len());
+    for target in targets {
+        match db::network_segment::for_static_address(txn.as_pgconn(), target.ip_address, None)
+            .await
+        {
+            Ok(segment) => resolved_targets.push((target, segment.id)),
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    mac_address = %target.mac_address,
+                    ip_address = %target.ip_address,
+                    kind = target.kind,
+                    "Site-explorer expected-switch preallocation skipped"
+                );
+            }
+        }
+    }
+    let allocations = resolved_targets
+        .iter()
+        .map(|(target, segment_id)| (*segment_id, target.ip_address))
+        .collect::<Vec<_>>();
+    if let Err(error) =
+        db::machine_interface::lock_static_address_allocations(txn.as_pgconn(), &allocations).await
+    {
+        tracing::warn!(
+            %error,
+            %bmc_mac_address,
+            "Site-explorer expected-switch address reconcile skipped"
+        );
+        return;
+    }
+
+    for (target, _) in resolved_targets {
+        if let Err(error) =
+            preallocate_expected_switch_target(txn.as_pgconn(), target, retained_window).await
+        {
+            tracing::warn!(
+                %error,
+                mac_address = %target.mac_address,
+                ip_address = %target.ip_address,
+                kind = target.kind,
+                "Site-explorer expected-switch preallocation skipped"
+            );
+        }
+    }
+
+    if let Err(error) = txn.commit().await {
+        tracing::warn!(
+            %error,
+            %bmc_mac_address,
+            "Site-explorer expected-switch address reconcile: commit failed"
+        );
+    }
+}
+
 /// Reconcile a single static-IP reservation into `machine_interfaces` in its
 /// own transaction.
 ///
@@ -3590,26 +3843,14 @@ pub async fn try_preallocate_one(
             return;
         }
     };
-    let result = match interface_type {
-        InterfaceType::Bmc => {
-            db::machine_interface::preallocate_bmc_machine_interface(
-                txn.as_pgconn(),
-                mac,
-                ip,
-                retained_window,
-            )
-            .await
-        }
-        InterfaceType::Data => {
-            db::machine_interface::preallocate_machine_interface(
-                txn.as_pgconn(),
-                mac,
-                ip,
-                retained_window,
-            )
-            .await
-        }
-    };
+    let result = db::machine_interface::preallocate_machine_interface_with_type(
+        txn.as_pgconn(),
+        mac,
+        ip,
+        interface_type,
+        retained_window,
+    )
+    .await;
     match result {
         Ok(()) => {
             if let Err(error) = txn.commit().await {
@@ -3634,39 +3875,80 @@ pub async fn try_preallocate_one(
     }
 }
 
-/// Pin a BMC's auto-allocated (DHCP) address as `Static` so DHCP lease expiry
-/// can't reap it, for BMCs whose `bmc_ip_allocation` retains a dynamic IP and
-/// that have no operator-specified `bmc_ip_address`. Mirrors
-/// [`try_preallocate_one`]: own txn from the pool, warn-and-continue on error so
-/// a single failure never fails the whole reconcile pass. Idempotent on the
-/// api-db side -- a no-op once the address is already `Static`.
-pub async fn try_retain_bmc(pool: &PgPool, mac: MacAddress) {
+/// Materialize a fixed reservation declared by an ExpectedMachine interface.
+/// Attached rows are left alone. Once an interface row is deleted, a later
+/// pass can materialize the current reservation for its next observation.
+pub async fn try_preallocate_expected_interface(
+    pool: &PgPool,
+    mac: MacAddress,
+    retained_window: Option<chrono::Duration>,
+) {
     let mut txn = match db::Transaction::begin(pool).await {
-        Ok(t) => t,
+        Ok(txn) => txn,
         Err(error) => {
             tracing::warn!(
                 %error,
-                bmc_mac_address = %mac,
-                "Site-explorer BMC retain: txn_begin failed"
+                mac_address = %mac,
+                "Site-explorer expected-interface preallocation: txn_begin failed"
             );
             return;
         }
     };
-    match db::machine_interface::retain_bmc_address_by_mac(txn.as_pgconn(), mac).await {
+
+    // The outer Site Explorer pass works from a detached snapshot. Re-read and
+    // lock the declaration here so a configuration update or deletion cannot
+    // race this transaction and leave a stale fixed reservation behind.
+    if let Err(error) = db::expected_machine::lock_config_mutations_shared(txn.as_pgconn()).await {
+        tracing::warn!(
+            %error,
+            mac_address = %mac,
+            "Site-explorer expected-interface preallocation skipped"
+        );
+        return;
+    }
+    let expected_machine =
+        match db::expected_machine::find_by_host_mac_address(txn.as_pgconn(), mac).await {
+            Ok(Some(expected_machine)) => expected_machine,
+            Ok(None) => return,
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    mac_address = %mac,
+                    "Site-explorer expected-interface preallocation skipped"
+                );
+                return;
+            }
+        };
+    let Some(expected_interface) = expected_machine.data.expected_interface_for_mac(mac) else {
+        return;
+    };
+    let Some(ip) = expected_interface.fixed_ip else {
+        return;
+    };
+
+    match db::machine_interface::preallocate_expected_machine_interface_if_never_associated(
+        txn.as_pgconn(),
+        &expected_interface,
+        retained_window,
+    )
+    .await
+    {
         Ok(()) => {
             if let Err(error) = txn.commit().await {
                 tracing::warn!(
                     %error,
-                    bmc_mac_address = %mac,
-                    "Site-explorer BMC retain: commit failed"
+                    mac_address = %mac,
+                    ip_address = %ip,
+                    "Site-explorer expected-interface preallocation: commit failed"
                 );
             }
         }
         Err(error) => {
             tracing::warn!(
                 %error,
-                bmc_mac_address = %mac,
-                "Site-explorer BMC retain skipped"
+                mac_address = %mac,
+                ip_address = %ip,
+                "Site-explorer expected-interface preallocation skipped"
             );
         }
     }
@@ -4147,11 +4429,155 @@ fn health_reports_equal_ignoring_observed_at(
 #[cfg(test)]
 mod tests {
     use carbide_test_support::Outcome::*;
-    use carbide_test_support::{Case, check_cases, value_scenarios};
+    use carbide_test_support::{Case, Check, check_cases, check_values, value_scenarios};
     use config_version::ConfigVersion;
+    use model::expected_machine::ExpectedInterfaceRole;
     use model::site_explorer::PreingestionState;
 
     use super::*;
+
+    #[test]
+    fn legacy_bmc_interface_hints_remain_redfish_scan_candidates() {
+        check_values(
+            [
+                Check {
+                    scenario: "legacy bmc hint",
+                    input: (ExpectedInterfaceRole::Host, Some("bmc"), None),
+                    expect: false,
+                },
+                Check {
+                    scenario: "legacy oob hint is case-insensitive",
+                    input: (ExpectedInterfaceRole::Host, Some("OOB"), None),
+                    expect: false,
+                },
+                Check {
+                    scenario: "legacy onboard data hint",
+                    input: (ExpectedInterfaceRole::Host, Some("onboard"), None),
+                    expect: true,
+                },
+                Check {
+                    scenario: "legacy host interface without a hint",
+                    input: (ExpectedInterfaceRole::Host, None, None),
+                    expect: true,
+                },
+                Check {
+                    scenario: "explicit DPU OS role overrides legacy hint",
+                    input: (ExpectedInterfaceRole::DpuOs, Some("bmc"), None),
+                    expect: true,
+                },
+                Check {
+                    scenario: "explicit DPU BMC role",
+                    input: (ExpectedInterfaceRole::DpuBmc, None, None),
+                    expect: false,
+                },
+                Check {
+                    scenario: "typed admin segment overrides legacy bmc hint",
+                    input: (
+                        ExpectedInterfaceRole::Host,
+                        Some("bmc"),
+                        Some(NetworkSegmentType::Admin),
+                    ),
+                    expect: true,
+                },
+                Check {
+                    scenario: "typed underlay segment overrides legacy oob hint",
+                    input: (
+                        ExpectedInterfaceRole::Host,
+                        Some("oob"),
+                        Some(NetworkSegmentType::Underlay),
+                    ),
+                    expect: true,
+                },
+            ],
+            |(role, nic_type, network_segment_type)| {
+                is_expected_data_only_interface(&ExpectedHostNic {
+                    role,
+                    nic_type: nic_type.map(str::to_string),
+                    network_segment_type,
+                    ..Default::default()
+                })
+            },
+        );
+    }
+
+    #[test]
+    fn expected_data_interfaces_are_not_redfish_scan_candidates() {
+        let underlay_segment: NetworkSegmentId = uuid::Uuid::new_v4().into();
+        let host_inband_segment: NetworkSegmentId = uuid::Uuid::new_v4().into();
+        let expected_data_mac: MacAddress = "AA:BB:CC:00:00:01".parse().unwrap();
+        let unknown_mac: MacAddress = "AA:BB:CC:00:00:02".parse().unwrap();
+        let expected_data_macs = HashSet::from([expected_data_mac]);
+
+        let interface = |mac_address, segment_id, interface_type, owned: bool| {
+            let mut interface = MachineInterfaceSnapshot::mock_with_mac(mac_address);
+            interface.segment_id = segment_id;
+            interface.interface_type = interface_type;
+            interface.machine_id = owned.then(|| {
+                carbide_uuid::machine::MachineId::new(
+                    carbide_uuid::machine::MachineIdSource::Tpm,
+                    [0x42; 32],
+                    MachineType::Host,
+                )
+            });
+            interface
+        };
+        let scannable = |interface: &MachineInterfaceSnapshot| {
+            is_scannable_interface(
+                interface,
+                &[underlay_segment],
+                &[host_inband_segment],
+                &expected_data_macs,
+            )
+        };
+
+        check_values(
+            [
+                Check {
+                    scenario: "unowned unknown data interface on underlay",
+                    input: (unknown_mac, underlay_segment, InterfaceType::Data, false),
+                    expect: true,
+                },
+                Check {
+                    scenario: "unowned expected data interface on underlay",
+                    input: (
+                        expected_data_mac,
+                        underlay_segment,
+                        InterfaceType::Data,
+                        false,
+                    ),
+                    expect: false,
+                },
+                Check {
+                    scenario: "owned unknown data interface on underlay",
+                    input: (unknown_mac, underlay_segment, InterfaceType::Data, true),
+                    expect: false,
+                },
+                Check {
+                    scenario: "owned expected BMC interface on underlay",
+                    input: (
+                        expected_data_mac,
+                        underlay_segment,
+                        InterfaceType::Bmc,
+                        true,
+                    ),
+                    expect: true,
+                },
+                Check {
+                    scenario: "unowned unknown BMC interface on host in-band",
+                    input: (unknown_mac, host_inband_segment, InterfaceType::Bmc, false),
+                    expect: true,
+                },
+                Check {
+                    scenario: "unowned unknown data interface on host in-band",
+                    input: (unknown_mac, host_inband_segment, InterfaceType::Data, false),
+                    expect: false,
+                },
+            ],
+            |(mac_address, segment_id, interface_type, owned)| {
+                scannable(&interface(mac_address, segment_id, interface_type, owned))
+            },
+        );
+    }
 
     #[test]
     fn in_memory_marker_keeps_bmc_reset_throttled_when_persist_fails() {

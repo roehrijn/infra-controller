@@ -23,7 +23,7 @@ use db::{self, expected_machine, machine_interface};
 use mac_address::MacAddress;
 use model::allocation_type::AllocationType;
 use model::dpa_interface::DpaInterface;
-use model::expected_machine::ExpectedHostNic;
+use model::expected_machine::{ExpectedHostNic, ExpectedInterfaceRole};
 use model::machine::MachineInterfaceSnapshot;
 use model::machine_interface::InterfaceType;
 use model::network_segment::{
@@ -480,154 +480,220 @@ pub async fn discover_dhcp(
     )?;
     let is_v6_observation = address_family == IpAddressFamily::Ipv6
         && message_kind == Some(DhcpMessageKind::V6InfoRequest);
-    let mut host_nic: Option<ExpectedHostNic> = None;
-    // `is_primary_nic` reflects the matched ExpectedHostNic's `primary` flag.
-    // - `Some(true)` -- the operator flagged this NIC as the host's boot interface.
-    // - `Some(false)` -- another NIC on this host is the declared primary.
-    // - `None` -- no declaration, use the default at interface creation time.
-    let mut is_primary_nic: Option<bool> = None;
-
     let parsed_mac: MacAddress = mac_address.parse()?;
-    let mut predicted_interface_for_observation = None;
 
+    let mut retain_new_expected_address = false;
+    let mut expected_machine = expected_machine::find_by_host_mac_address(&mut txn, parsed_mac)
+        .await
+        .map_err(CarbideError::from)?;
+    let initial_lookup_was_empty = expected_machine.is_none();
+    db::machine_interface::lock_expected_machine_interface_macs(
+        &mut txn,
+        std::iter::once(parsed_mac),
+    )
+    .await?;
+    if initial_lookup_was_empty {
+        // ExpectedMachine creation cannot change this nested declaration while
+        // the MAC is locked. Keep the second pass non-locking so an update
+        // holding the ExpectedMachine row cannot deadlock on the MAC.
+        expected_machine =
+            expected_machine::find_by_host_mac_address_after_interface_lock(&mut txn, parsed_mac)
+                .await
+                .map_err(CarbideError::from)?;
+    }
+    let predicted_interface =
+        db::predicted_machine_interface::find_by_mac_address(&mut txn, parsed_mac).await?;
+    let prediction_needs_refresh = predicted_interface
+        .as_ref()
+        .is_some_and(|interface| !interface.expected_interface_captured);
     let desired_address_ip: Option<IpAddr> = if is_v6_observation {
         None
     } else {
         desired_address.map(|addr| addr.parse()).transpose()?
     };
+    let mut existing_machine_id =
+        db::machine::find_existing_machine(&mut txn, parsed_mac, parsed_relay).await?;
+    let should_check_legacy_reservations =
+        existing_machine_id.is_none() && predicted_interface.is_none();
+    if should_check_legacy_reservations
+        && address_family == IpAddressFamily::Ipv4
+        && let Some(response) =
+            handle_dhcp_from_dpa(api, &mut txn, parsed_mac, relay_address, desired_address_ip)
+                .await?
+    {
+        txn.commit().await?;
+        return Ok(response);
+    }
 
-    let existing_machine_id =
-        match db::machine::find_existing_machine(&mut txn, parsed_mac, parsed_relay).await? {
-            Some(existing_machine) => Some(existing_machine),
-            None => {
-                if let Some(expected_interface) =
-                    db::predicted_machine_interface::find_by_mac_address(&mut txn, parsed_mac)
-                        .await?
-                {
-                    if is_v6_observation {
-                        predicted_interface_for_observation = Some(expected_interface);
-                        None
-                    } else {
-                        // remember expected machine id for later rack update
-                        machine_interface::move_predicted_machine_interface_to_machine(
-                            &mut txn,
-                            &expected_interface,
-                            parsed_relay,
-                            api.runtime_config.retained_boot_interface_window,
-                        )
-                        .await?;
-                        Some(expected_interface.machine_id)
-                    }
-                } else {
-                    // DPA allocation is currently IPv4-only. The overlay
-                    // uses u32 arithmetic (LSB toggle) and /31 linknets,
-                    // and the underlay parses relay_address as Ipv4Addr.
-                    // Skip the DPA path entirely for IPv6 relays.
-                    if address_family == IpAddressFamily::Ipv4
-                        && let Some(resp) = handle_dhcp_from_dpa(
-                            api,
-                            &mut txn,
-                            parsed_mac,
-                            relay_address,
-                            desired_address_ip,
-                        )
-                        .await?
-                    {
-                        txn.commit().await?;
-                        return Ok(resp);
-                    }
+    // Legacy top-level BMC and ExpectedSwitch reservations are still valid
+    // when no nested interface declaration applies. Their writers take this
+    // same MAC lock before making the lookup visible, so these post-lock reads
+    // are stable through the transaction without taking a config-row lock in
+    // the opposite order.
+    let legacy_expected_machine = if expected_machine.is_none() && should_check_legacy_reservations
+    {
+        expected_machine::find_by_bmc_mac_address(&mut txn, parsed_mac)
+            .await
+            .map_err(CarbideError::from)?
+    } else {
+        None
+    };
+    let legacy_bmc_ip = legacy_expected_machine
+        .as_ref()
+        .and_then(|machine| machine.data.bmc_ip_address)
+        .filter(|address| address.is_address_family(address_family));
+    let legacy_expected_switch = if expected_machine.is_none()
+        && should_check_legacy_reservations
+        && legacy_bmc_ip.is_none()
+    {
+        db::expected_switch::find_by_nvos_mac_address(&mut txn, parsed_mac)
+            .await
+            .map_err(CarbideError::from)?
+    } else {
+        None
+    };
+    let legacy_nvos_ip = legacy_expected_switch
+        .as_ref()
+        .and_then(|switch| switch.nvos_ip_address)
+        .filter(|address| address.is_address_family(address_family));
+    let mut legacy_fixed_allocations = Vec::new();
+    for address in legacy_bmc_ip.into_iter().chain(legacy_nvos_ip) {
+        let segment = db::network_segment::for_static_address(&mut txn, address, None).await?;
+        legacy_fixed_allocations.push((segment.id, address));
+    }
+    let current_expected_interface = expected_machine
+        .as_ref()
+        .and_then(|machine| machine.data.expected_interface_for_mac(parsed_mac));
+    let expected_interface_lock_inputs =
+        db::machine_interface::expected_interface_discovery_lock_inputs(
+            &mut txn,
+            parsed_mac,
+            current_expected_interface.as_ref(),
+        )
+        .await?;
 
-                    // Now lets check expected machine data to see if there's any
-                    // useful configuration we need to address, such as primary NIC
-                    // assignment and/or static DHCP reservation allocations.
-                    //
-                    // For static DHCP reservations, we do this here for the simple
-                    // reason that it's a good place to put it. If an operator force
-                    // deletes a machine and its interfaces, how would we put them
-                    // back? The answer is the same way they would be put back in a
-                    // dynamic allocation -- during DHCPDISCOVER/DHCPREQUEST. We see
-                    // that a static DHCP reservation is configured per expected
-                    // machine data, so we make an idempotent call to ensure that
-                    // allocation exists, and if not, is created.
-                    if let Some(m) =
-                        expected_machine::find_by_host_mac_address(&mut txn, parsed_mac)
-                            .await
-                            .map_err(CarbideError::from)?
-                    {
-                        // The host's declared primary NIC (if any) decides whether this
-                        // MAC is its boot interface; the matched NIC also carries any
-                        // static reservation need handled below.
-                        if let Some(declared_primary_mac) = m.data.declared_primary_mac() {
-                            is_primary_nic = Some(declared_primary_mac == parsed_mac);
-                        }
-                        host_nic = m
-                            .data
-                            .host_nics
-                            .iter()
-                            .find(|nic| nic.mac_address == parsed_mac)
-                            .cloned();
-                        if let Some(ref nic) = host_nic
-                            && let Some(fixed_ip) = nic.fixed_ip
-                            && fixed_ip.is_address_family(address_family)
-                        {
-                            // It looks like there's a DHCP reservation for this address,
-                            // so make an idempotent call to ensure we have a preallocated
-                            // machine interface (and machine interface address) for it,
-                            // creating one if needed.
-                            db::machine_interface::preallocate_machine_interface(
-                                &mut txn,
-                                parsed_mac,
-                                fixed_ip,
-                                api.runtime_config.retained_boot_interface_window,
-                            )
-                            .await?;
-                        }
-                    } else if let Some(m) =
-                        expected_machine::find_by_bmc_mac_address(&mut txn, parsed_mac)
-                            .await
-                            .map_err(CarbideError::from)?
-                        && let Some(bmc_ip) = m.data.bmc_ip_address
-                        && bmc_ip.is_address_family(address_family)
-                    {
-                        // In this case it looks like our parsed MAC address is for the BMC
-                        // of an expected machine, and it has a static DHCP reservation per
-                        // its bmc_ip_address, so again, ensure the machine interface is
-                        // allocated before continuing. BMC variant so the row carries
-                        // InterfaceType::Bmc (and primary=false). Races against
-                        // site-explorer's reconciliation pass are handled inside preallocate.
-                        db::machine_interface::preallocate_bmc_machine_interface(
-                            &mut txn,
-                            parsed_mac,
-                            bmc_ip,
-                            api.runtime_config.retained_boot_interface_window,
-                        )
-                        .await?;
-                    } else if let Some(s) =
-                        db::expected_switch::find_by_nvos_mac_address(&mut txn, parsed_mac)
-                            .await
-                            .map_err(CarbideError::from)?
-                        && let Some(nvos_ip) = s.nvos_ip_address
-                        && nvos_ip.is_address_family(address_family)
-                    {
-                        // The parsed MAC matches the single wired NVOS port of an expected
-                        // switch with a configured static IP. Mirrors the ExpectedHostNic
-                        // fixed_ip path: ensure the (mac, nvos_ip) row exists so the static
-                        // reservation gets served by the find_or_create_machine_interface
-                        // step below. Data variant (NVOS is a data interface, not a BMC).
-                        // Races against site-explorer's reconciliation pass are handled
-                        // inside preallocate.
-                        db::machine_interface::preallocate_machine_interface(
-                            &mut txn,
-                            parsed_mac,
-                            nvos_ip,
-                            api.runtime_config.retained_boot_interface_window,
-                        )
-                        .await?;
-                    }
-                    None
-                }
+    // Segment locks must precede any machine-interface row lock. Admin
+    // reconciliation takes an exclusive segment lock before locking those
+    // rows, while allocation later takes per-address locks. Lock every relay
+    // candidate so the policy filter cannot select an unlocked fallback, and
+    // include fixed and computed SLAAC targets before declaration capture. A
+    // fixed reservation's address-selected segment may differ from the relay.
+    let relay_candidate_segments =
+        db::network_segment::for_relay_all(&mut txn, std::slice::from_ref(&parsed_relay)).await?;
+    let mut candidate_segment_ids = relay_candidate_segments
+        .iter()
+        .map(|segment| segment.id)
+        .collect::<Vec<_>>();
+    let mut address_lock_targets = expected_interface_lock_inputs.fixed_allocations;
+    address_lock_targets.extend(legacy_fixed_allocations);
+    if is_v6_observation {
+        address_lock_targets.extend(relay_candidate_segments.iter().filter_map(|segment| {
+            segment
+                .slaac_eligible()
+                .and_then(|prefix| v6::slaac_gua_from_eui64(prefix, &parsed_mac))
+                .map(|address| (segment.id, IpAddr::V6(address)))
+        }));
+    }
+    if let Some(existing_segment_id) = expected_interface_lock_inputs.existing_segment_id {
+        candidate_segment_ids.push(existing_segment_id);
+    }
+    candidate_segment_ids.extend(
+        address_lock_targets
+            .iter()
+            .map(|(segment_id, _)| *segment_id),
+    );
+    if address_family == IpAddressFamily::Ipv6 && !is_v6_observation {
+        // Stateful IPv6 allocation reads the segment's used-address set.
+        db::machine_interface::lock_network_segments_exclusive(&mut txn, &candidate_segment_ids)
+            .await?;
+    } else {
+        // IPv4 and DHCPv6 INFORMATION-REQUEST use per-address locking.
+        db::machine_interface::lock_network_segments_shared(&mut txn, &candidate_segment_ids)
+            .await?;
+    }
+    db::machine_interface::lock_static_address_keys_after_segment_locks(
+        &mut txn,
+        &address_lock_targets,
+    )
+    .await?;
+
+    let host_nic = db::machine_interface::capture_expected_interface_for_discovery(
+        &mut txn,
+        parsed_mac,
+        current_expected_interface.as_ref(),
+    )
+    .await?;
+    let predicted_interface = if prediction_needs_refresh {
+        db::predicted_machine_interface::find_by_mac_address(&mut txn, parsed_mac).await?
+    } else {
+        predicted_interface
+    };
+    let is_primary_nic = host_nic
+        .as_ref()
+        .filter(|interface| interface.role == ExpectedInterfaceRole::Host)
+        .map(ExpectedHostNic::initial_primary_interface);
+
+    let mut predicted_interface = predicted_interface;
+
+    if let Some(expected_interface) = host_nic.as_ref() {
+        retain_new_expected_address = !is_v6_observation
+            && expected_interface
+                .resolved_ip_allocation()
+                .retains_dynamic_ip();
+
+        if expected_interface.fixed_ip.is_some() {
+            // A fixed declaration rebuilds its reservation during initial
+            // discovery or re-ingestion, even when first contact uses the
+            // other address family. Recheck attachment under the DB row lock
+            // so a concurrent ingestion cannot turn this into live-state
+            // reconciliation.
+            if predicted_interface.is_some() {
+                db::machine_interface::preallocate_captured_expected_machine_interface(
+                    &mut txn,
+                    expected_interface,
+                    api.runtime_config.retained_boot_interface_window,
+                )
+                .await?;
+            } else {
+                db::machine_interface::preallocate_expected_machine_interface_if_never_associated(
+                    &mut txn,
+                    expected_interface,
+                    api.runtime_config.retained_boot_interface_window,
+                )
+                .await?;
             }
-        };
+        }
+    } else if should_check_legacy_reservations {
+        if let Some(bmc_ip) = legacy_bmc_ip {
+            db::machine_interface::preallocate_bmc_machine_interface(
+                &mut txn,
+                parsed_mac,
+                bmc_ip,
+                api.runtime_config.retained_boot_interface_window,
+            )
+            .await?;
+        } else if let Some(nvos_ip) = legacy_nvos_ip {
+            db::machine_interface::preallocate_machine_interface(
+                &mut txn,
+                parsed_mac,
+                nvos_ip,
+                api.runtime_config.retained_boot_interface_window,
+            )
+            .await?;
+        }
+    }
+
+    if !is_v6_observation && let Some(expected_interface) = predicted_interface.take() {
+        // Remember the expected machine id for the later rack update.
+        machine_interface::move_predicted_machine_interface_to_machine(
+            &mut txn,
+            &expected_interface,
+            parsed_relay,
+            api.runtime_config.retained_boot_interface_window,
+        )
+        .await?;
+        existing_machine_id = Some(expected_interface.machine_id);
+    }
 
     if is_v6_observation {
         let network_segments = db::machine_interface::network_segments_for_dhcp_relays(
@@ -691,7 +757,8 @@ pub async fn discover_dhcp(
             );
         } else if segment.config.allocation_strategy == AllocationStrategy::Reserved
             && interfaces.is_empty()
-            && predicted_interface_for_observation.is_none()
+            && predicted_interface.is_none()
+            && host_nic.is_none()
         {
             // Anonymous reserved requests can receive segment options without
             // creating observed rows. Known or predicted interfaces must
@@ -708,10 +775,10 @@ pub async fn discover_dhcp(
         }
     }
 
-    if is_v6_observation && predicted_interface_for_observation.is_some() {
+    if is_v6_observation && predicted_interface.is_some() {
         let interfaces = db::machine_interface::find_by_mac_address(&mut txn, parsed_mac).await?;
         if interfaces.is_empty()
-            && let Some(predicted_interface) = predicted_interface_for_observation.take()
+            && let Some(predicted_interface) = predicted_interface.take()
         {
             // Reserved segments reject anonymous observed-row creation, but a
             // prediction is explicit host identity. Promote it before the observed
@@ -733,7 +800,7 @@ pub async fn discover_dhcp(
             existing_machine_id,
             parsed_mac,
             std::slice::from_ref(&parsed_relay),
-            host_nic,
+            host_nic.clone(),
             is_primary_nic,
             api.runtime_config.retained_boot_interface_window,
         )
@@ -747,7 +814,7 @@ pub async fn discover_dhcp(
             parsed_mac,
             std::slice::from_ref(&parsed_relay),
             machine_interface::FindOrCreateMachineInterfaceOptions {
-                host_nic,
+                host_nic: host_nic.clone(),
                 is_primary: is_primary_nic,
                 retained_window: api.runtime_config.retained_boot_interface_window,
             },
@@ -755,8 +822,14 @@ pub async fn discover_dhcp(
         )
         .await?
     };
+    db::machine_interface::persist_expected_interface_if_missing(
+        &mut txn,
+        machine_interface.id,
+        host_nic.as_ref(),
+    )
+    .await?;
 
-    if let Some(predicted_interface) = predicted_interface_for_observation {
+    if let Some(predicted_interface) = predicted_interface {
         machine_interface::move_predicted_machine_interface_to_machine(
             &mut txn,
             &predicted_interface,
@@ -810,6 +883,21 @@ pub async fn discover_dhcp(
             address_family,
         )
         .await?;
+        if retain_new_expected_address
+            && db::machine_interface_address::retain_expected_machine_dhcp_address_for_family(
+                &mut txn,
+                machine_interface.id,
+                address_family,
+            )
+            .await?
+        {
+            tracing::info!(
+                machine_interface_id = %machine_interface.id,
+                client_mac_address = %parsed_mac,
+                ?address_family,
+                "Retained newly allocated expected-interface DHCP address"
+            );
+        }
     }
 
     if machine_interface.interface_type != InterfaceType::Bmc

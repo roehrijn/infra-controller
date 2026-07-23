@@ -20,7 +20,8 @@ use std::net::IpAddr;
 use carbide_test_harness::prelude::*;
 use carbide_test_harness::test_support::network_segment::create_static_assignments_segment;
 use mac_address::MacAddress;
-use model::expected_machine::{ExpectedMachine, ExpectedMachineData};
+use model::allocation_type::AllocationType;
+use model::expected_machine::{BmcIpAllocationType, ExpectedMachine, ExpectedMachineData};
 use model::metadata::Metadata;
 
 async fn init(pool: &PgPool) -> TestHarness {
@@ -234,11 +235,13 @@ async fn test_site_explorer_reconcile_preallocates_host_nic_fixed_ip(
                 host_nics: vec![model::expected_machine::ExpectedHostNic {
                     network_segment_type: None,
                     mac_address: nic_mac,
-                    nic_type: Some("onboard".into()),
+                    nic_type: None,
                     fixed_ip: Some(parsed_fixed_ip),
                     fixed_mask: None,
                     fixed_gateway: None,
                     primary: None,
+                    role: Default::default(),
+                    ip_allocation: None,
                 }],
                 ..Default::default()
             },
@@ -247,15 +250,7 @@ async fn test_site_explorer_reconcile_preallocates_host_nic_fixed_ip(
     .await?;
     txn.commit().await?;
 
-    carbide_site_explorer::try_preallocate_one(
-        &pool,
-        nic_mac,
-        parsed_fixed_ip,
-        model::machine_interface::InterfaceType::Data,
-        "expected_machine host NIC",
-        None,
-    )
-    .await;
+    carbide_site_explorer::try_preallocate_expected_interface(&pool, nic_mac, None).await;
 
     let mut txn = pool.begin().await?;
     let nic_iface = db::machine_interface::find_by_mac_address(&mut *txn, nic_mac).await?;
@@ -274,6 +269,269 @@ async fn test_site_explorer_reconcile_preallocates_host_nic_fixed_ip(
         model::machine_interface::InterfaceType::Data,
         "host NIC preallocation should mark the interface as InterfaceType::Data, not Bmc"
     );
+
+    Ok(())
+}
+
+/// A Site Explorer pass can hold a detached ExpectedMachine snapshot while an
+/// operator deletes that configuration. The per-interface helper must re-read
+/// current state instead of recreating a reservation from the stale snapshot.
+#[sqlx_test]
+async fn test_site_explorer_reconcile_skips_deleted_expected_interface_snapshot(
+    pool: PgPool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    init(&pool).await;
+
+    let bmc_mac: MacAddress = "AA:BB:CC:DD:E1:11".parse()?;
+    let nic_mac: MacAddress = "AA:BB:CC:DD:E1:12".parse()?;
+    let fixed_ip: IpAddr = "10.99.0.21".parse()?;
+
+    let mut txn = pool.begin().await?;
+    db::expected_machine::create(
+        &mut txn,
+        ExpectedMachine {
+            id: None,
+            bmc_mac_address: bmc_mac,
+            data: ExpectedMachineData {
+                serial_number: "reconcile-stale-001".to_string(),
+                host_nics: vec![model::expected_machine::ExpectedHostNic {
+                    mac_address: nic_mac,
+                    fixed_ip: Some(fixed_ip),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        },
+    )
+    .await?;
+    txn.commit().await?;
+
+    // The outer loop has already remembered nic_mac, but the configuration is
+    // deleted before its delayed per-interface transaction starts.
+    let mut txn = pool.begin().await?;
+    db::expected_machine::delete_by_mac(&mut txn, bmc_mac).await?;
+    txn.commit().await?;
+
+    carbide_site_explorer::try_preallocate_expected_interface(&pool, nic_mac, None).await;
+
+    let mut txn = pool.begin().await?;
+    let interfaces = db::machine_interface::find_by_mac_address(&mut *txn, nic_mac).await?;
+    txn.rollback().await?;
+    assert!(
+        interfaces.is_empty(),
+        "a stale Site Explorer snapshot must not recreate a deleted reservation"
+    );
+
+    Ok(())
+}
+
+/// Legacy BMC reconciliation receives a MAC from the outer Site Explorer
+/// snapshot, but its fixed-address decision must come from the current row.
+#[sqlx_test]
+async fn test_site_explorer_reconcile_skips_removed_expected_machine_bmc_address(
+    pool: PgPool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    init(&pool).await;
+
+    let bmc_mac: MacAddress = "AA:BB:CC:DD:E1:21".parse()?;
+    let stale_ip: IpAddr = "10.99.0.22".parse()?;
+
+    let mut txn = pool.begin().await?;
+    let mut expected_machine = db::expected_machine::create(
+        &mut txn,
+        ExpectedMachine {
+            id: None,
+            bmc_mac_address: bmc_mac,
+            data: ExpectedMachineData {
+                serial_number: "reconcile-stale-bmc-001".to_string(),
+                bmc_ip_address: Some(stale_ip),
+                ..Default::default()
+            },
+        },
+    )
+    .await?;
+    txn.commit().await?;
+
+    // The outer loop has remembered the old fixed address, but the operator
+    // switches this BMC to Dynamic before its per-source transaction starts.
+    expected_machine.data.bmc_ip_address = None;
+    expected_machine.data.bmc_ip_allocation = BmcIpAllocationType::Dynamic;
+    let mut txn = pool.begin().await?;
+    db::expected_machine::update(&mut txn, &expected_machine).await?;
+    txn.commit().await?;
+
+    carbide_site_explorer::try_reconcile_expected_machine_bmc(&pool, bmc_mac, None).await;
+
+    let mut txn = pool.begin().await?;
+    let interfaces = db::machine_interface::find_by_mac_address(&mut *txn, bmc_mac).await?;
+    txn.rollback().await?;
+    assert!(
+        interfaces.is_empty(),
+        "the stale fixed BMC address must not be materialized after it is removed"
+    );
+
+    Ok(())
+}
+
+/// A Retained policy from the outer snapshot must not pin a DHCP address after
+/// the current ExpectedMachine changes to Dynamic.
+#[sqlx_test]
+async fn test_site_explorer_reconcile_skips_removed_expected_machine_bmc_retention(
+    pool: PgPool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    init(&pool).await;
+
+    let bmc_mac: MacAddress = "AA:BB:CC:DD:E1:25".parse()?;
+    let bmc_ip: IpAddr = "10.99.0.27".parse()?;
+
+    let mut txn = pool.begin().await?;
+    let mut expected_machine = db::expected_machine::create(
+        &mut txn,
+        ExpectedMachine {
+            id: None,
+            bmc_mac_address: bmc_mac,
+            data: ExpectedMachineData {
+                serial_number: "reconcile-stale-retained-001".to_string(),
+                bmc_ip_allocation: BmcIpAllocationType::Retained,
+                ..Default::default()
+            },
+        },
+    )
+    .await?;
+    txn.commit().await?;
+
+    carbide_site_explorer::try_preallocate_one(
+        &pool,
+        bmc_mac,
+        bmc_ip,
+        model::machine_interface::InterfaceType::Bmc,
+        "expected_machine BMC test setup",
+        None,
+    )
+    .await;
+    let mut txn = pool.begin().await?;
+    let interface = db::machine_interface::find_by_mac_address(&mut *txn, bmc_mac)
+        .await?
+        .remove(0);
+    sqlx::query(
+        "UPDATE machine_interface_addresses
+         SET allocation_type = 'dhcp'
+         WHERE interface_id = $1",
+    )
+    .bind(interface.id)
+    .execute(&mut *txn)
+    .await?;
+    txn.commit().await?;
+
+    expected_machine.data.bmc_ip_allocation = BmcIpAllocationType::Dynamic;
+    let mut txn = pool.begin().await?;
+    db::expected_machine::update(&mut txn, &expected_machine).await?;
+    txn.commit().await?;
+
+    carbide_site_explorer::try_reconcile_expected_machine_bmc(&pool, bmc_mac, None).await;
+
+    let mut txn = pool.begin().await?;
+    let addresses =
+        db::machine_interface_address::find_for_interface(&mut txn, interface.id).await?;
+    txn.rollback().await?;
+    assert_eq!(addresses.len(), 1);
+    assert_eq!(addresses[0].allocation_type, AllocationType::Dhcp);
+
+    Ok(())
+}
+
+/// ExpectedSwitch reconciliation must reload updated addresses instead of
+/// applying values from the detached Site Explorer snapshot.
+#[sqlx_test]
+async fn test_site_explorer_reconcile_uses_updated_expected_switch_bmc_address(
+    pool: PgPool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    init(&pool).await;
+
+    let bmc_mac: MacAddress = "AA:BB:CC:DD:E1:31".parse()?;
+    let stale_ip: IpAddr = "10.99.0.23".parse()?;
+    let current_ip: IpAddr = "10.99.0.24".parse()?;
+
+    let mut txn = pool.begin().await?;
+    let mut expected_switch = db::expected_switch::create(
+        &mut txn,
+        model::expected_switch::ExpectedSwitch {
+            expected_switch_id: None,
+            bmc_mac_address: bmc_mac,
+            nvos_mac_addresses: vec![],
+            bmc_username: "ADMIN".into(),
+            serial_number: "reconcile-stale-switch-001".into(),
+            bmc_password: "PASS".into(),
+            nvos_username: None,
+            nvos_password: None,
+            bmc_ip_address: Some(stale_ip),
+            nvos_ip_address: None,
+            metadata: Metadata::default(),
+            rack_id: None,
+            bmc_retain_credentials: None,
+        },
+    )
+    .await?;
+    txn.commit().await?;
+
+    expected_switch.bmc_ip_address = Some(current_ip);
+    let mut txn = pool.begin().await?;
+    db::expected_switch::update(&mut txn, &expected_switch).await?;
+    txn.commit().await?;
+
+    carbide_site_explorer::try_reconcile_expected_switch_addresses(&pool, bmc_mac, None).await;
+
+    let mut txn = pool.begin().await?;
+    let interfaces = db::machine_interface::find_by_mac_address(&mut *txn, bmc_mac).await?;
+    txn.rollback().await?;
+    assert_eq!(interfaces.len(), 1);
+    assert!(interfaces[0].addresses.contains(&current_ip));
+    assert!(!interfaces[0].addresses.contains(&stale_ip));
+
+    Ok(())
+}
+
+/// A malformed legacy NVOS pairing is skipped without hiding an otherwise
+/// valid switch BMC reservation.
+#[sqlx_test]
+async fn test_site_explorer_reconcile_invalid_nvos_pairing_keeps_switch_bmc(
+    pool: PgPool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    init(&pool).await;
+
+    let bmc_mac: MacAddress = "AA:BB:CC:DD:E1:41".parse()?;
+    let bmc_ip: IpAddr = "10.99.0.25".parse()?;
+    let nvos_ip: IpAddr = "10.99.0.26".parse()?;
+
+    let mut txn = pool.begin().await?;
+    db::expected_switch::create(
+        &mut txn,
+        model::expected_switch::ExpectedSwitch {
+            expected_switch_id: None,
+            bmc_mac_address: bmc_mac,
+            nvos_mac_addresses: vec![],
+            bmc_username: "ADMIN".into(),
+            serial_number: "reconcile-invalid-nvos-001".into(),
+            bmc_password: "PASS".into(),
+            nvos_username: None,
+            nvos_password: None,
+            bmc_ip_address: Some(bmc_ip),
+            nvos_ip_address: Some(nvos_ip),
+            metadata: Metadata::default(),
+            rack_id: None,
+            bmc_retain_credentials: None,
+        },
+    )
+    .await?;
+    txn.commit().await?;
+
+    carbide_site_explorer::try_reconcile_expected_switch_addresses(&pool, bmc_mac, None).await;
+
+    let mut txn = pool.begin().await?;
+    let interfaces = db::machine_interface::find_by_mac_address(&mut *txn, bmc_mac).await?;
+    txn.rollback().await?;
+    assert_eq!(interfaces.len(), 1);
+    assert!(interfaces[0].addresses.contains(&bmc_ip));
 
     Ok(())
 }

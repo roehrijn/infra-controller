@@ -137,7 +137,7 @@ pub struct ExpectedMachineJson {
     pub metadata: Option<rpc::forge::Metadata>,
     pub sku_id: Option<String>,
     #[serde(default)]
-    pub host_nics: Vec<rpc::forge::ExpectedHostNic>,
+    pub host_nics: Option<Vec<rpc::forge::ExpectedHostNic>>,
     pub rack_id: Option<RackId>,
     pub default_pause_ingestion_and_poweron: Option<bool>,
     pub dpf_enabled: Option<bool>,

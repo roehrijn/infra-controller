@@ -46,12 +46,21 @@ pub async fn find_by_nvos_mac_address(
     txn: &mut PgConnection,
     nvos_mac_address: MacAddress,
 ) -> Result<Option<ExpectedSwitch>, DatabaseError> {
-    let sql = "SELECT * FROM expected_switches WHERE $1::macaddr = ANY(nvos_mac_addresses)";
-    sqlx::query_as(sql)
+    let sql = "SELECT * FROM expected_switches
+        WHERE $1::macaddr = ANY(nvos_mac_addresses)
+        ORDER BY bmc_mac_address";
+    let mut switches: Vec<ExpectedSwitch> = sqlx::query_as(sql)
         .bind(nvos_mac_address)
-        .fetch_optional(txn)
+        .fetch_all(txn)
         .await
-        .map_err(|err| DatabaseError::query(sql, err))
+        .map_err(|err| DatabaseError::query(sql, err))?;
+    match switches.len() {
+        0 => Ok(None),
+        1 => Ok(switches.pop()),
+        _ => Err(DatabaseError::internal(format!(
+            "multiple ExpectedSwitches declare NVOS MAC address {nvos_mac_address}",
+        ))),
+    }
 }
 
 /// Serialize expected-switch writes on a transaction-scoped advisory lock so
@@ -59,7 +68,7 @@ pub async fn find_by_nvos_mac_address(
 /// check before either row lands (check-then-write under READ COMMITTED).
 /// The lock releases with the transaction; the namespaced key keeps it from
 /// colliding with other subsystems' advisory locks.
-async fn lock_expected_switch_writes(txn: &mut PgConnection) -> DatabaseResult<()> {
+pub async fn lock_writes(txn: &mut PgConnection) -> DatabaseResult<()> {
     let sql = "SELECT pg_advisory_xact_lock(hashtextextended('expected_switches:write', 0))";
     sqlx::query(sql)
         .execute(txn)
@@ -72,7 +81,7 @@ async fn lock_expected_switch_writes(txn: &mut PgConnection) -> DatabaseResult<(
 /// already claims, if any. "Different" follows the same key `update` targets:
 /// `switch.expected_switch_id` when set, otherwise `switch.bmc_mac_address`.
 /// `macaddr` comparison canonicalizes case and separator differences.
-/// `update_nvos_mac_addresses` stays unguarded on purpose -- it records
+/// `update_nvos_mac_addresses` still permits overlap because it records
 /// hardware-observed truth from site-explorer.
 async fn find_nvos_mac_claimed_elsewhere(
     txn: &mut PgConnection,
@@ -264,7 +273,16 @@ pub async fn create(
     // (`find_by_nvos_mac_address`), so a MAC claimed by another switch is a
     // conflict. The advisory lock makes the check-then-insert deterministic
     // under concurrent writers.
-    lock_expected_switch_writes(&mut *txn).await?;
+    lock_writes(&mut *txn).await?;
+    crate::machine_interface::lock_expected_machine_interface_macs(
+        &mut *txn,
+        switch
+            .nvos_mac_addresses
+            .iter()
+            .copied()
+            .chain(std::iter::once(switch.bmc_mac_address)),
+    )
+    .await?;
     if let Some(mac) =
         find_nvos_mac_claimed_elsewhere(&mut *txn, &switch.nvos_mac_addresses, &switch).await?
     {
@@ -325,7 +343,7 @@ pub async fn find_for_update(
     txn: &mut PgConnection,
     req: &ExpectedSwitchRequest,
 ) -> DatabaseResult<Option<ExpectedSwitch>> {
-    lock_expected_switch_writes(&mut *txn).await?;
+    lock_writes(&mut *txn).await?;
 
     let (query, key) = if let Some(id) = req.expected_switch_id {
         (
@@ -353,6 +371,27 @@ pub async fn find_for_update(
 /// delete deletes an expected switch by expected_switch_id if provided,
 /// otherwise by bmc_mac_address.
 pub async fn delete(txn: &mut PgConnection, req: &ExpectedSwitchRequest) -> DatabaseResult<()> {
+    lock_writes(&mut *txn).await?;
+    let current = find(&mut *txn, req)
+        .await?
+        .ok_or_else(|| DatabaseError::NotFoundError {
+            kind: "expected_switch",
+            id: req
+                .expected_switch_id
+                .map(|id| id.to_string())
+                .or_else(|| req.bmc_mac_address.map(|mac| mac.to_string()))
+                .unwrap_or_default(),
+        })?;
+    crate::machine_interface::lock_expected_machine_interface_macs(
+        &mut *txn,
+        current
+            .nvos_mac_addresses
+            .iter()
+            .copied()
+            .chain(std::iter::once(current.bmc_mac_address)),
+    )
+    .await?;
+
     if let Some(id) = req.expected_switch_id {
         delete_by_id(txn, id).await
     } else if let Some(mac) = req.bmc_mac_address {
@@ -408,6 +447,24 @@ pub async fn update_nvos_mac_addresses(
     bmc_mac_address: MacAddress,
     nvos_mac_addresses: &[MacAddress],
 ) -> DatabaseResult<()> {
+    lock_writes(&mut *txn).await?;
+    let current = find_by_bmc_mac_address(&mut *txn, bmc_mac_address)
+        .await?
+        .ok_or_else(|| DatabaseError::NotFoundError {
+            kind: "expected_switch",
+            id: bmc_mac_address.to_string(),
+        })?;
+    crate::machine_interface::lock_expected_machine_interface_macs(
+        &mut *txn,
+        current
+            .nvos_mac_addresses
+            .iter()
+            .copied()
+            .chain(nvos_mac_addresses.iter().copied())
+            .chain(std::iter::once(bmc_mac_address)),
+    )
+    .await?;
+
     let query = "UPDATE expected_switches SET nvos_mac_addresses = $1 WHERE bmc_mac_address = $2";
     sqlx::query(query)
         .bind(nvos_mac_addresses)
@@ -423,7 +480,19 @@ pub async fn clear(txn: &mut PgConnection) -> Result<(), DatabaseError> {
     // create flows (`replace_all_expected_switches`) acquire locks in the same
     // order as `create`/`update` -- advisory first, rows second -- instead of
     // forming a deadlock cycle with them.
-    lock_expected_switch_writes(&mut *txn).await?;
+    lock_writes(&mut *txn).await?;
+    let current = find_all(&mut *txn).await?;
+    crate::machine_interface::lock_expected_machine_interface_macs(
+        &mut *txn,
+        current.iter().flat_map(|switch| {
+            switch
+                .nvos_mac_addresses
+                .iter()
+                .copied()
+                .chain(std::iter::once(switch.bmc_mac_address))
+        }),
+    )
+    .await?;
 
     let query = "DELETE FROM expected_switches";
 
@@ -439,7 +508,7 @@ pub async fn clear(txn: &mut PgConnection) -> Result<(), DatabaseError> {
 pub async fn update(txn: &mut PgConnection, switch: &ExpectedSwitch) -> DatabaseResult<()> {
     // The lock serializes the existence read, conflict check, and UPDATE as
     // one unit against concurrent expected-switch writers.
-    lock_expected_switch_writes(&mut *txn).await?;
+    lock_writes(&mut *txn).await?;
 
     // Resolve the target first: a missing switch reports NotFound rather than
     // a MAC conflict, and the current row bounds the conflict check to newly
@@ -461,6 +530,16 @@ pub async fn update(txn: &mut PgConnection, switch: &ExpectedSwitch) -> Database
             .map(|id| id.to_string())
             .unwrap_or_else(|| switch.bmc_mac_address.to_string()),
     })?;
+    crate::machine_interface::lock_expected_machine_interface_macs(
+        &mut *txn,
+        current
+            .nvos_mac_addresses
+            .iter()
+            .copied()
+            .chain(switch.nvos_mac_addresses.iter().copied())
+            .chain([current.bmc_mac_address, switch.bmc_mac_address]),
+    )
+    .await?;
 
     let newly_claimed: Vec<MacAddress> = switch
         .nvos_mac_addresses
@@ -532,11 +611,33 @@ pub async fn create_missing_from(
     txn: &mut PgConnection,
     expected_switches: &[ExpectedSwitch],
 ) -> DatabaseResult<()> {
-    let existing_switches = find_all(txn).await?;
+    lock_writes(&mut *txn).await?;
+    let existing_switches = find_all(&mut *txn).await?;
     let existing_map: BTreeMap<String, ExpectedSwitch> = existing_switches
         .into_iter()
         .map(|switch| (switch.bmc_mac_address.to_string(), switch))
         .collect();
+
+    let missing = expected_switches
+        .iter()
+        .filter(|expected_switch| {
+            !existing_map.contains_key(&expected_switch.bmc_mac_address.to_string())
+        })
+        .collect::<Vec<_>>();
+    crate::machine_interface::lock_expected_machine_interface_macs(
+        &mut *txn,
+        missing
+            .iter()
+            .flat_map(|switch| {
+                switch
+                    .nvos_mac_addresses
+                    .iter()
+                    .copied()
+                    .chain(std::iter::once(switch.bmc_mac_address))
+            })
+            .collect::<Vec<_>>(),
+    )
+    .await?;
 
     for expected_switch in expected_switches {
         if existing_map.contains_key(&expected_switch.bmc_mac_address.to_string()) {

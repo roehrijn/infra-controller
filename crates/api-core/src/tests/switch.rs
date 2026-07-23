@@ -684,6 +684,43 @@ async fn test_force_delete_switch_success(
 }
 
 #[crate::sqlx_test]
+async fn test_force_delete_switch_deletes_interfaces(
+    pool: sqlx::PgPool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let env = create_test_env(pool).await;
+    let switch_id = new_switch(&env, None, None).await?;
+
+    let mut txn = env.pool.begin().await?;
+    let interface_ids = db::machine_interface::find_ids_by_switch_id(&mut txn, &switch_id).await?;
+    assert_eq!(interface_ids.len(), 1);
+    let interface = db::machine_interface::find_one(&mut *txn, interface_ids[0]).await?;
+    assert!(!interface.addresses.is_empty());
+    txn.commit().await?;
+
+    let response = env
+        .api
+        .admin_force_delete_switch(tonic::Request::new(AdminForceDeleteSwitchRequest {
+            switch_id: Some(switch_id),
+            delete_interfaces: true,
+        }))
+        .await?
+        .into_inner();
+
+    assert_eq!(response.switch_id, switch_id.to_string());
+    assert_eq!(response.interfaces_deleted, 1);
+
+    let mut txn = env.pool.begin().await?;
+    let matching_interfaces =
+        db::machine_interface::find_by_mac_address(&mut *txn, interface.mac_address).await?;
+    assert!(matching_interfaces.is_empty());
+    let matching_addresses =
+        db::machine_interface_address::find_for_interface(&mut txn, interface.id).await?;
+    assert!(matching_addresses.is_empty());
+
+    Ok(())
+}
+
+#[crate::sqlx_test]
 async fn test_force_delete_switch_not_found(
     pool: sqlx::PgPool,
 ) -> Result<(), Box<dyn std::error::Error>> {

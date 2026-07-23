@@ -851,6 +851,105 @@ pub async fn lookup_managed_host_state(
     Ok(Some(json.0))
 }
 
+/// Lock machines before adding an interface association.
+///
+/// Key-share locks let independent associations and ordinary machine updates
+/// proceed together while keeping a force-delete from publishing
+/// `ForceDeletion` before their transactions finish. Some callers already hold
+/// allocator or interface locks, so this query must never wait behind a
+/// force-delete that will later need those locks.
+pub async fn lock_interface_association_targets(
+    txn: &mut PgConnection,
+    machine_ids: &[MachineId],
+) -> DatabaseResult<()> {
+    let mut machine_ids = machine_ids.to_vec();
+    machine_ids.sort_unstable();
+    machine_ids.dedup();
+    if machine_ids.is_empty() {
+        return Ok(());
+    }
+
+    let query = "SELECT id, controller_state
+        FROM machines
+        WHERE id = ANY($1)
+        ORDER BY id
+        FOR KEY SHARE NOWAIT";
+    let machine_id_strings = machine_ids
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    let states: Vec<(MachineId, sqlx::types::Json<ManagedHostState>)> = match sqlx::query_as(query)
+        .bind(&machine_id_strings)
+        .fetch_all(txn)
+        .await
+    {
+        Ok(states) => states,
+        Err(sqlx::Error::Database(error)) if error.code().as_deref() == Some("55P03") => {
+            return Err(DatabaseError::FailedPrecondition(
+                "machines are changing while preparing interface association; retry the request"
+                    .to_string(),
+            ));
+        }
+        Err(error) => return Err(DatabaseError::query(query, error)),
+    };
+    if states.len() != machine_ids.len() {
+        return Err(DatabaseError::FailedPrecondition(
+            "machines changed while preparing interface association; retry the request".to_string(),
+        ));
+    }
+    if let Some((machine_id, _)) = states
+        .iter()
+        .find(|(_, state)| state.0 == ManagedHostState::ForceDeletion)
+    {
+        return Err(DatabaseError::FailedPrecondition(format!(
+            "machine {machine_id} is being force-deleted and cannot accept interface associations",
+        )));
+    }
+    Ok(())
+}
+
+/// Lock every machine that one force-delete request will transition.
+///
+/// `NOWAIT` makes force-delete retry instead of waiting while another
+/// transaction holds one of the target rows.
+pub async fn lock_force_deletion_targets(
+    txn: &mut PgConnection,
+    machine_ids: &[MachineId],
+) -> DatabaseResult<()> {
+    let mut machine_ids = machine_ids.to_vec();
+    machine_ids.sort_unstable();
+    machine_ids.dedup();
+    if machine_ids.is_empty() {
+        return Ok(());
+    }
+
+    let query = "SELECT id FROM machines WHERE id = ANY($1) ORDER BY id FOR UPDATE NOWAIT";
+    let machine_id_strings = machine_ids
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    let mut locked: Vec<MachineId> = match sqlx::query_scalar(query)
+        .bind(&machine_id_strings)
+        .fetch_all(txn)
+        .await
+    {
+        Ok(locked) => locked,
+        Err(sqlx::Error::Database(error)) if error.code().as_deref() == Some("55P03") => {
+            return Err(DatabaseError::FailedPrecondition(
+                "machines changed while preparing force deletion; retry the request".to_string(),
+            ));
+        }
+        Err(error) => return Err(DatabaseError::query(query, error)),
+    };
+    locked.sort_unstable();
+    if locked != machine_ids {
+        return Err(DatabaseError::FailedPrecondition(
+            "machines changed while preparing force deletion; retry the request".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 /// Returns the `use_admin_network` flag from the host that owns the
 /// given DPA interface.
 pub async fn get_host_use_admin_network_for_dpa_interface(

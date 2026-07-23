@@ -137,6 +137,8 @@ mod tests {
             expected_network_segment_type: NetworkSegmentType::HostInband,
             boot_interface_id: boot_interface_id.map(String::from),
             primary_interface: false,
+            expected_interface: None,
+            expected_interface_captured: true,
         }
     }
 

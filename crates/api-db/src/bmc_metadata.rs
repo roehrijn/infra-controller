@@ -15,12 +15,94 @@
  * limitations under the License.
  */
 
-use carbide_uuid::machine::MachineId;
+use std::net::IpAddr;
+
+use carbide_uuid::machine::{MachineId, MachineInterfaceId};
+use carbide_uuid::network::NetworkSegmentId;
+use mac_address::MacAddress;
 use model::bmc_info::BmcInfo;
+use model::expected_machine::ExpectedHostNic;
 use serde_json::json;
 use sqlx::PgConnection;
 
 use crate::{DatabaseError, DatabaseResult};
+
+#[cfg(test)]
+mod tests;
+
+/// Interface identity needed to stabilize BMC-address ownership.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, sqlx::FromRow)]
+pub struct BmcInterfaceOwner {
+    /// Interface that owns the BMC address.
+    pub interface_id: MachineInterfaceId,
+    /// MAC used for ExpectedMachine selection and ingestion serialization.
+    pub mac_address: MacAddress,
+    /// Segment that must be locked before the interface and address rows.
+    pub segment_id: NetworkSegmentId,
+}
+
+async fn find_interface_by_bmc_ip_with_query(
+    txn: &mut PgConnection,
+    bmc_ip: IpAddr,
+    query: &'static str,
+) -> DatabaseResult<Option<BmcInterfaceOwner>> {
+    let mut owners = sqlx::query_as::<_, BmcInterfaceOwner>(query)
+        .bind(bmc_ip)
+        .fetch_all(&mut *txn)
+        .await
+        .map_err(|error| DatabaseError::query(query, error))?;
+
+    match owners.len() {
+        0 => Ok(None),
+        1 => Ok(owners.pop()),
+        _ => Err(DatabaseError::internal(format!(
+            "multiple machine interfaces own BMC IP address {bmc_ip}",
+        ))),
+    }
+}
+
+/// Find the single machine interface that owns a BMC address.
+///
+/// Unlike the general IP lookup, this rejects ambiguous ownership instead of
+/// selecting whichever row PostgreSQL returns first.
+pub async fn find_interface_by_bmc_ip(
+    txn: &mut PgConnection,
+    bmc_ip: IpAddr,
+) -> DatabaseResult<Option<BmcInterfaceOwner>> {
+    let query = "
+        SELECT
+            mi.id AS interface_id,
+            mi.mac_address,
+            mi.segment_id
+        FROM machine_interface_addresses mia
+        JOIN machine_interfaces mi ON mi.id = mia.interface_id
+        WHERE mia.address = $1::inet
+        ORDER BY mi.id, mia.id
+    ";
+    find_interface_by_bmc_ip_with_query(txn, bmc_ip, query).await
+}
+
+/// Find and lock the single machine interface that owns a BMC address.
+///
+/// Both the interface and address rows stay locked for the caller's
+/// transaction.
+pub async fn find_interface_by_bmc_ip_for_update(
+    txn: &mut PgConnection,
+    bmc_ip: IpAddr,
+) -> DatabaseResult<Option<BmcInterfaceOwner>> {
+    let query = "
+        SELECT
+            mi.id AS interface_id,
+            mi.mac_address,
+            mi.segment_id
+        FROM machine_interface_addresses mia
+        JOIN machine_interfaces mi ON mi.id = mia.interface_id
+        WHERE mia.address = $1::inet
+        ORDER BY mi.id, mia.id
+        FOR UPDATE OF mia, mi
+    ";
+    find_interface_by_bmc_ip_with_query(txn, bmc_ip, query).await
+}
 
 async fn update_bmc_network_into_topologies(
     txn: &mut PgConnection,
@@ -53,10 +135,16 @@ async fn update_bmc_network_into_topologies(
     Ok(())
 }
 
+/// Associate a discovered BMC interface after saving the ExpectedMachine
+/// declaration selected for this ingestion attempt.
+///
+/// The caller must select `expected_interface` while holding the matching
+/// ExpectedMachine row and acquire the interface MAC lock before segment locks.
 pub async fn update_bmc_network_into_machine_interfaces(
     txn: &mut PgConnection,
     machine_id: &MachineId,
     bmc_info: &mut BmcInfo,
+    expected_interface: Option<&ExpectedHostNic>,
 ) -> DatabaseResult<()> {
     let Some(bmc_mac_address) = bmc_info.mac else {
         return Err(DatabaseError::internal(format!(
@@ -64,40 +152,51 @@ pub async fn update_bmc_network_into_machine_interfaces(
         )));
     };
 
-    let interface = if let Some(interface_id) = bmc_info.machine_interface_id {
-        crate::machine_interface::find_one(&mut *txn, interface_id).await?
+    let (interface_id, interface_mac_address) = if let Some(interface_id) =
+        bmc_info.machine_interface_id
+    {
+        let interface = crate::machine_interface::find_one(&mut *txn, interface_id).await?;
+        (interface.id, interface.mac_address)
     } else if let Some(bmc_ip) = bmc_info.ip.as_ref() {
-        crate::machine_interface::find_by_ip(&mut *txn, *bmc_ip)
+        let owner = find_interface_by_bmc_ip_for_update(&mut *txn, *bmc_ip)
             .await?
             .ok_or_else(|| DatabaseError::NotFoundError {
                 kind: "machine_interfaces.address",
                 id: bmc_ip.to_string(),
-            })?
+            })?;
+        (owner.interface_id, owner.mac_address)
     } else {
-        crate::machine_interface::find_by_mac_address(&mut *txn, bmc_mac_address)
+        let interface = crate::machine_interface::find_by_mac_address(&mut *txn, bmc_mac_address)
             .await?
             .into_iter()
             .next()
             .ok_or_else(|| DatabaseError::NotFoundError {
                 kind: "machine_interfaces.mac_address",
                 id: bmc_mac_address.to_string(),
-            })?
+            })?;
+        (interface.id, interface.mac_address)
     };
 
-    if interface.mac_address != bmc_mac_address {
+    if interface_mac_address != bmc_mac_address {
         return Err(DatabaseError::internal(format!(
             "BMC interface {} MAC {} does not match BMC Info MAC {} for machine {machine_id}",
-            interface.id, interface.mac_address, bmc_mac_address
+            interface_id, interface_mac_address, bmc_mac_address
         )));
     }
 
+    crate::machine_interface::capture_expected_interface_before_association(
+        txn,
+        interface_id,
+        expected_interface,
+    )
+    .await?;
     crate::machine_interface::associate_bmc_interface(
-        &interface.id,
+        &interface_id,
         model::machine_interface_address::MachineInterfaceAssociation::Machine(*machine_id),
         txn,
     )
     .await?;
-    bmc_info.machine_interface_id = Some(interface.id);
+    bmc_info.machine_interface_id = Some(interface_id);
 
     update_bmc_network_into_topologies(txn, machine_id, bmc_info).await
 }
@@ -120,19 +219,19 @@ pub async fn enrich_mac_address(
 
     let bmc_ip_address = bmc_info.ip.unwrap();
     if bmc_info.mac.is_none() {
-        if let Some(bmc_machine_interface) =
-            crate::machine_interface::find_by_ip(&mut *txn, bmc_ip_address).await?
+        if let Some(bmc_interface_owner) =
+            find_interface_by_bmc_ip(&mut *txn, bmc_ip_address).await?
         {
-            let bmc_mac_address = bmc_machine_interface.mac_address;
+            let bmc_mac_address = bmc_interface_owner.mac_address;
 
             tracing::info!(
                 caller = %caller,
                 machine_id = %machine_id,
-                mac_address = ?bmc_machine_interface.mac_address,
+                mac_address = ?bmc_interface_owner.mac_address,
                 "Enriching BMC information",
             );
             bmc_info.mac = Some(bmc_mac_address);
-            bmc_info.machine_interface_id = Some(bmc_machine_interface.id);
+            bmc_info.machine_interface_id = Some(bmc_interface_owner.interface_id);
             if persist {
                 update_bmc_network_into_topologies(txn, machine_id, bmc_info).await?;
             }

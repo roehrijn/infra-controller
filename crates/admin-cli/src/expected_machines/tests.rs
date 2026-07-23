@@ -25,7 +25,7 @@
 // Validation Logic    - Test business logic validators on parsed arguments.
 
 use carbide_test_support::Outcome::*;
-use carbide_test_support::scenarios;
+use carbide_test_support::{Check, check_values, scenarios};
 use clap::{CommandFactory, Parser};
 
 use super::common::ExpectedMachineJson;
@@ -237,6 +237,44 @@ fn expected_machine_json_accepts_missing_id() {
     .expect("expected machine without id should parse");
 
     assert_eq!(machine.id, None);
+}
+
+#[test]
+fn expected_machine_json_preserves_host_nics_field_presence() {
+    check_values(
+        [
+            Check {
+                scenario: "omitted list preserves the stored value during file update",
+                input: "",
+                expect: None,
+            },
+            Check {
+                scenario: "explicit empty list clears the stored value",
+                input: r#","host_nics":[] "#,
+                expect: Some(0),
+            },
+            Check {
+                scenario: "explicit populated list replaces the stored value",
+                input: r#","host_nics":[{"mac_address":"00:11:22:33:44:66"}] "#,
+                expect: Some(1),
+            },
+        ],
+        |host_nics| {
+            let json = format!(
+                r#"{{
+                    "bmc_mac_address": "00:11:22:33:44:55",
+                    "bmc_username": "admin",
+                    "bmc_password": "secret",
+                    "chassis_serial_number": "SN123"
+                    {host_nics}
+                }}"#
+            );
+            serde_json::from_str::<ExpectedMachineJson>(&json)
+                .unwrap()
+                .host_nics
+                .map(|interfaces| interfaces.len())
+        },
+    );
 }
 
 #[test]

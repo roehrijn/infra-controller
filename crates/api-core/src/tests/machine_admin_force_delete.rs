@@ -29,7 +29,7 @@ use carbide_ib_fabric::config::IBFabricConfig;
 use carbide_ib_fabric::ib::{self, IBFabricManager};
 use carbide_machine_controller::dpf::{DpfOperations, MockDpfOperations};
 use carbide_uuid::infiniband::IBPartitionId;
-use carbide_uuid::machine::{MachineId, MachineType};
+use carbide_uuid::machine::{MachineId, MachineInterfaceId, MachineType};
 use common::api_fixtures::dpu::create_dpu_machine;
 use common::api_fixtures::host::host_discover_dhcp;
 use common::api_fixtures::ib_partition::{DEFAULT_TENANT, create_ib_partition};
@@ -1099,6 +1099,74 @@ async fn test_admin_force_delete_retains_boot_interface_ids(pool: sqlx::PgPool) 
             .unwrap()
             .as_deref(),
         Some("NIC.Slot.5-1"),
+    );
+    txn.rollback().await.unwrap();
+}
+
+/// `delete_interfaces` removes machine-owned rows but preserves a host
+/// interface linked only through `attached_dpu_machine_id`. Force cleanup
+/// detaches that relationship, matching the pre-existing snapshot behavior.
+#[crate::sqlx_test]
+async fn test_admin_force_delete_detaches_attached_only_interface(pool: sqlx::PgPool) {
+    let env = create_test_env(pool).await;
+    let (host_machine_id, dpu_machine_id) = create_managed_host(&env).await.into();
+
+    let mut txn = env.pool.begin().await.unwrap();
+    let interface_id: MachineInterfaceId = sqlx::query_scalar(
+        "INSERT INTO machine_interfaces
+             (segment_id, mac_address, primary_interface, hostname)
+         SELECT segment_id, '7A:7B:7C:7D:84:01'::macaddr, false,
+                'force-delete-attached-only'
+         FROM machine_interfaces
+         WHERE machine_id = $1
+           AND interface_type != 'Bmc'
+         ORDER BY id
+         LIMIT 1
+         RETURNING id",
+    )
+    .bind(host_machine_id)
+    .fetch_one(txn.as_mut())
+    .await
+    .unwrap();
+    db::machine_interface::associate_interface_with_dpu_machine(
+        &interface_id,
+        &dpu_machine_id,
+        txn.as_mut(),
+    )
+    .await
+    .unwrap();
+    txn.commit().await.unwrap();
+
+    let response = env
+        .api
+        .admin_force_delete_machine(tonic::Request::new(AdminForceDeleteMachineRequest {
+            host_query: host_machine_id.to_string(),
+            delete_interfaces: true,
+            delete_bmc_interfaces: false,
+            delete_bmc_credentials: false,
+            allow_delete_with_orphaned_dpf_crds: false,
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(response.all_done);
+    assert!(response.host_interfaces_deleted);
+    assert!(response.dpu_interfaces_deleted);
+
+    let mut txn = env.pool.begin().await.unwrap();
+    let stored: Option<(Option<MachineId>, Option<MachineId>)> = sqlx::query_as(
+        "SELECT machine_id, attached_dpu_machine_id
+         FROM machine_interfaces
+         WHERE id = $1",
+    )
+    .bind(interface_id)
+    .fetch_optional(txn.as_mut())
+    .await
+    .unwrap();
+    assert_eq!(
+        stored,
+        Some((None, None)),
+        "force-delete must preserve the host interface and detach the deleted DPU",
     );
     txn.rollback().await.unwrap();
 }

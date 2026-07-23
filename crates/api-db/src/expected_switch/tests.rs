@@ -233,6 +233,35 @@ async fn test_update_tolerates_preexisting_nvos_mac_overlap(
 }
 
 #[crate::sqlx_test]
+async fn test_find_by_nvos_mac_rejects_ambiguous_ownership(
+    pool: sqlx::PgPool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut txn = pool.begin().await?;
+    let switches = create_expected_switches(&mut txn).await;
+    let shared_mac = switches[1].nvos_mac_addresses[0];
+    let mut overlapped = switches[0].nvos_mac_addresses.clone();
+    overlapped.push(shared_mac);
+    db::expected_switch::update_nvos_mac_addresses(
+        &mut txn,
+        switches[0].bmc_mac_address,
+        &overlapped,
+    )
+    .await?;
+
+    let error = match db::expected_switch::find_by_nvos_mac_address(&mut txn, shared_mac).await {
+        Ok(_) => panic!("ambiguous NVOS ownership must not select one ExpectedSwitch"),
+        Err(error) => error,
+    };
+    assert!(matches!(
+        error,
+        DatabaseError::Internal { message }
+            if message
+                == format!("multiple ExpectedSwitches declare NVOS MAC address {shared_mac}")
+    ));
+    Ok(())
+}
+
+#[crate::sqlx_test]
 async fn test_update_bmc_credentials(pool: sqlx::PgPool) -> Result<(), Box<dyn std::error::Error>> {
     let mut txn = pool.begin().await.unwrap();
     let switches = create_expected_switches(&mut txn).await;

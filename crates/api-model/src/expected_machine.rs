@@ -25,6 +25,7 @@ use sqlx::postgres::PgRow;
 use sqlx::{FromRow, Row};
 use uuid::Uuid;
 
+use crate::machine_interface::InterfaceType;
 use crate::metadata::Metadata;
 use crate::network_segment::NetworkSegmentType;
 
@@ -145,16 +146,90 @@ pub struct ExpectedMachineRequest {
     pub bmc_mac_address: Option<MacAddress>,
 }
 
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+/// Identifies which machine endpoint an expected interface belongs to.
+///
+/// The role controls interface behavior; it does not choose a network segment.
+/// A configured fixed IP still resolves its segment from prefix containment.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExpectedInterfaceRole {
+    /// A host operating-system interface. This preserves the behavior of
+    /// declarations created before interface roles were introduced.
+    #[default]
+    Host,
+    /// The DPU operating-system interface.
+    DpuOs,
+    /// The DPU's Redfish/BMC interface.
+    DpuBmc,
+}
+
+impl ExpectedInterfaceRole {
+    pub fn is_host(&self) -> bool {
+        matches!(self, Self::Host)
+    }
+
+    pub fn interface_type(self) -> InterfaceType {
+        match self {
+            Self::Host | Self::DpuOs => InterfaceType::Data,
+            Self::DpuBmc => InterfaceType::Bmc,
+        }
+    }
+}
+
+/// Controls how an expected interface receives and retains its IP address.
+///
+/// When the policy is omitted, [`ExpectedHostNic::resolved_ip_allocation`]
+/// preserves the legacy behavior: an interface with [`ExpectedHostNic::fixed_ip`]
+/// is fixed, and one without it is dynamic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExpectedInterfaceIpAllocation {
+    /// Allocate a normal DHCP lease that may expire and change.
+    Dynamic,
+    /// Reserve the operator-specified [`ExpectedHostNic::fixed_ip`].
+    Fixed,
+    /// Allocate through DHCP, then retain that address across lease expiry.
+    Retained,
+}
+
+impl ExpectedInterfaceIpAllocation {
+    /// Validate the policy against whether a fixed IP is configured.
+    pub fn validate(self, has_fixed_ip: bool) -> Result<(), &'static str> {
+        match self {
+            Self::Fixed if !has_fixed_ip => Err("ip_allocation=fixed requires fixed_ip"),
+            Self::Dynamic if has_fixed_ip => {
+                Err("ip_allocation=dynamic cannot be combined with fixed_ip")
+            }
+            Self::Retained if has_fixed_ip => {
+                Err("ip_allocation=retained cannot be combined with fixed_ip; use fixed")
+            }
+            _ => Ok(()),
+        }
+    }
+
+    pub fn retains_dynamic_ip(self) -> bool {
+        matches!(self, Self::Retained)
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
 pub struct ExpectedHostNic {
     pub mac_address: MacAddress,
-    /// The network segment type this NIC's first DHCP lease should come from.
+    /// Which machine endpoint owns this interface. Missing values retain the
+    /// legacy host-interface behavior.
+    #[serde(default, skip_serializing_if = "ExpectedInterfaceRole::is_host")]
+    pub role: ExpectedInterfaceRole,
+    /// Optional IP allocation policy. Missing declarations infer `Fixed` when
+    /// [`Self::fixed_ip`] is configured and `Dynamic` otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ip_allocation: Option<ExpectedInterfaceIpAllocation>,
+    /// Optional guard for the interface's network segment type.
     ///
-    /// A NIC's segment is normally determined by its DHCP relay -- the segment
-    /// whose prefix contains the relay address. Where segment prefixes nest or
-    /// overlap, one relay can match several segments; declaring this narrows the
-    /// choice to the segment of this type. `None` (with no legacy
-    /// [`Self::nic_type`]) leaves the relay's match as-is. Resolved via
+    /// For dynamic allocation, the DHCP relay selects candidate segments and
+    /// this value narrows that set. For a fixed IP, prefix containment selects
+    /// the segment and this value verifies its type. `None` (with no legacy
+    /// [`Self::nic_type`]) leaves DHCP selection unconstrained; a fixed IP still
+    /// derives its segment from the address. Dynamic hints are resolved via
     /// [`Self::resolved_network_segment_type`].
     #[serde(default)]
     pub network_segment_type: Option<NetworkSegmentType>,
@@ -177,6 +252,37 @@ pub struct ExpectedHostNic {
 }
 
 impl ExpectedHostNic {
+    /// Resolve the primary-interface state to use before this declaration is
+    /// associated with a machine. Host declarations retain their legacy
+    /// primary-by-default behavior, DPU OS interfaces are primary data
+    /// interfaces, and DPU BMC interfaces are never primary.
+    pub fn initial_primary_interface(&self) -> bool {
+        match self.role {
+            ExpectedInterfaceRole::Host => self.primary.unwrap_or(true),
+            ExpectedInterfaceRole::DpuOs => true,
+            ExpectedInterfaceRole::DpuBmc => false,
+        }
+    }
+
+    /// Resolve an explicit allocation policy or infer the legacy behavior from
+    /// whether this interface has a fixed IP.
+    pub fn resolved_ip_allocation(&self) -> ExpectedInterfaceIpAllocation {
+        self.ip_allocation.unwrap_or_else(|| {
+            if self.fixed_ip.is_some() {
+                ExpectedInterfaceIpAllocation::Fixed
+            } else {
+                ExpectedInterfaceIpAllocation::Dynamic
+            }
+        })
+    }
+
+    /// Validate the effective allocation policy against this interface's
+    /// fixed-IP declaration.
+    pub fn validate_ip_allocation(&self) -> Result<(), &'static str> {
+        self.resolved_ip_allocation()
+            .validate(self.fixed_ip.is_some())
+    }
+
     /// The network segment type to narrow this NIC's DHCP segment selection to,
     /// if the declaration names one. Prefers the typed
     /// [`Self::network_segment_type`]; otherwise maps the legacy
@@ -278,8 +384,27 @@ impl ExpectedMachineData {
     pub fn declared_primary_mac(&self) -> Option<MacAddress> {
         self.host_nics
             .iter()
-            .find(|nic| nic.primary == Some(true))
+            .find(|nic| nic.role.is_host() && nic.primary == Some(true))
             .map(|nic| nic.mac_address)
+    }
+
+    /// Return one declaration with the host's effective primary choice.
+    ///
+    /// An explicit primary declaration also makes every other host interface
+    /// explicitly non-primary. Without one, the interface keeps its configured
+    /// value so legacy primary-by-default behavior remains unchanged.
+    pub fn expected_interface_for_mac(&self, mac_address: MacAddress) -> Option<ExpectedHostNic> {
+        let mut interface = self
+            .host_nics
+            .iter()
+            .find(|interface| interface.mac_address == mac_address)?
+            .clone();
+        if interface.role.is_host()
+            && let Some(declared_primary_mac) = self.declared_primary_mac()
+        {
+            interface.primary = Some(declared_primary_mac == mac_address);
+        }
+        Some(interface)
     }
 }
 
@@ -719,6 +844,204 @@ mod tests {
     }
 
     #[test]
+    fn expected_interface_role_preserves_legacy_json_format() {
+        let legacy = r#"{
+            "mac_address": "AA:BB:CC:DD:EE:FF",
+            "nic_type": "dpu"
+        }"#;
+        let interface: ExpectedHostNic = serde_json::from_str(legacy).unwrap();
+
+        assert_eq!(interface.role, ExpectedInterfaceRole::Host);
+        assert_eq!(interface.ip_allocation, None);
+        let serialized = serde_json::to_value(interface).unwrap();
+        assert_eq!(serialized.get("role"), None);
+        assert_eq!(serialized.get("ip_allocation"), None);
+    }
+
+    #[test]
+    fn expected_interface_roles_map_to_interface_behavior() {
+        check_values(
+            [
+                Check {
+                    scenario: "legacy host",
+                    input: ExpectedInterfaceRole::Host,
+                    expect: (true, InterfaceType::Data),
+                },
+                Check {
+                    scenario: "DPU OS",
+                    input: ExpectedInterfaceRole::DpuOs,
+                    expect: (false, InterfaceType::Data),
+                },
+                Check {
+                    scenario: "DPU BMC",
+                    input: ExpectedInterfaceRole::DpuBmc,
+                    expect: (false, InterfaceType::Bmc),
+                },
+            ],
+            |role| (role.is_host(), role.interface_type()),
+        );
+    }
+
+    #[test]
+    fn expected_interface_roles_resolve_initial_primary_state() {
+        check_values(
+            [
+                Check {
+                    scenario: "legacy host defaults to primary",
+                    input: (ExpectedInterfaceRole::Host, None),
+                    expect: true,
+                },
+                Check {
+                    scenario: "host honors explicit non-primary",
+                    input: (ExpectedInterfaceRole::Host, Some(false)),
+                    expect: false,
+                },
+                Check {
+                    scenario: "DPU OS is always primary",
+                    input: (ExpectedInterfaceRole::DpuOs, Some(false)),
+                    expect: true,
+                },
+                Check {
+                    scenario: "DPU BMC is never primary",
+                    input: (ExpectedInterfaceRole::DpuBmc, Some(true)),
+                    expect: false,
+                },
+            ],
+            |(role, primary)| {
+                ExpectedHostNic {
+                    role,
+                    primary,
+                    ..Default::default()
+                }
+                .initial_primary_interface()
+            },
+        );
+    }
+
+    #[test]
+    fn expected_interface_ip_allocation_infers_and_validates_policy() {
+        struct Declaration {
+            policy: Option<ExpectedInterfaceIpAllocation>,
+            fixed_ip: Option<IpAddr>,
+        }
+
+        let fixed_ip = Some("192.0.2.10".parse().unwrap());
+        check_values(
+            [
+                Check {
+                    scenario: "omitted policy without fixed IP infers dynamic",
+                    input: Declaration {
+                        policy: None,
+                        fixed_ip: None,
+                    },
+                    expect: (ExpectedInterfaceIpAllocation::Dynamic, None),
+                },
+                Check {
+                    scenario: "omitted policy with fixed IP infers fixed",
+                    input: Declaration {
+                        policy: None,
+                        fixed_ip,
+                    },
+                    expect: (ExpectedInterfaceIpAllocation::Fixed, None),
+                },
+                Check {
+                    scenario: "explicit dynamic without fixed IP is valid",
+                    input: Declaration {
+                        policy: Some(ExpectedInterfaceIpAllocation::Dynamic),
+                        fixed_ip: None,
+                    },
+                    expect: (ExpectedInterfaceIpAllocation::Dynamic, None),
+                },
+                Check {
+                    scenario: "explicit dynamic with fixed IP is rejected",
+                    input: Declaration {
+                        policy: Some(ExpectedInterfaceIpAllocation::Dynamic),
+                        fixed_ip,
+                    },
+                    expect: (
+                        ExpectedInterfaceIpAllocation::Dynamic,
+                        Some("ip_allocation=dynamic cannot be combined with fixed_ip"),
+                    ),
+                },
+                Check {
+                    scenario: "explicit fixed with fixed IP is valid",
+                    input: Declaration {
+                        policy: Some(ExpectedInterfaceIpAllocation::Fixed),
+                        fixed_ip,
+                    },
+                    expect: (ExpectedInterfaceIpAllocation::Fixed, None),
+                },
+                Check {
+                    scenario: "explicit fixed without fixed IP is rejected",
+                    input: Declaration {
+                        policy: Some(ExpectedInterfaceIpAllocation::Fixed),
+                        fixed_ip: None,
+                    },
+                    expect: (
+                        ExpectedInterfaceIpAllocation::Fixed,
+                        Some("ip_allocation=fixed requires fixed_ip"),
+                    ),
+                },
+                Check {
+                    scenario: "explicit retained without fixed IP is valid",
+                    input: Declaration {
+                        policy: Some(ExpectedInterfaceIpAllocation::Retained),
+                        fixed_ip: None,
+                    },
+                    expect: (ExpectedInterfaceIpAllocation::Retained, None),
+                },
+                Check {
+                    scenario: "explicit retained with fixed IP is rejected",
+                    input: Declaration {
+                        policy: Some(ExpectedInterfaceIpAllocation::Retained),
+                        fixed_ip,
+                    },
+                    expect: (
+                        ExpectedInterfaceIpAllocation::Retained,
+                        Some("ip_allocation=retained cannot be combined with fixed_ip; use fixed"),
+                    ),
+                },
+            ],
+            |declaration| {
+                let interface = ExpectedHostNic {
+                    mac_address: "AA:BB:CC:DD:EE:FF".parse().unwrap(),
+                    ip_allocation: declaration.policy,
+                    fixed_ip: declaration.fixed_ip,
+                    ..Default::default()
+                };
+                (
+                    interface.resolved_ip_allocation(),
+                    interface.validate_ip_allocation().err(),
+                )
+            },
+        );
+    }
+
+    #[test]
+    fn expected_interface_ip_allocation_json_uses_canonical_names() {
+        check_values(
+            [
+                Check {
+                    scenario: "dynamic",
+                    input: ExpectedInterfaceIpAllocation::Dynamic,
+                    expect: r#""dynamic""#.to_string(),
+                },
+                Check {
+                    scenario: "fixed",
+                    input: ExpectedInterfaceIpAllocation::Fixed,
+                    expect: r#""fixed""#.to_string(),
+                },
+                Check {
+                    scenario: "retained",
+                    input: ExpectedInterfaceIpAllocation::Retained,
+                    expect: r#""retained""#.to_string(),
+                },
+            ],
+            |policy| serde_json::to_string(&policy).unwrap(),
+        );
+    }
+
+    #[test]
     fn host_lifecycle_profile_is_empty_when_all_fields_none() {
         let hlp = HostLifecycleProfile::default();
         assert!(hlp.is_empty());
@@ -896,17 +1219,26 @@ mod tests {
         let mac_a: MacAddress = "AA:BB:CC:00:00:01".parse().unwrap();
         let mac_b: MacAddress = "AA:BB:CC:00:00:02".parse().unwrap();
 
-        let nic = |mac: MacAddress, primary: Option<bool>| ExpectedHostNic {
-            mac_address: mac,
-            primary,
-            ..Default::default()
+        let nic = |mac: MacAddress,
+                   role: ExpectedInterfaceRole,
+                   primary: Option<bool>|
+         -> ExpectedHostNic {
+            ExpectedHostNic {
+                mac_address: mac,
+                role,
+                primary,
+                ..Default::default()
+            }
         };
 
         // Nothing declared -- empty, or only explicit non-primaries.
         assert_eq!(ExpectedMachineData::default().declared_primary_mac(), None);
         assert_eq!(
             ExpectedMachineData {
-                host_nics: vec![nic(mac_a, None), nic(mac_b, Some(false))],
+                host_nics: vec![
+                    nic(mac_a, ExpectedInterfaceRole::Host, None),
+                    nic(mac_b, ExpectedInterfaceRole::Host, Some(false)),
+                ],
                 ..Default::default()
             }
             .declared_primary_mac(),
@@ -916,11 +1248,23 @@ mod tests {
         // The declared NIC wins.
         assert_eq!(
             ExpectedMachineData {
-                host_nics: vec![nic(mac_a, Some(false)), nic(mac_b, Some(true))],
+                host_nics: vec![
+                    nic(mac_a, ExpectedInterfaceRole::Host, Some(false)),
+                    nic(mac_b, ExpectedInterfaceRole::Host, Some(true)),
+                ],
                 ..Default::default()
             }
             .declared_primary_mac(),
             Some(mac_b)
+        );
+
+        assert_eq!(
+            ExpectedMachineData {
+                host_nics: vec![nic(mac_a, ExpectedInterfaceRole::DpuBmc, Some(true),)],
+                ..Default::default()
+            }
+            .declared_primary_mac(),
+            None
         );
     }
 

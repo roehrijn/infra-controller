@@ -22,11 +22,12 @@ use ::rpc::forge_api_client::{EXPECTED_SWITCH_UPDATE_MASK_HEADER, ExpectedSwitch
 use db::{DatabaseError, expected_switch as db_expected_switch};
 use mac_address::MacAddress;
 use model::expected_switch::{ExpectedSwitch, ExpectedSwitchRequest};
+use model::machine_interface::InterfaceType;
 use tonic::{Request, Response, Status};
 
 use crate::CarbideError;
 use crate::api::Api;
-use crate::handlers::machine_interface_address::update_preallocated_machine_interface;
+use crate::handlers::machine_interface_address::update_preallocated_machine_interface_after_locks;
 
 fn parse_expected_switch_update_mask(
     request: &Request<rpc::ExpectedSwitch>,
@@ -155,6 +156,94 @@ fn validate_expected_switch(switch: &ExpectedSwitch) -> Result<(), CarbideError>
     Ok(())
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct ExpectedSwitchStaticInterface {
+    mac_address: MacAddress,
+    ip_address: std::net::IpAddr,
+    interface_type: InterfaceType,
+}
+
+struct ResolvedExpectedSwitchStaticInterface {
+    interface: ExpectedSwitchStaticInterface,
+    segment: model::network_segment::NetworkSegment,
+}
+
+fn expected_switch_static_interfaces(
+    switch: &ExpectedSwitch,
+) -> Vec<ExpectedSwitchStaticInterface> {
+    let mut interfaces = Vec::with_capacity(2);
+    if let Some(ip_address) = switch.bmc_ip_address {
+        interfaces.push(ExpectedSwitchStaticInterface {
+            mac_address: switch.bmc_mac_address,
+            ip_address,
+            interface_type: InterfaceType::Bmc,
+        });
+    }
+    // Request-derived switches are validated before this helper is called.
+    // A malformed stored pairing has no unambiguous target to reconcile.
+    if let (Some(ip_address), [mac_address]) =
+        (switch.nvos_ip_address, switch.nvos_mac_addresses.as_slice())
+    {
+        interfaces.push(ExpectedSwitchStaticInterface {
+            mac_address: *mac_address,
+            ip_address,
+            interface_type: InterfaceType::Data,
+        });
+    }
+    interfaces
+}
+
+async fn resolve_and_lock_expected_switch_static_interfaces<'a>(
+    txn: &mut sqlx::PgConnection,
+    switches: impl IntoIterator<Item = &'a ExpectedSwitch>,
+) -> Result<Vec<ResolvedExpectedSwitchStaticInterface>, CarbideError> {
+    let static_interfaces = switches
+        .into_iter()
+        .flat_map(expected_switch_static_interfaces)
+        .collect::<Vec<_>>();
+    let mut resolved_interfaces = Vec::with_capacity(static_interfaces.len());
+    for interface in static_interfaces {
+        let segment =
+            db::network_segment::for_static_address(&mut *txn, interface.ip_address, None).await?;
+        resolved_interfaces.push(ResolvedExpectedSwitchStaticInterface { interface, segment });
+    }
+
+    let allocations = resolved_interfaces
+        .iter()
+        .map(|resolved| (resolved.segment.id, resolved.interface.ip_address))
+        .collect::<Vec<_>>();
+    db::machine_interface::lock_static_address_allocations(txn, &allocations).await?;
+
+    Ok(resolved_interfaces)
+}
+
+async fn reconcile_expected_switch_static_interfaces(
+    api: &Api,
+    txn: &mut sqlx::PgConnection,
+    mut resolved_interfaces: Vec<ResolvedExpectedSwitchStaticInterface>,
+) -> Result<(), CarbideError> {
+    resolved_interfaces.sort_by(|left, right| {
+        left.interface
+            .mac_address
+            .to_string()
+            .cmp(&right.interface.mac_address.to_string())
+            .then_with(|| left.interface.ip_address.cmp(&right.interface.ip_address))
+    });
+    for resolved in resolved_interfaces {
+        update_preallocated_machine_interface_after_locks(
+            txn,
+            resolved.interface.mac_address,
+            resolved.interface.ip_address,
+            resolved.interface.interface_type,
+            &resolved.segment,
+            api.runtime_config.retained_boot_interface_window,
+        )
+        .await?;
+    }
+
+    Ok(())
+}
+
 pub async fn add_expected_switch(
     api: &Api,
     request: Request<rpc::ExpectedSwitch>,
@@ -225,6 +314,14 @@ pub async fn update_expected_switch(
 ) -> Result<Response<()>, Status> {
     let update_mask = parse_expected_switch_update_mask(&request)?;
     let patch = request.into_inner();
+    let lookup: ExpectedSwitchRequest = rpc::ExpectedSwitchRequest {
+        bmc_mac_address: patch.bmc_mac_address.clone(),
+        expected_switch_id: patch.expected_switch_id.clone(),
+    }
+    .try_into()
+    .map_err(|e: ::rpc::errors::RpcDataConversionError| {
+        CarbideError::InvalidArgument(e.to_string())
+    })?;
 
     let mut txn = api
         .database_connection
@@ -233,30 +330,22 @@ pub async fn update_expected_switch(
         .map_err(|e| CarbideError::Internal {
             message: format!("Database error: {}", e),
         })?;
+    db_expected_switch::lock_writes(&mut txn).await?;
 
-    let switch: ExpectedSwitch = if let Some(update_mask) = update_mask {
-        let lookup: ExpectedSwitchRequest = rpc::ExpectedSwitchRequest {
-            bmc_mac_address: patch.bmc_mac_address.clone(),
-            expected_switch_id: patch.expected_switch_id.clone(),
-        }
-        .try_into()
-        .map_err(|e: ::rpc::errors::RpcDataConversionError| {
-            CarbideError::InvalidArgument(e.to_string())
+    let current = db_expected_switch::find(&mut txn, &lookup)
+        .await
+        .map_err(CarbideError::from)?
+        .ok_or_else(|| DatabaseError::NotFoundError {
+            kind: "expected_switch",
+            id: lookup
+                .expected_switch_id
+                .map(|id| id.to_string())
+                .or_else(|| lookup.bmc_mac_address.map(|mac| mac.to_string()))
+                .unwrap_or_default(),
         })?;
 
-        let current = db_expected_switch::find_for_update(&mut txn, &lookup)
-            .await
-            .map_err(CarbideError::from)?
-            .ok_or_else(|| DatabaseError::NotFoundError {
-                kind: "expected_switch",
-                id: lookup
-                    .expected_switch_id
-                    .map(|id| id.to_string())
-                    .or_else(|| lookup.bmc_mac_address.map(|mac| mac.to_string()))
-                    .unwrap_or_default(),
-            })?;
-
-        merge_expected_switch_patch(patch, current.into(), &update_mask)
+    let switch: ExpectedSwitch = if let Some(update_mask) = update_mask {
+        merge_expected_switch_patch(patch, current.clone().into(), &update_mask)
             .try_into()
             .map_err(|e: ::rpc::errors::RpcDataConversionError| {
                 CarbideError::InvalidArgument(e.to_string())
@@ -271,26 +360,21 @@ pub async fn update_expected_switch(
 
     validate_expected_switch(&switch)?;
 
-    if let Some(bmc_ip) = switch.bmc_ip_address {
-        update_preallocated_machine_interface(
-            &mut txn,
-            switch.bmc_mac_address,
-            bmc_ip,
-            api.runtime_config.retained_boot_interface_window,
-        )
-        .await?;
-    }
-    if let Some(nvos_ip) = switch.nvos_ip_address {
-        // Pairing already validated above; nvos_mac_addresses has exactly one entry.
-        let nvos_mac = switch.nvos_mac_addresses[0];
-        update_preallocated_machine_interface(
-            &mut txn,
-            nvos_mac,
-            nvos_ip,
-            api.runtime_config.retained_boot_interface_window,
-        )
-        .await?;
-    }
+    db::machine_interface::lock_expected_machine_interface_macs(
+        &mut txn,
+        current
+            .nvos_mac_addresses
+            .iter()
+            .copied()
+            .chain(switch.nvos_mac_addresses.iter().copied())
+            .chain([current.bmc_mac_address, switch.bmc_mac_address]),
+    )
+    .await?;
+
+    let resolved =
+        resolve_and_lock_expected_switch_static_interfaces(&mut txn, std::iter::once(&switch))
+            .await?;
+    reconcile_expected_switch_static_interfaces(api, &mut txn, resolved).await?;
 
     db_expected_switch::update(&mut txn, &switch)
         .await
@@ -375,22 +459,20 @@ pub async fn replace_all_expected_switches(
     api: &Api,
     request: Request<rpc::ExpectedSwitchList>,
 ) -> Result<Response<()>, Status> {
-    let req = request.into_inner();
-
-    let mut switches = Vec::with_capacity(req.expected_switches.len());
-
-    for expected_switch in req.expected_switches {
-        let switch: ExpectedSwitch =
-            expected_switch
-                .try_into()
-                .map_err(|e: ::rpc::errors::RpcDataConversionError| {
-                    CarbideError::InvalidArgument(e.to_string())
-                })?;
-
-        validate_expected_switch(&switch)?;
-
-        switches.push(switch);
-    }
+    let replacements = request
+        .into_inner()
+        .expected_switches
+        .into_iter()
+        .map(|expected_switch| {
+            let switch: ExpectedSwitch = expected_switch.try_into().map_err(
+                |error: ::rpc::errors::RpcDataConversionError| {
+                    CarbideError::InvalidArgument(error.to_string())
+                },
+            )?;
+            validate_expected_switch(&switch)?;
+            Ok(switch)
+        })
+        .collect::<Result<Vec<_>, CarbideError>>()?;
 
     let mut txn = api
         .database_connection
@@ -399,15 +481,33 @@ pub async fn replace_all_expected_switches(
         .map_err(|e| CarbideError::Internal {
             message: format!("Database error: {}", e),
         })?;
+    db_expected_switch::lock_writes(&mut txn).await?;
+    let previous = db_expected_switch::find_all(&mut txn).await?;
+    db::machine_interface::lock_expected_machine_interface_macs(
+        &mut txn,
+        previous
+            .iter()
+            .chain(&replacements)
+            .flat_map(|switch| {
+                switch
+                    .nvos_mac_addresses
+                    .iter()
+                    .copied()
+                    .chain(std::iter::once(switch.bmc_mac_address))
+            })
+            .collect::<Vec<_>>(),
+    )
+    .await?;
 
-    // Clear all existing expected switches
     db_expected_switch::clear(&mut txn)
         .await
         .map_err(CarbideError::from)?;
 
-    // Add all new expected switches
-    for switch in switches {
-        db_expected_switch::create(&mut txn, switch)
+    // Keep bulk replacement aligned with add: store declarations and let
+    // discovery materialize their interfaces. Eager reservations cannot be
+    // distinguished from operator-managed static assignments during cleanup.
+    for switch in &replacements {
+        db_expected_switch::create(&mut txn, switch.clone())
             .await
             .map_err(CarbideError::from)?;
     }

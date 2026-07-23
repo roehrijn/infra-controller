@@ -35,6 +35,61 @@ use crate::api::{Api, log_machine_id, log_request_data};
 use crate::handlers::utils::convert_and_log_machine_id;
 use crate::{CarbideError, attestation as attest};
 
+#[derive(Clone, Copy)]
+enum CallerInterfaceLookup {
+    Insecure {
+        interface_id: carbide_uuid::machine::MachineInterfaceId,
+    },
+    InterfaceAddress {
+        remote_ip: std::net::IpAddr,
+    },
+    InstanceAddress {
+        remote_ip: std::net::IpAddr,
+        interface_id: carbide_uuid::machine::MachineInterfaceId,
+    },
+}
+
+fn initial_caller_interface_lookup_error(
+    error: db::machine_interface::DiscoveryInterfaceLookupError,
+) -> CarbideError {
+    match error {
+        db::machine_interface::DiscoveryInterfaceLookupError::Database(error) => error.into(),
+        error @ (db::machine_interface::DiscoveryInterfaceLookupError::AmbiguousInterfaceAddress {
+            ..
+        }
+        | db::machine_interface::DiscoveryInterfaceLookupError::AmbiguousInstanceAddress {
+            ..
+        }) => CarbideError::internal(error.to_string()),
+    }
+}
+
+fn caller_interface_changed() -> CarbideError {
+    CarbideError::FailedPrecondition(
+        "machine interface identity changed while discovery was waiting for allocator locks; retry discovery"
+            .to_string(),
+    )
+}
+
+fn locked_caller_interface_lookup_error(
+    error: db::machine_interface::DiscoveryInterfaceLookupError,
+) -> CarbideError {
+    match error {
+        db::machine_interface::DiscoveryInterfaceLookupError::Database(error) => error.into(),
+        error @ (db::machine_interface::DiscoveryInterfaceLookupError::AmbiguousInterfaceAddress {
+            ..
+        }
+        | db::machine_interface::DiscoveryInterfaceLookupError::AmbiguousInstanceAddress {
+            ..
+        }) => {
+            tracing::warn!(
+                %error,
+                "machine interface lookup changed while discovery was waiting for allocator locks"
+            );
+            caller_interface_changed()
+        }
+    }
+}
+
 pub(crate) async fn discover_machine(
     api: &Api,
     request: Request<rpc::MachineDiscoveryInfo>,
@@ -105,13 +160,184 @@ pub(crate) async fn discover_machine(
 
     let mut txn = api.txn_begin().await?;
 
-    // Advisory-lock the admin segments before any machine-interface row
-    // writes in this transaction (`associate_interface_with_dpu_machine`,
-    // the proactive host-interface create, `set_primary_interface`), so the
-    // whole transaction holds locks in the allocator order (segment advisory
-    // lock first, then interface rows) all the way to the reconcile pass --
-    // which re-acquires the same locks as a no-op.
-    db::machine_interface::lock_all_admin_segments(&mut txn).await?;
+    // Resolve the caller without locking interface rows. ExpectedMachine and
+    // allocator locks must come first, so this lookup is repeated under row
+    // locks before discovery can modify an interface.
+    let (caller_interface_lookup, caller_interface_preview) = if api
+        .runtime_config
+        .allow_insecure_discovery
+    {
+        let interface_id = machine_discovery_info.machine_interface_id.ok_or_else(|| {
+            CarbideError::InvalidArgument(
+                "machine_interface_id is required for insecure discovery".to_string(),
+            )
+        })?;
+        (
+            CallerInterfaceLookup::Insecure { interface_id },
+            db::machine_interface::find_one(&mut txn, interface_id).await?,
+        )
+    } else {
+        let remote_ip = remote_ip.ok_or_else(|| {
+            CarbideError::InvalidArgument(
+                "could not determine client IP address for discovery".to_string(),
+            )
+        })?;
+        if let Some(interface) =
+            db::machine_interface::find_optional_unique_by_ip(&mut txn, remote_ip)
+                .await
+                .map_err(initial_caller_interface_lookup_error)?
+        {
+            (
+                CallerInterfaceLookup::InterfaceAddress { remote_ip },
+                interface,
+            )
+        } else {
+            let interface_id =
+                    machine_discovery_info.machine_interface_id.ok_or_else(|| {
+                        CarbideError::InvalidArgument(
+                            "no machine_interface found for client IP address, and no machine_interface_id was provided".to_string(),
+                        )
+                    })?;
+            let interface = db::machine_interface::find_if_matches_instance_ip(
+                    &mut txn,
+                    interface_id,
+                    remote_ip,
+                )
+                .await
+                .map_err(initial_caller_interface_lookup_error)?
+                .ok_or_else(|| {
+                    tracing::error!(
+                        %interface_id,
+                        %remote_ip,
+                        "potential machine impersonation attempt: caller provided machine_interface_id does not belong to this remote IP"
+                    );
+                    CarbideError::PermissionDeniedError(
+                        "selected interface and discovery source IP do not belong to the same host"
+                            .to_string(),
+                    )
+                })?;
+            (
+                CallerInterfaceLookup::InstanceAddress {
+                    remote_ip,
+                    interface_id,
+                },
+                interface,
+            )
+        }
+    };
+
+    let proactive_host_mac = hardware_info
+        .is_dpu()
+        .then(|| {
+            hardware_info.factory_mac_address().map_err(|error| {
+                CarbideError::InvalidArgument(format!(
+                    "hardware info missing host factory MAC address: {error}"
+                ))
+            })
+        })
+        .transpose()?;
+    let mut expected_interface_lookup_macs = vec![caller_interface_preview.mac_address];
+    expected_interface_lookup_macs.extend(proactive_host_mac);
+    expected_interface_lookup_macs.sort_by_key(ToString::to_string);
+    expected_interface_lookup_macs.dedup();
+
+    db::expected_machine::lock_config_mutations_shared(&mut txn).await?;
+    let mut expected_machine_lookups = Vec::with_capacity(expected_interface_lookup_macs.len());
+    for mac_address in &expected_interface_lookup_macs {
+        expected_machine_lookups.push((
+            *mac_address,
+            db::expected_machine::find_by_host_mac_address(&mut txn, *mac_address).await?,
+        ));
+    }
+    // The capture helper also consults pending predictions when current
+    // configuration has no declaration. Lock both lookup MACs up front so
+    // that fallback never takes a MAC lock after allocator segment locks.
+    db::machine_interface::lock_expected_machine_interface_macs(
+        &mut txn,
+        expected_interface_lookup_macs.clone(),
+    )
+    .await?;
+
+    for (mac_address, expected_machine) in &mut expected_machine_lookups {
+        if expected_machine.is_none() {
+            // All nested-interface writers hold this MAC before changing
+            // host_nics. The plain SELECT is stable without reversing the
+            // ExpectedMachine-row-then-interface-MAC lock order.
+            *expected_machine =
+                db::expected_machine::find_by_host_mac_address_after_interface_lock(
+                    &mut txn,
+                    *mac_address,
+                )
+                .await?;
+        }
+    }
+
+    let mut expected_interfaces_by_mac = HashMap::new();
+    let mut expected_machine_owner = None;
+    for (mac_address, expected_machine) in expected_machine_lookups {
+        let Some(expected_machine) = expected_machine else {
+            continue;
+        };
+        if let Some((owner_mac, owner_lookup_mac)) = expected_machine_owner
+            && owner_mac != expected_machine.bmc_mac_address
+        {
+            return Err(CarbideError::InvalidArgument(format!(
+                "discovery interfaces {owner_lookup_mac} and {mac_address} belong to different ExpectedMachines {owner_mac} and {}",
+                expected_machine.bmc_mac_address,
+            ))
+            .into());
+        }
+        expected_machine_owner = Some((expected_machine.bmc_mac_address, mac_address));
+        let expected_interface = expected_machine
+            .data
+            .expected_interface_for_mac(mac_address)
+            .ok_or_else(|| {
+                CarbideError::internal(format!(
+                    "ExpectedMachine {} no longer declares interface {mac_address}",
+                    expected_machine.bmc_mac_address,
+                ))
+            })?;
+        expected_interfaces_by_mac.insert(mac_address, expected_interface);
+    }
+
+    // Lock every segment and fixed address this discovery may touch before
+    // locking an interface row. The later capture and reconcile helpers can
+    // reacquire these transaction-scoped locks without changing their order.
+    let admin_segment_ids = if hardware_info.is_dpu() {
+        db::network_segment::list_segment_ids(
+            &mut txn,
+            Some(model::network_segment::NetworkSegmentType::Admin),
+        )
+        .await?
+    } else {
+        Vec::new()
+    };
+    let mut segment_ids = admin_segment_ids.clone();
+    let mut fixed_allocations = Vec::new();
+    for mac_address in &expected_interface_lookup_macs {
+        let lock_inputs = db::machine_interface::expected_interface_discovery_lock_inputs(
+            &mut txn,
+            *mac_address,
+            expected_interfaces_by_mac.get(mac_address),
+        )
+        .await?;
+        if let Some(existing_segment_id) = lock_inputs.existing_segment_id {
+            segment_ids.push(existing_segment_id);
+        }
+        segment_ids.extend(
+            lock_inputs
+                .fixed_allocations
+                .iter()
+                .map(|(segment_id, _)| *segment_id),
+        );
+        fixed_allocations.extend(lock_inputs.fixed_allocations);
+    }
+    db::machine_interface::lock_network_segments_exclusive(&mut txn, &segment_ids).await?;
+    db::machine_interface::lock_static_address_keys_after_segment_locks(
+        &mut txn,
+        &fixed_allocations,
+    )
+    .await?;
 
     tracing::debug!(
         remote_ip_address = ?remote_ip,
@@ -119,62 +345,50 @@ pub(crate) async fn discover_machine(
         "discover_machine loading interface"
     );
 
-    // Who's discovery info is this? DiscoverMachine is an anonymous call, and so normally we should
-    // look it up ourselves from the client IP. But that isn't feasible in integration tests, so
-    // config.allow_insecure_discovery lets the caller pass a machine_interface_id.
-    let caller_interface = if api.runtime_config.allow_insecure_discovery {
-        let interface_id = machine_discovery_info.machine_interface_id.ok_or_else(|| {
-            CarbideError::InvalidArgument(
-                "machine_interface_id is required for insecure discovery".to_string(),
-            )
-        })?;
-        let interface = db::machine_interface::find_one(&mut txn, interface_id).await?;
-        tracing::warn!(
-            machine_interface_id = %interface_id,
-            "Allowing insecure discovery: trusting caller-provided machine_interface_id. This is for integration tests only and must not be done in production."
-        );
-        interface
-    } else {
-        let remote_ip = remote_ip.ok_or_else(|| {
-            CarbideError::InvalidArgument(
-                "could not determine client IP address for discovery".to_string(),
-            )
-        })?;
-
-        if let Some(interface) =
-            db::machine_interface::find_optional_for_update_by_ip(&mut txn, remote_ip).await?
-        {
-            // Caller is an un-allocated machine with no instance
+    let caller_interface = match caller_interface_lookup {
+        CallerInterfaceLookup::Insecure { interface_id } => {
+            let interface =
+                db::machine_interface::find_optional_one_for_update(&mut txn, interface_id)
+                    .await?
+                    .ok_or_else(caller_interface_changed)?;
+            tracing::warn!(
+                machine_interface_id = %interface_id,
+                "Allowing insecure discovery: trusting caller-provided machine_interface_id. This is for integration tests only and must not be done in production."
+            );
             interface
-        } else {
-            // Caller may be an allocated instance running scout (e.g. for machine validation). We
-            // need the machine_interface_id in the payload to know which interface to use. We will
-            // check it against the caller's IP to make sure it belongs to instance on the same
-            // machine.
-            let machine_interface_id = machine_discovery_info.machine_interface_id.ok_or_else(|| {
-                CarbideError::InvalidArgument(
-                    "no machine_interface found for client IP address, and no machine_interface_id was provided".to_string(),
-                )
-            })?;
+        }
+        CallerInterfaceLookup::InterfaceAddress { remote_ip } => {
+            db::machine_interface::find_optional_for_update_by_ip(&mut txn, remote_ip)
+                .await
+                .map_err(locked_caller_interface_lookup_error)?
+                .ok_or_else(caller_interface_changed)?
+        }
+        CallerInterfaceLookup::InstanceAddress {
+            remote_ip,
+            interface_id,
+        } => {
+            let direct_interface =
+                db::machine_interface::find_optional_unique_by_ip(&mut txn, remote_ip)
+                    .await
+                    .map_err(locked_caller_interface_lookup_error)?;
+            if direct_interface.is_some() {
+                return Err(caller_interface_changed().into());
+            }
             db::machine_interface::find_for_update_if_matches_instance_ip(
                 &mut txn,
-                machine_interface_id,
+                interface_id,
                 remote_ip,
             )
-            .await?
-            .ok_or_else(|| {
-                tracing::error!(
-                    %machine_interface_id,
-                    %remote_ip,
-                    "potential machine impersonation attempt: caller provided machine_interface_id does not belong to this remote IP"
-                );
-                CarbideError::PermissionDeniedError(
-                    "selected interface and discovery source IP do not belong to the same host"
-                        .to_string(),
-                )
-            })?
+            .await
+            .map_err(locked_caller_interface_lookup_error)?
+            .ok_or_else(caller_interface_changed)?
         }
     };
+    if caller_interface.id != caller_interface_preview.id
+        || caller_interface.mac_address != caller_interface_preview.mac_address
+    {
+        return Err(caller_interface_changed().into());
+    }
 
     let site_explorer_creates_machines = api
         .runtime_config
@@ -275,6 +489,12 @@ pub(crate) async fn discover_machine(
         }
 
         let db_machine = if machine_discovery_info.create_machine {
+            db::machine_interface::capture_expected_interface_before_association(
+                &mut txn,
+                caller_interface.id,
+                expected_interfaces_by_mac.get(&caller_interface.mac_address),
+            )
+            .await?;
             let machine = db::machine::get_or_create(
                 &mut txn,
                 Some(&api.common_pools),
@@ -378,14 +598,31 @@ pub(crate) async fn discover_machine(
         // Create Host proactively.
         // In case host interface is created, this method will return existing one, instead
         // creating new everytime.
+        let proactive_expected_interface =
+            proactive_host_mac.and_then(|mac_address| expected_interfaces_by_mac.get(&mac_address));
         let machine_interface =
-            db::machine_interface::create_host_machine_dpu_interface_proactively(
+            db::machine_interface::find_or_create_host_machine_dpu_interface_proactively(
                 &mut txn,
                 Some(&hardware_info),
                 &machine_id,
+                proactive_expected_interface,
                 api.runtime_config.retained_boot_interface_window,
             )
             .await?;
+        db::machine_interface::capture_expected_interface_before_association(
+            &mut txn,
+            machine_interface.id,
+            expected_interfaces_by_mac.get(&machine_interface.mac_address),
+        )
+        .await?;
+        db::machine_interface::associate_interface_with_dpu_machine(
+            &machine_interface.id,
+            &machine_id,
+            &mut txn,
+        )
+        .await?;
+        let machine_interface =
+            db::machine_interface::find_one(&mut txn, machine_interface.id).await?;
 
         let host_machine_id = if let Some(host_machine_id) = machine_interface.machine_id {
             host_machine_id
@@ -449,8 +686,12 @@ pub(crate) async fn discover_machine(
         // Normalize admin address ownership any time DPU discovery creates
         // or reattaches a DPU-backed host interface.
         let active_config_changed =
-            db::machine_interface::reconcile_admin_addresses_for_host(&mut txn, &host_machine_id)
-                .await?;
+            db::machine_interface::reconcile_admin_addresses_for_host_with_locked_admin_segments(
+                &mut txn,
+                &host_machine_id,
+                &admin_segment_ids,
+            )
+            .await?;
         if active_config_changed {
             let (network_config, network_config_version) =
                 db::machine::get_network_config(&mut txn, &host_machine_id)

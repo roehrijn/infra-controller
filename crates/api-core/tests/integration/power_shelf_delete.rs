@@ -17,6 +17,8 @@
 
 use carbide_test_harness::prelude::*;
 use carbide_uuid::power_shelf::PowerShelfId;
+use mac_address::MacAddress;
+use model::machine_interface_address::MachineInterfaceAssociation;
 use rpc::forge::{AdminForceDeletePowerShelfRequest, PowerShelfDeletionRequest, PowerShelfQuery};
 use tonic::Code;
 
@@ -143,6 +145,61 @@ async fn test_force_delete_power_shelf_success(
             .any(|record| record.state == r#""retained-before-force-delete""#),
         "Power shelf state history should be retained",
     );
+
+    Ok(())
+}
+
+#[sqlx_test]
+async fn test_force_delete_power_shelf_deletes_interfaces(
+    pool: PgPool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let env = TestHarness::builder(pool).build().await;
+    let power_shelf_id =
+        create_custom_power_shelf(&env, "ForceDelete Interfaces", Some(5000), Some(240)).await?;
+    let domain = env.test_domain().await;
+    let admin_segment = env.network_controller().create_admin_segment(&domain).await;
+    let interface_mac: MacAddress = "02:00:00:00:39:91".parse()?;
+
+    let mut txn = env.db_txn().await;
+    let interface = db::machine_interface::validate_existing_mac_and_create(
+        &mut txn,
+        interface_mac,
+        &[admin_segment.relay_address],
+        None,
+        None,
+    )
+    .await?;
+    db::machine_interface::associate_bmc_interface(
+        &interface.id,
+        MachineInterfaceAssociation::PowerShelf(power_shelf_id),
+        &mut txn,
+    )
+    .await?;
+    let addresses =
+        db::machine_interface_address::find_for_interface(&mut txn, interface.id).await?;
+    assert!(!addresses.is_empty());
+    txn.commit().await?;
+
+    let response = env
+        .api()
+        .admin_force_delete_power_shelf(tonic::Request::new(AdminForceDeletePowerShelfRequest {
+            power_shelf_id: Some(power_shelf_id),
+            delete_interfaces: true,
+        }))
+        .await?
+        .into_inner();
+
+    assert_eq!(response.power_shelf_id, power_shelf_id.to_string());
+    assert_eq!(response.interfaces_deleted, 1);
+
+    let mut txn = env.db_txn().await;
+    let matching_interfaces =
+        db::machine_interface::find_by_mac_address(&mut *txn, interface_mac).await?;
+    assert!(matching_interfaces.is_empty());
+    let matching_addresses =
+        db::machine_interface_address::find_for_interface(&mut txn, interface.id).await?;
+    assert!(matching_addresses.is_empty());
+    txn.rollback().await?;
 
     Ok(())
 }

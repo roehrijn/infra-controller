@@ -95,13 +95,10 @@ pub async fn observe_slaac_address(
     if let Some(address) = slaac_gua_from_eui64(prefix, mac) {
         let address = IpAddr::V6(address);
 
-        // TODO: This is a best-effort ownership check, not a complete
-        // concurrency boundary. Static assignment and preallocation do not yet
-        // share a segment lock with SLAAC observation, so they can still race
-        // between this read and insert. A future PR should route DHCP, SLAAC,
-        // and static address writes through one DB helper that locks the owning
-        // segment, checks global address ownership, applies the replacement
-        // policy, and writes the row.
+        // Stateful allocators and static reservations use this same per-address
+        // lock. The DHCP path already holds the segment lock, so this preserves
+        // segment -> address ordering before the ownership re-read and insert.
+        db::machine_interface::lock_static_address_allocation(txn, segment, address).await?;
         if let Some(existing) =
             db::machine_interface_address::find_by_address(&mut *txn, address).await?
         {

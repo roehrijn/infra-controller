@@ -523,6 +523,9 @@ async fn test_machine_creator_created_host_advances_through_dpu_discovery(
         bmc_mac_address: mock_host.bmc_mac_address,
         data: ExpectedMachineData::default(),
     };
+    let mut txn = env.pool.begin().await?;
+    let expected_machine = db::expected_machine::create(&mut txn, expected_machine).await?;
+    txn.commit().await?;
 
     assert!(
         machine_creator

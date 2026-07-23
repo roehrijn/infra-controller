@@ -4212,6 +4212,8 @@ mod tests {
             expected_network_segment_type: segment_type,
             boot_interface_id: None,
             primary_interface: primary,
+            expected_interface: None,
+            expected_interface_captured: true,
         }
     }
 

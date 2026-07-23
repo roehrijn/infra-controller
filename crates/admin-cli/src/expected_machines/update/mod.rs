@@ -38,6 +38,11 @@ impl Run for Args {
 
         let dpu_policy = expected_machine.dpu_policy();
         let metadata = expected_machine.metadata.unwrap_or_default();
+        let host_nics = expected_machine
+            .host_nics
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()?;
 
         // Patch merges with the server record; we pass all fields from JSON so the result matches the file.
         ctx.api_client
@@ -76,9 +81,7 @@ impl Run for Args {
                         disable_lockdown: hlp.disable_lockdown,
                     }
                 }),
-                // TODO: file-based update preserves existing host_nics; wire in
-                // expected_machine.host_nics to honor the file's list
-                None,
+                host_nics,
             )
             .await?;
         Ok(())

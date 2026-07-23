@@ -337,12 +337,21 @@ pub async fn admin_force_delete_switch(
         let interface_ids = db::machine_interface::find_ids_by_switch_id(&mut txn, &switch_id)
             .await
             .map_err(CarbideError::from)?;
-        for interface_id in &interface_ids {
-            db::machine_interface::delete(interface_id, &mut txn)
+        let prepared = db::machine_interface::prepare_deletes(&mut txn, &interface_ids)
+            .await
+            .map_err(CarbideError::from)?;
+        if prepared.len() != interface_ids.len() {
+            return Err(CarbideError::FailedPrecondition(
+                "switch interfaces changed while preparing deletion; retry the request".to_string(),
+            )
+            .into());
+        }
+        interfaces_deleted = prepared.len() as u32;
+        for interface in prepared {
+            db::machine_interface::delete_prepared(interface, &mut txn)
                 .await
                 .map_err(CarbideError::from)?;
         }
-        interfaces_deleted = interface_ids.len() as u32;
     }
 
     // Hard-delete the switch.

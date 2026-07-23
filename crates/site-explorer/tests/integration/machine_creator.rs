@@ -35,10 +35,15 @@ use db::ObjectFilter;
 use itertools::Itertools;
 use librms::protos::rack_manager as rms;
 use mac_address::MacAddress;
-use model::expected_machine::{ExpectedMachine, ExpectedMachineData};
+use model::allocation_type::AllocationType;
+use model::expected_machine::{
+    ExpectedHostNic, ExpectedInterfaceIpAllocation, ExpectedInterfaceRole, ExpectedMachine,
+    ExpectedMachineData,
+};
 use model::expected_rack::ExpectedRack;
 use model::machine::ManagedHostState;
 use model::machine::machine_search_config::MachineSearchConfig;
+use model::machine_interface::InterfaceType;
 use model::rack::RackConfig;
 use model::rack_type::{
     RackCapabilitiesSet, RackCapabilityCompute, RackCapabilityPowerShelf, RackCapabilitySwitch,
@@ -60,11 +65,13 @@ struct ExploredHostFixture {
     host: ExploredManagedHost,
     host_report: EndpointExplorationReport,
     dpu_machine_ids: HashMap<u8, MachineId>,
+    expected_machine: ExpectedMachine,
 }
 
 struct Env {
     pool: PgPool,
     underlay_segment: TestNetworkSegment,
+    admin_segment: TestNetworkSegment,
     test_harness: TestHarness,
 }
 
@@ -76,10 +83,11 @@ impl Env {
         let domain = test_harness.test_domain().await;
         let network_controller = test_harness.network_controller();
         let underlay_segment = network_controller.create_underlay_segment(&domain).await;
-        network_controller.create_admin_segment(&domain).await;
+        let admin_segment = network_controller.create_admin_segment(&domain).await;
         Self {
             pool,
             underlay_segment,
+            admin_segment,
             test_harness,
         }
     }
@@ -214,7 +222,7 @@ async fn test_machine_creator_compute_rms_request_uses_rack_profile(
             .create_managed_host(
                 &fixture.host,
                 &mut fixture.host_report,
-                Some(&expected_machine(&managed_host)),
+                Some(&fixture.expected_machine),
                 &env.pool,
             )
             .await?
@@ -292,7 +300,7 @@ async fn test_machine_creator_compute_rms_request_errors_for_rack_without_profil
         .create_managed_host(
             &fixture.host,
             &mut fixture.host_report,
-            Some(&expected_machine(&managed_host)),
+            Some(&fixture.expected_machine),
             &env.pool,
         )
         .await;
@@ -344,7 +352,7 @@ async fn test_machine_creator_compute_rms_request_errors_for_unknown_profile(
         .create_managed_host(
             &fixture.host,
             &mut fixture.host_report,
-            Some(&expected_machine(&managed_host)),
+            Some(&fixture.expected_machine),
             &env.pool,
         )
         .await;
@@ -439,11 +447,18 @@ async fn explored_host_fixture(env: &Env, managed_host: &ManagedHostConfig) -> E
             report: Arc::new(dpu.report),
         })
         .collect();
+    let expected_machine = expected_machine(managed_host);
+    let mut txn = env.pool.begin().await.unwrap();
+    db::expected_machine::create(&mut txn, expected_machine.clone())
+        .await
+        .unwrap();
+    txn.commit().await.unwrap();
 
     ExploredHostFixture {
         host: ExploredManagedHost { host_bmc_ip, dpus },
         host_report,
         dpu_machine_ids,
+        expected_machine,
     }
 }
 
@@ -471,7 +486,7 @@ async fn test_machine_creator_creates_managed_host(
             .create_managed_host(
                 &fixture.host,
                 &mut fixture.host_report,
-                Some(&expected_machine(&mock_host)),
+                Some(&fixture.expected_machine),
                 &env.pool,
             )
             .await?
@@ -564,7 +579,7 @@ async fn test_machine_creator_creates_managed_host(
             .create_managed_host(
                 &fixture.host,
                 &mut EndpointExplorationReport::default(),
-                Some(&expected_machine(&mock_host)),
+                Some(&fixture.expected_machine),
                 &env.pool,
             )
             .await?
@@ -599,6 +614,439 @@ async fn test_machine_creator_creates_managed_host(
 }
 
 #[sqlx_test]
+async fn test_machine_creator_retains_proactive_host_interface_address_before_association(
+    pool: PgPool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let env = Env::new(pool).await;
+    let creator = machine_creator(&env, machine_creator_config(false));
+    let mock_dpu = DpuConfig::default();
+    let host_mac_address = mock_dpu.host_mac_address;
+    let mock_host = ManagedHostConfig {
+        expected_machine_data: Some(ExpectedMachineData {
+            host_nics: vec![ExpectedHostNic {
+                mac_address: host_mac_address,
+                role: ExpectedInterfaceRole::Host,
+                ip_allocation: Some(ExpectedInterfaceIpAllocation::Retained),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }),
+        ..ManagedHostConfig::default().with_dpus(vec![mock_dpu])
+    };
+    let mut fixture = explored_host_fixture(&env, &mock_host).await;
+
+    assert!(
+        creator
+            .create_managed_host(
+                &fixture.host,
+                &mut fixture.host_report,
+                Some(&fixture.expected_machine),
+                &env.pool,
+            )
+            .await?
+    );
+
+    let mut txn = env.pool.begin().await?;
+    let interfaces =
+        db::machine_interface::find_by_mac_address(&mut *txn, host_mac_address).await?;
+    let [interface] = interfaces.as_slice() else {
+        return Err(std::io::Error::other(format!(
+            "expected one proactive host interface, got {}",
+            interfaces.len()
+        ))
+        .into());
+    };
+    assert!(
+        interface.machine_id.is_some(),
+        "the proactive host interface should be associated"
+    );
+    let addresses =
+        db::machine_interface_address::find_for_interface(&mut txn, interface.id).await?;
+    txn.commit().await?;
+
+    assert!(
+        addresses
+            .iter()
+            .any(|address| address.allocation_type == AllocationType::Static),
+        "Retained should pin the proactive interface's allocated DHCP address"
+    );
+    assert!(
+        addresses
+            .iter()
+            .all(|address| address.allocation_type != AllocationType::Dhcp),
+        "the proactive interface should not retain an expiring DHCP address"
+    );
+
+    Ok(())
+}
+
+#[sqlx_test]
+async fn test_machine_creator_places_fixed_proactive_host_interface_by_address(
+    pool: PgPool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let env = Env::new(pool).await;
+    let creator = machine_creator(&env, machine_creator_config(false));
+    let mock_dpu = DpuConfig::default();
+    let host_mac_address = mock_dpu.host_mac_address;
+    let fixed_ip: IpAddr = "192.0.1.230".parse()?;
+    let mock_host = ManagedHostConfig {
+        expected_machine_data: Some(ExpectedMachineData {
+            host_nics: vec![ExpectedHostNic {
+                mac_address: host_mac_address,
+                fixed_ip: Some(fixed_ip),
+                role: ExpectedInterfaceRole::Host,
+                ip_allocation: Some(ExpectedInterfaceIpAllocation::Fixed),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }),
+        ..ManagedHostConfig::default().with_dpus(vec![mock_dpu])
+    };
+    let mut fixture = explored_host_fixture(&env, &mock_host).await;
+
+    assert!(
+        creator
+            .create_managed_host(
+                &fixture.host,
+                &mut fixture.host_report,
+                Some(&fixture.expected_machine),
+                &env.pool,
+            )
+            .await?
+    );
+
+    let mut txn = env.pool.begin().await?;
+    let interfaces =
+        db::machine_interface::find_by_mac_address(&mut *txn, host_mac_address).await?;
+    let [interface] = interfaces.as_slice() else {
+        return Err(std::io::Error::other(format!(
+            "expected one proactive host interface, got {}",
+            interfaces.len()
+        ))
+        .into());
+    };
+    assert!(interface.machine_id.is_some());
+    assert_eq!(
+        interface.attached_dpu_machine_id,
+        Some(fixture.dpu_machine_ids[&0])
+    );
+    assert_eq!(interface.segment_id, env.underlay_segment.id);
+
+    let addresses =
+        db::machine_interface_address::find_for_interface(&mut txn, interface.id).await?;
+    assert_eq!(addresses.len(), 1);
+    assert_eq!(addresses[0].address, fixed_ip);
+    assert_eq!(addresses[0].allocation_type, AllocationType::Static);
+
+    let saved_interface = sqlx::query_scalar::<
+        _,
+        sqlx::types::Json<model::expected_machine::ExpectedHostNic>,
+    >("SELECT expected_interface FROM machine_interfaces WHERE id = $1")
+    .bind(interface.id)
+    .fetch_one(&mut *txn)
+    .await?;
+    assert_eq!(saved_interface.fixed_ip, Some(fixed_ip));
+    assert_eq!(
+        saved_interface.resolved_ip_allocation(),
+        ExpectedInterfaceIpAllocation::Fixed
+    );
+    txn.rollback().await?;
+
+    Ok(())
+}
+
+#[sqlx_test]
+async fn test_machine_creator_retains_preexisting_proactive_host_interface_dhcp_address(
+    pool: PgPool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let env = Env::new(pool).await;
+    let creator = machine_creator(&env, machine_creator_config(false));
+    let mock_dpu = DpuConfig::default();
+    let host_mac_address = mock_dpu.host_mac_address;
+    let mock_host = ManagedHostConfig {
+        expected_machine_data: Some(ExpectedMachineData {
+            host_nics: vec![ExpectedHostNic {
+                mac_address: host_mac_address,
+                role: ExpectedInterfaceRole::Host,
+                ip_allocation: Some(ExpectedInterfaceIpAllocation::Retained),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }),
+        ..ManagedHostConfig::default().with_dpus(vec![mock_dpu])
+    };
+
+    let initial_response = env
+        .api()
+        .discover_dhcp(
+            rpc::forge::DhcpDiscovery::builder(host_mac_address, env.admin_segment.relay_address)
+                .tonic_request(),
+        )
+        .await?
+        .into_inner();
+    let interface_id = initial_response
+        .machine_interface_id
+        .expect("DHCP response should include an interface id");
+    let initial_address: IpAddr = initial_response.address.parse()?;
+
+    let mut txn = env.pool.begin().await?;
+    let interface = db::machine_interface::find_one(&mut *txn, interface_id).await?;
+    assert!(interface.machine_id.is_none());
+    let addresses =
+        db::machine_interface_address::find_for_interface(&mut txn, interface_id).await?;
+    assert_eq!(addresses.len(), 1);
+    assert_eq!(addresses[0].address, initial_address);
+    assert_eq!(addresses[0].allocation_type, AllocationType::Dhcp);
+    txn.commit().await?;
+
+    let mut fixture = explored_host_fixture(&env, &mock_host).await;
+    assert!(
+        creator
+            .create_managed_host(
+                &fixture.host,
+                &mut fixture.host_report,
+                Some(&fixture.expected_machine),
+                &env.pool,
+            )
+            .await?
+    );
+
+    let mut txn = env.pool.begin().await?;
+    let interface = db::machine_interface::find_one(&mut *txn, interface_id).await?;
+    assert!(
+        interface.machine_id.is_some(),
+        "the proactive host interface should be associated"
+    );
+    let addresses =
+        db::machine_interface_address::find_for_interface(&mut txn, interface_id).await?;
+    txn.commit().await?;
+
+    assert_eq!(addresses.len(), 1);
+    assert_eq!(addresses[0].address, initial_address);
+    assert_eq!(
+        addresses[0].allocation_type,
+        AllocationType::Static,
+        "Retained should pin the anonymous DHCP address before association"
+    );
+
+    Ok(())
+}
+
+#[sqlx_test]
+async fn test_machine_creator_applies_dpu_bmc_role_before_adopting_anonymous_interface(
+    pool: PgPool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let env = Env::new(pool).await;
+    let creator = machine_creator(&env, machine_creator_config(false));
+    let mock_dpu = DpuConfig::default();
+    let dpu_oob_mac_address = mock_dpu.oob_mac_address;
+    let mock_host = ManagedHostConfig {
+        expected_machine_data: Some(ExpectedMachineData {
+            host_nics: vec![ExpectedHostNic {
+                mac_address: dpu_oob_mac_address,
+                role: ExpectedInterfaceRole::DpuBmc,
+                ..Default::default()
+            }],
+            ..Default::default()
+        }),
+        ..ManagedHostConfig::default().with_dpus(vec![mock_dpu])
+    };
+
+    dhcp_discover_dpu_oob_iface(env.api(), env.underlay_segment, dpu_oob_mac_address).await;
+    let mut txn = env.pool.begin().await?;
+    let interfaces =
+        db::machine_interface::find_by_mac_address(&mut *txn, dpu_oob_mac_address).await?;
+    let [anonymous_interface] = interfaces.as_slice() else {
+        return Err(std::io::Error::other(format!(
+            "expected one anonymous DPU interface, got {}",
+            interfaces.len()
+        ))
+        .into());
+    };
+    assert_eq!(
+        anonymous_interface.interface_type,
+        model::machine_interface::InterfaceType::Data
+    );
+    assert!(anonymous_interface.machine_id.is_none());
+    assert!(anonymous_interface.attached_dpu_machine_id.is_none());
+    txn.commit().await?;
+
+    let mut fixture = explored_host_fixture(&env, &mock_host).await;
+    assert!(
+        creator
+            .create_managed_host(
+                &fixture.host,
+                &mut fixture.host_report,
+                Some(&fixture.expected_machine),
+                &env.pool,
+            )
+            .await?
+    );
+
+    let mut txn = env.pool.begin().await?;
+    let interfaces =
+        db::machine_interface::find_by_mac_address(&mut *txn, dpu_oob_mac_address).await?;
+    txn.commit().await?;
+    let [adopted_interface] = interfaces.as_slice() else {
+        return Err(std::io::Error::other(format!(
+            "expected one adopted DPU interface, got {}",
+            interfaces.len()
+        ))
+        .into());
+    };
+    assert_eq!(
+        adopted_interface.interface_type,
+        model::machine_interface::InterfaceType::Bmc,
+        "Site Explorer should apply the DpuBmc role before association"
+    );
+    assert!(adopted_interface.machine_id.is_some());
+    assert!(adopted_interface.attached_dpu_machine_id.is_some());
+    assert!(!adopted_interface.primary_interface);
+
+    Ok(())
+}
+
+#[sqlx_test]
+async fn test_machine_creator_captures_added_dpu_bmc_policy_before_association(
+    pool: PgPool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let env = Env::new(pool).await;
+    let creator = machine_creator(&env, machine_creator_config(false));
+    let mock_dpu = DpuConfig::default();
+    let dpu_bmc_mac_address = mock_dpu.bmc_mac_address;
+    let mock_host = ManagedHostConfig {
+        expected_machine_data: Some(ExpectedMachineData {
+            host_nics: vec![ExpectedHostNic {
+                mac_address: dpu_bmc_mac_address,
+                role: ExpectedInterfaceRole::DpuBmc,
+                ip_allocation: Some(ExpectedInterfaceIpAllocation::Retained),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }),
+        ..ManagedHostConfig::default().with_dpus(vec![mock_dpu])
+    };
+
+    // The fixture discovers the BMC before it stores ExpectedMachine, leaving
+    // an anonymous DHCP row whose new policy must be captured during ingestion.
+    let mut fixture = explored_host_fixture(&env, &mock_host).await;
+    assert!(
+        creator
+            .create_managed_host(
+                &fixture.host,
+                &mut fixture.host_report,
+                Some(&fixture.expected_machine),
+                &env.pool,
+            )
+            .await?
+    );
+
+    let mut txn = env.pool.begin().await?;
+    let interfaces =
+        db::machine_interface::find_by_mac_address(&mut *txn, dpu_bmc_mac_address).await?;
+    let [interface] = interfaces.as_slice() else {
+        return Err(std::io::Error::other(format!(
+            "expected one DPU BMC interface, got {}",
+            interfaces.len()
+        ))
+        .into());
+    };
+    let stored: Option<sqlx::types::Json<ExpectedHostNic>> = sqlx::query_scalar(
+        "SELECT expected_interface
+         FROM machine_interfaces
+         WHERE id = $1",
+    )
+    .bind(interface.id)
+    .fetch_one(&mut *txn)
+    .await?;
+    let addresses =
+        db::machine_interface_address::find_for_interface(&mut txn, interface.id).await?;
+    txn.rollback().await?;
+
+    let stored = stored.expect("DPU BMC policy should be captured before association");
+    assert_eq!(stored.role, ExpectedInterfaceRole::DpuBmc);
+    assert_eq!(
+        stored.ip_allocation,
+        Some(ExpectedInterfaceIpAllocation::Retained)
+    );
+    assert!(interface.machine_id.is_some());
+    assert_eq!(interface.interface_type, InterfaceType::Bmc);
+    assert!(
+        addresses
+            .iter()
+            .all(|address| address.allocation_type == AllocationType::Static),
+        "Retained should pin the anonymous DHCP address before association"
+    );
+
+    Ok(())
+}
+
+#[sqlx_test]
+async fn test_machine_creator_clears_removed_dpu_bmc_policy_before_association(
+    pool: PgPool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let env = Env::new(pool).await;
+    let creator = machine_creator(&env, machine_creator_config(false));
+    let mock_dpu = DpuConfig::default();
+    let dpu_bmc_mac_address = mock_dpu.bmc_mac_address;
+    let mock_host = ManagedHostConfig::default().with_dpus(vec![mock_dpu]);
+    let mut fixture = explored_host_fixture(&env, &mock_host).await;
+
+    let stale_interface = ExpectedHostNic {
+        mac_address: dpu_bmc_mac_address,
+        role: ExpectedInterfaceRole::DpuBmc,
+        ip_allocation: Some(ExpectedInterfaceIpAllocation::Retained),
+        ..Default::default()
+    };
+    let mut txn = env.pool.begin().await?;
+    let updated = sqlx::query(
+        "UPDATE machine_interfaces
+         SET expected_interface = $2::jsonb,
+             expected_interface_captured = true
+         WHERE mac_address = $1",
+    )
+    .bind(dpu_bmc_mac_address)
+    .bind(sqlx::types::Json(&stale_interface))
+    .execute(&mut *txn)
+    .await?;
+    assert_eq!(updated.rows_affected(), 1);
+    txn.commit().await?;
+
+    assert!(
+        creator
+            .create_managed_host(
+                &fixture.host,
+                &mut fixture.host_report,
+                Some(&fixture.expected_machine),
+                &env.pool,
+            )
+            .await?
+    );
+
+    let mut txn = env.pool.begin().await?;
+    let stored: Option<sqlx::types::Json<ExpectedHostNic>> = sqlx::query_scalar(
+        "SELECT expected_interface
+         FROM machine_interfaces
+         WHERE mac_address = $1",
+    )
+    .bind(dpu_bmc_mac_address)
+    .fetch_one(&mut *txn)
+    .await?;
+    let interfaces =
+        db::machine_interface::find_by_mac_address(&mut *txn, dpu_bmc_mac_address).await?;
+    txn.rollback().await?;
+
+    assert!(
+        stored.is_none(),
+        "a removed declaration must not be finalized during association"
+    );
+    assert_eq!(interfaces.len(), 1);
+    assert!(interfaces[0].machine_id.is_some());
+
+    Ok(())
+}
+
+#[sqlx_test]
 async fn test_machine_creator_creates_multi_dpu_managed_host(
     pool: PgPool,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -612,10 +1060,11 @@ async fn test_machine_creator_creates_multi_dpu_managed_host(
     let domain = test_harness.test_domain().await;
     let network_controller = test_harness.network_controller();
     let underlay_segment = network_controller.create_underlay_segment(&domain).await;
-    network_controller.create_admin_segment(&domain).await;
+    let admin_segment = network_controller.create_admin_segment(&domain).await;
     let env = Env {
         pool,
         underlay_segment,
+        admin_segment,
         test_harness,
     };
     let creator = machine_creator(&env, machine_creator_config(true));
@@ -657,7 +1106,7 @@ async fn test_machine_creator_creates_multi_dpu_managed_host(
             .create_managed_host(
                 &fixture.host,
                 &mut fixture.host_report,
-                Some(&expected_machine(&mock_host)),
+                Some(&fixture.expected_machine),
                 &env.pool,
             )
             .await?
@@ -669,7 +1118,7 @@ async fn test_machine_creator_creates_multi_dpu_managed_host(
             .create_managed_host(
                 &fixture.host,
                 &mut EndpointExplorationReport::default(),
-                Some(&expected_machine(&mock_host)),
+                Some(&fixture.expected_machine),
                 &env.pool,
             )
             .await?
@@ -890,7 +1339,7 @@ async fn test_mi_attach_dpu_if_mi_exists_during_machine_creation(
             .create_managed_host(
                 &fixture.host,
                 &mut fixture.host_report,
-                Some(&expected_machine(&mock_host)),
+                Some(&fixture.expected_machine),
                 &env.pool,
             )
             .await?
@@ -931,7 +1380,7 @@ async fn test_mi_attach_dpu_if_mi_created_after_machine_creation(
             .create_managed_host(
                 &fixture.host,
                 &mut fixture.host_report,
-                Some(&expected_machine(&mock_host)),
+                Some(&fixture.expected_machine),
                 &env.pool,
             )
             .await?
@@ -966,7 +1415,7 @@ async fn test_mi_attach_dpu_if_mi_created_after_machine_creation(
             .create_managed_host(
                 &fixture.host,
                 &mut EndpointExplorationReport::default(),
-                Some(&expected_machine(&mock_host)),
+                Some(&fixture.expected_machine),
                 &env.pool,
             )
             .await?
@@ -1001,7 +1450,7 @@ async fn test_all_dpu_interfaces_attach_if_created_after_multi_dpu_machine_creat
             .create_managed_host(
                 &fixture.host,
                 &mut fixture.host_report,
-                Some(&expected_machine(&mock_host)),
+                Some(&fixture.expected_machine),
                 &env.pool,
             )
             .await?
@@ -1016,7 +1465,7 @@ async fn test_all_dpu_interfaces_attach_if_created_after_multi_dpu_machine_creat
             .create_managed_host(
                 &fixture.host,
                 &mut EndpointExplorationReport::default(),
-                Some(&expected_machine(&mock_host)),
+                Some(&fixture.expected_machine),
                 &env.pool,
             )
             .await?
@@ -1065,7 +1514,7 @@ async fn test_machine_creator_rejects_partial_dpu_machine_set(
             .create_managed_host(
                 &partial_host,
                 &mut partial_host_report,
-                Some(&expected_machine(&mock_host)),
+                Some(&fixture.expected_machine),
                 &env.pool,
             )
             .await?
@@ -1075,7 +1524,7 @@ async fn test_machine_creator_rejects_partial_dpu_machine_set(
         .create_managed_host(
             &fixture.host,
             &mut fixture.host_report,
-            Some(&expected_machine(&mock_host)),
+            Some(&fixture.expected_machine),
             &env.pool,
         )
         .await
@@ -1118,7 +1567,7 @@ async fn test_machine_creator_creates_managed_host_with_dpf_disabled(
             .create_managed_host(
                 &fixture.host,
                 &mut fixture.host_report,
-                Some(&expected_machine(&mock_host)),
+                Some(&fixture.expected_machine),
                 &env.pool,
             )
             .await?
@@ -1170,7 +1619,7 @@ async fn test_machine_creator_creates_managed_host_with_dpf_enabled(
             .create_managed_host(
                 &fixture.host,
                 &mut fixture.host_report,
-                Some(&expected_machine(&mock_host)),
+                Some(&fixture.expected_machine),
                 &env.pool,
             )
             .await?

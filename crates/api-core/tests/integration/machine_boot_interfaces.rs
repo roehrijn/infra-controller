@@ -94,6 +94,7 @@ async fn test_get_machine_boot_interfaces_gathers_all_four_stores(
                 expected_network_segment_type: NetworkSegmentType::HostInband,
                 boot_interface_id: Some("NIC.Predicted.1-1-1".to_string()),
                 primary_interface: true,
+                expected_interface: None,
             },
             txn.as_mut(),
         )

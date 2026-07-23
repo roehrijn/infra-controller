@@ -955,7 +955,7 @@ impl ApiClient {
                         .unwrap_or_default(),
                     metadata: machine.metadata,
                     sku_id: machine.sku_id,
-                    host_nics: machine.host_nics,
+                    host_nics: machine.host_nics.unwrap_or_default(),
                     rack_id: machine.rack_id,
                     default_pause_ingestion_and_poweron: machine
                         .default_pause_ingestion_and_poweron,

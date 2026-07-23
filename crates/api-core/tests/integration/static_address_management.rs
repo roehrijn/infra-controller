@@ -86,6 +86,68 @@ async fn test_assign_static_address(pool: PgPool) -> Result<(), Box<dyn std::err
 }
 
 #[sqlx_test]
+async fn test_assign_static_address_rejects_address_owned_by_another_interface(
+    pool: PgPool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let StaticAddressTestEnv {
+        env, admin_segment, ..
+    } = init(pool).await;
+    let relay = admin_segment.relay_address;
+    let static_ip = "192.0.2.214";
+
+    let mut txn = env.db_txn().await;
+    let owner = db::machine_interface::validate_existing_mac_and_create(
+        &mut txn,
+        MacAddress::from_str("aa:bb:cc:dd:ee:14").unwrap(),
+        std::slice::from_ref(&relay),
+        None,
+        None,
+    )
+    .await?;
+    let requester = db::machine_interface::validate_existing_mac_and_create(
+        &mut txn,
+        MacAddress::from_str("aa:bb:cc:dd:ee:15").unwrap(),
+        std::slice::from_ref(&relay),
+        None,
+        None,
+    )
+    .await?;
+    db::machine_interface_address::delete(&mut txn, &owner.id).await?;
+    db::machine_interface_address::delete(&mut txn, &requester.id).await?;
+    txn.commit().await?;
+
+    env.api()
+        .assign_static_address(Request::new(AssignStaticAddressRequest {
+            interface_id: Some(owner.id),
+            ip_address: static_ip.to_string(),
+        }))
+        .await?;
+
+    let error = env
+        .api()
+        .assign_static_address(Request::new(AssignStaticAddressRequest {
+            interface_id: Some(requester.id),
+            ip_address: static_ip.to_string(),
+        }))
+        .await
+        .expect_err("another interface must not receive an allocated address");
+    assert!(error.to_string().contains("already allocated to interface"));
+
+    let mut txn = env.db_txn().await;
+    let owner_addresses =
+        db::machine_interface_address::find_for_interface(&mut txn, owner.id).await?;
+    let requester_addresses =
+        db::machine_interface_address::find_for_interface(&mut txn, requester.id).await?;
+    txn.rollback().await?;
+
+    assert_eq!(owner_addresses.len(), 1);
+    assert_eq!(owner_addresses[0].address, static_ip.parse::<IpAddr>()?);
+    assert!(requester_addresses.is_empty());
+
+    Ok(())
+}
+
+#[sqlx_test]
 async fn test_assign_replaces_existing_static(
     pool: PgPool,
 ) -> Result<(), Box<dyn std::error::Error>> {

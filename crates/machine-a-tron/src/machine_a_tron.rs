@@ -68,6 +68,8 @@ fn expected_host_nics(
             fixed_gateway: None,
             primary: Some(index == 0),
             network_segment_type: Some(NetworkSegmentType::HostInband as i32),
+            role: None,
+            ip_allocation: None,
         })
         .collect()
 }
@@ -547,6 +549,8 @@ mod tests {
             fixed_gateway: None,
             primary: Some(primary),
             network_segment_type: Some(NetworkSegmentType::HostInband as i32),
+            role: None,
+            ip_allocation: None,
         }
     }
 

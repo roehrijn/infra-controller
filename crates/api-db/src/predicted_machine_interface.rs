@@ -15,6 +15,7 @@
  * limitations under the License.
  */
 use mac_address::MacAddress;
+use model::expected_machine::ExpectedHostNic;
 use model::predicted_machine_interface::{NewPredictedMachineInterface, PredictedMachineInterface};
 use sqlx::PgConnection;
 
@@ -108,17 +109,56 @@ pub async fn find_by_mac_address(
     )
 }
 
+/// Fill a snapshot omitted by an older writer after the schema migration.
+/// New writers record the captured state, including an intentional absence,
+/// when they create the prediction.
+pub async fn capture_expected_interface_if_missing(
+    txn: &mut PgConnection,
+    predicted_interface: &PredictedMachineInterface,
+    expected_interface: Option<&ExpectedHostNic>,
+) -> Result<Option<ExpectedHostNic>, DatabaseError> {
+    if predicted_interface.expected_interface_captured {
+        return Ok(predicted_interface.expected_interface().cloned());
+    }
+
+    let query = "UPDATE predicted_machine_interfaces
+        SET expected_interface = $2::jsonb,
+            primary_interface = COALESCE($3, primary_interface),
+            expected_interface_captured = true
+        WHERE id = $1
+          AND NOT expected_interface_captured";
+    sqlx::query(query)
+        .bind(predicted_interface.id)
+        .bind(expected_interface.map(sqlx::types::Json))
+        .bind(expected_interface.map(ExpectedHostNic::initial_primary_interface))
+        .execute(txn)
+        .await
+        .map_err(|error| DatabaseError::query(query, error))?;
+    Ok(expected_interface.cloned())
+}
+
 pub async fn create(
     value: NewPredictedMachineInterface<'_>,
     txn: &mut PgConnection,
 ) -> Result<PredictedMachineInterface, DatabaseError> {
-    let query = "INSERT INTO predicted_machine_interfaces (machine_id, mac_address, expected_network_segment_type, boot_interface_id, primary_interface) VALUES ($1, $2, $3, $4, $5) RETURNING *";
+    let query = "INSERT INTO predicted_machine_interfaces (
+            machine_id,
+            mac_address,
+            expected_network_segment_type,
+            boot_interface_id,
+            primary_interface,
+            expected_interface,
+            expected_interface_captured
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, true)
+        RETURNING *";
     sqlx::query_as(query)
         .bind(value.machine_id)
         .bind(value.mac_address)
         .bind(value.expected_network_segment_type)
         .bind(&value.boot_interface_id)
         .bind(value.primary_interface)
+        .bind(value.expected_interface.map(sqlx::types::Json))
         .fetch_one(txn)
         .await
         .map_err(|e| DatabaseError::query(query, e))

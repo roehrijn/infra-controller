@@ -14,6 +14,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+use std::net::IpAddr;
 use std::sync::Arc;
 
 use carbide_rack::rms_node_type::compute_node_identity_for_profile;
@@ -22,13 +23,14 @@ use carbide_secrets::credentials::{
 };
 use carbide_utils::none_if_empty::NoneIfEmpty;
 use carbide_uuid::machine::MachineId;
+use carbide_uuid::network::NetworkSegmentId;
 use db::{ObjectColumnFilter, Transaction};
 use itertools::Itertools;
 use librms::RmsApi;
 use librms::protos::rack_manager as rms;
 use mac_address::MacAddress;
 use model::bmc_info::BmcInfo;
-use model::expected_machine::{ExpectedMachine, ExpectedMachineData};
+use model::expected_machine::{ExpectedMachine, ExpectedMachineData, ExpectedMachineRequest};
 use model::hardware_info::HardwareInfo;
 use model::machine::machine_id::host_id_from_dpu_hardware_info;
 use model::machine::machine_search_config::MachineSearchConfig;
@@ -139,7 +141,11 @@ impl MachineCreator {
             );
             return Ok(false);
         };
-        let machine_data = Some(&expected_machine.data);
+        let expected_machine_identity = ExpectedMachineIngestionIdentity::from(expected_machine);
+        let expected_machine_request = ExpectedMachineRequest {
+            id: expected_machine.id,
+            bmc_mac_address: Some(expected_machine.bmc_mac_address),
+        };
         let mut managed_host = ManagedHost::init(explored_host);
 
         let bmc_credentials =
@@ -160,13 +166,82 @@ impl MachineCreator {
             };
 
         let mut txn = Transaction::begin(pool).await?;
+        let expected_machine =
+            db::expected_machine::find_for_update(txn.as_pgconn(), &expected_machine_request)
+                .await?
+                .ok_or_else(|| {
+                    db::DatabaseError::FailedPrecondition(
+                        "ExpectedMachine changed before managed-host ingestion; retry ingestion"
+                            .to_string(),
+                    )
+                })?;
+        if !expected_machine_identity.matches(&expected_machine) {
+            return Err(db::DatabaseError::FailedPrecondition(
+                "ExpectedMachine identity or credential selection changed before managed-host ingestion; retry ingestion"
+                    .to_string(),
+            )
+            .into());
+        }
+        let machine_data = Some(&expected_machine.data);
 
-        // Advisory-lock the admin segments before any machine-interface row
-        // writes (`attach_dpu_to_host` / `configure_dpu_interface`), so this
-        // transaction holds locks in the allocator order (segment advisory
-        // lock first, then interface rows) all the way to the reconcile
-        // pass -- which re-acquires the same locks as a no-op.
-        db::machine_interface::lock_all_admin_segments(txn.as_pgconn()).await?;
+        let bmc_interface_owners =
+            preview_bmc_interface_owners(txn.as_pgconn(), explored_host).await?;
+
+        // DHCP locks an interface MAC before entering the segment allocator.
+        // Cover every interface this transaction may capture or associate so
+        // report-only and IP-resolved BMC interfaces use that same order.
+        let ingestion_interface_macs = managed_host_ingestion_interface_macs(
+            &expected_machine,
+            explored_host,
+            report,
+            bmc_interface_owners
+                .iter()
+                .filter_map(|preview| preview.owner.as_ref().map(|owner| owner.mac_address)),
+        );
+        db::machine_interface::lock_expected_machine_interface_macs(
+            txn.as_pgconn(),
+            ingestion_interface_macs.iter().copied(),
+        )
+        .await?;
+
+        let interface_lock_inputs = managed_host_interface_discovery_lock_inputs(
+            txn.as_pgconn(),
+            &expected_machine,
+            &ingestion_interface_macs,
+        )
+        .await?;
+        let ingestion_lock_inputs = managed_host_ingestion_lock_inputs(
+            txn.as_pgconn(),
+            &expected_machine,
+            &bmc_interface_owners,
+            &interface_lock_inputs,
+        )
+        .await?;
+        // Take one complete segment-lock pass, then every fixed-address key,
+        // before any BMC or machine-interface row is locked. Fixed-address
+        // helpers may safely re-acquire these transaction-scoped locks later.
+        db::machine_interface::lock_network_segments_exclusive(
+            txn.as_pgconn(),
+            &ingestion_lock_inputs.segment_ids,
+        )
+        .await?;
+        db::machine_interface::lock_static_address_keys_after_segment_locks(
+            txn.as_pgconn(),
+            &ingestion_lock_inputs.fixed_allocations,
+        )
+        .await?;
+        lock_and_revalidate_bmc_interface_owners(txn.as_pgconn(), &bmc_interface_owners).await?;
+        if !host_bmc_owner_matches_expected_machine(
+            &bmc_interface_owners,
+            explored_host.host_bmc_ip,
+            expected_machine.bmc_mac_address,
+        ) {
+            return Err(db::DatabaseError::FailedPrecondition(format!(
+                "BMC interface ownership for {} does not match the locked ExpectedMachine BMC MAC {}; retry ingestion",
+                explored_host.host_bmc_ip, expected_machine.bmc_mac_address,
+            ))
+            .into());
+        }
 
         // Zero-dpu case: If the explored host had no DPUs, we can create the machine now
         if managed_host.explored_host.dpus.is_empty() {
@@ -241,11 +316,16 @@ impl MachineCreator {
             };
 
             for dpu_report in managed_host.explored_host.dpus.iter() {
-                self.configure_dpu_interface(&mut txn, dpu_report).await?;
+                self.configure_dpu_interface(&mut txn, dpu_report, machine_data)
+                    .await?;
             }
 
-            self.reconcile_host_admin_addresses(&mut txn, &host_machine_id)
-                .await?;
+            self.reconcile_host_admin_addresses(
+                &mut txn,
+                &host_machine_id,
+                &ingestion_lock_inputs.admin_segment_ids,
+            )
+            .await?;
 
             txn.commit().await?;
             return Ok(false);
@@ -255,7 +335,7 @@ impl MachineCreator {
             managed_host.explored_host.dpus.iter().zip(dpu_ids.iter())
         {
             let dpu_machine = self
-                .create_dpu(&mut txn, dpu_report)
+                .create_dpu(&mut txn, dpu_report, machine_data)
                 .await?
                 .ok_or_else(|| {
                     SiteExplorerError::internal(format!(
@@ -326,8 +406,12 @@ impl MachineCreator {
 
         // Normalize host admin address ownership after all DPU-backed host
         // interfaces have been attached and primary flags are final.
-        self.reconcile_host_admin_addresses(&mut txn, &host_machine_id)
-            .await?;
+        self.reconcile_host_admin_addresses(
+            &mut txn,
+            &host_machine_id,
+            &ingestion_lock_inputs.admin_segment_ids,
+        )
+        .await?;
 
         let rms_node_identity = if let (Some(rack_id), Some(_)) =
             (&expected_machine.data.rack_id, &self.rms_client)
@@ -544,6 +628,14 @@ impl MachineCreator {
                     .into_iter()
                     .next()
             {
+                let expected_interface =
+                    machine_data.and_then(|data| data.expected_interface_for_mac(mac_address));
+                db::machine_interface::capture_expected_interface_before_association(
+                    txn,
+                    machine_interface.id,
+                    expected_interface.as_ref(),
+                )
+                .await?;
                 // There's already a machine_interface with this MAC...
                 if let Some(existing_machine_id) = machine_interface.machine_id {
                     // Same machine_id means the preallocated BMC interface row we
@@ -610,6 +702,19 @@ impl MachineCreator {
                     .iter()
                     .find(|(mac, _)| *mac == mac_address)
                     .map(|(_, id)| id.clone());
+                let expected_interface = machine_data
+                    .and_then(|data| {
+                        data.host_nics
+                            .iter()
+                            .find(|interface| interface.mac_address == mac_address)
+                    })
+                    .cloned()
+                    .map(|mut interface| {
+                        if interface.role.is_host() {
+                            interface.primary = Some(is_primary);
+                        }
+                        interface
+                    });
                 db::predicted_machine_interface::create(
                     NewPredictedMachineInterface {
                         machine_id,
@@ -617,6 +722,7 @@ impl MachineCreator {
                         expected_network_segment_type: NetworkSegmentType::HostInband,
                         boot_interface_id,
                         primary_interface: is_primary,
+                        expected_interface: expected_interface.as_ref(),
                     },
                     txn,
                 )
@@ -654,6 +760,14 @@ impl MachineCreator {
             .into_iter()
             .next()
         {
+            let expected_interface =
+                machine_data.and_then(|data| data.expected_interface_for_mac(declared_mac));
+            db::machine_interface::capture_expected_interface_before_association(
+                txn,
+                existing.id,
+                expected_interface.as_ref(),
+            )
+            .await?;
             if let Some(existing_machine_id) = existing.machine_id {
                 // Owned by THIS host already (e.g. a declared DPU host-PF): its
                 // primary flag is settled by the DPU attach / promotion paths.
@@ -711,6 +825,17 @@ impl MachineCreator {
         let boot_interface_id = report
             .find_interface_id_for_mac(declared_mac)
             .map(|id| id.to_string());
+        let expected_interface = machine_data
+            .and_then(|data| {
+                data.host_nics
+                    .iter()
+                    .find(|interface| interface.mac_address == declared_mac)
+            })
+            .cloned()
+            .map(|mut interface| {
+                interface.primary = Some(true);
+                interface
+            });
         db::predicted_machine_interface::create(
             NewPredictedMachineInterface {
                 machine_id: host_machine_id,
@@ -718,6 +843,7 @@ impl MachineCreator {
                 expected_network_segment_type: NetworkSegmentType::HostInband,
                 boot_interface_id,
                 primary_interface: true,
+                expected_interface: expected_interface.as_ref(),
             },
             txn,
         )
@@ -742,14 +868,22 @@ impl MachineCreator {
         &self,
         txn: &mut PgConnection,
         explored_dpu: &ExploredDpu,
+        machine_data: Option<&ExpectedMachineData>,
     ) -> SiteExplorerResult<Option<Machine>> {
         if let Some(dpu_machine) = self.create_dpu_machine(txn, explored_dpu).await? {
-            self.configure_dpu_interface(txn, explored_dpu).await?;
+            self.configure_dpu_interface(txn, explored_dpu, machine_data)
+                .await?;
             let dpu_machine_id: &MachineId = explored_dpu.report.machine_id.as_ref().unwrap();
             let dpu_bmc_info = explored_dpu.bmc_info();
             let dpu_hw_info = explored_dpu.hardware_info()?;
-            self.update_machine_topology(txn, dpu_machine_id, dpu_bmc_info, dpu_hw_info)
-                .await?;
+            self.update_machine_topology(
+                txn,
+                dpu_machine_id,
+                dpu_bmc_info,
+                dpu_hw_info,
+                machine_data,
+            )
+            .await?;
             return Ok(Some(dpu_machine));
         }
         Ok(None)
@@ -779,6 +913,7 @@ impl MachineCreator {
             predicted_machine_id,
             managed_host.explored_host.bmc_info(),
             hardware_info,
+            machine_data,
         )
         .await
     }
@@ -790,20 +925,10 @@ impl MachineCreator {
         &self,
         txn: &mut PgConnection,
         explored_dpu: &ExploredDpu,
+        machine_data: Option<&ExpectedMachineData>,
     ) -> SiteExplorerResult<bool> {
         let dpu_machine_id: &MachineId = explored_dpu.report.machine_id.as_ref().unwrap();
-        let oob_net0_mac = explored_dpu.report.systems.iter().find_map(|x| {
-            x.ethernet_interfaces.iter().find_map(|x| {
-                if x.id
-                    .as_ref()
-                    .is_some_and(|id| id.to_lowercase().contains("oob"))
-                {
-                    x.mac_address
-                } else {
-                    None
-                }
-            })
-        });
+        let oob_net0_mac = dpu_oob_mac_address(explored_dpu);
 
         // If machine_interface exists for the DPU and machine_id is not updated, do it now.
         if let Some(oob_net0_mac) = oob_net0_mac {
@@ -812,6 +937,14 @@ impl MachineCreator {
             if let Some(interface) = mi.first()
                 && interface.machine_id.is_none()
             {
+                let expected_interface = machine_data
+                    .and_then(|data| data.expected_interface_for_mac(interface.mac_address));
+                db::machine_interface::capture_expected_interface_before_association(
+                    txn,
+                    interface.id,
+                    expected_interface.as_ref(),
+                )
+                .await?;
                 tracing::info!(
                     machine_interface_id = %interface.id,
                     machine_id = %dpu_machine_id,
@@ -880,14 +1013,22 @@ impl MachineCreator {
         machine_data: Option<&ExpectedMachineData>,
     ) -> SiteExplorerResult<MachineId> {
         let dpu_hw_info = explored_dpu.hardware_info()?;
+        let proactive_host_mac = dpu_hw_info.factory_mac_address().map_err(|error| {
+            SiteExplorerError::InvalidArgument(format!(
+                "DPU hardware info is missing its host factory MAC address: {error}",
+            ))
+        })?;
+        let proactive_expected_interface =
+            machine_data.and_then(|data| data.expected_interface_for_mac(proactive_host_mac));
         // Create Host proactively.
         // In case host interface is created, this method will return existing one, instead
         // creating new everytime.
         let host_machine_interface =
-            db::machine_interface::create_host_machine_dpu_interface_proactively(
+            db::machine_interface::find_or_create_host_machine_dpu_interface_proactively(
                 txn,
                 Some(&dpu_hw_info),
                 explored_dpu.report.machine_id.as_ref().unwrap(),
+                proactive_expected_interface.as_ref(),
                 self.config.retained_boot_interface_window,
             )
             .await?;
@@ -899,6 +1040,21 @@ impl MachineCreator {
                 host_machine_interface
             )));
         }
+
+        db::machine_interface::capture_expected_interface_before_association(
+            txn,
+            host_machine_interface.id,
+            proactive_expected_interface.as_ref(),
+        )
+        .await?;
+        db::machine_interface::associate_interface_with_dpu_machine(
+            &host_machine_interface.id,
+            explored_dpu.report.machine_id.as_ref().unwrap(),
+            txn,
+        )
+        .await?;
+        let host_machine_interface =
+            db::machine_interface::find_one(&mut *txn, host_machine_interface.id).await?;
 
         let host_machine_id = self
             .configure_host_machine(
@@ -926,6 +1082,7 @@ impl MachineCreator {
         machine_id: &MachineId,
         mut bmc_info: BmcInfo,
         hardware_info: HardwareInfo,
+        machine_data: Option<&ExpectedMachineData>,
     ) -> SiteExplorerResult<()> {
         let _topology =
             db::machine_topology::create_or_update(txn, machine_id, &hardware_info).await?;
@@ -943,10 +1100,14 @@ impl MachineCreator {
         )
         .await?;
 
+        let expected_interface = bmc_info.mac.and_then(|mac_address| {
+            machine_data.and_then(|data| data.expected_interface_for_mac(mac_address))
+        });
         db::bmc_metadata::update_bmc_network_into_machine_interfaces(
             txn,
             machine_id,
             &mut bmc_info,
+            expected_interface.as_ref(),
         )
         .await?;
 
@@ -994,9 +1155,15 @@ impl MachineCreator {
         &self,
         txn: &mut PgConnection,
         host_machine_id: &MachineId,
+        locked_admin_segment_ids: &[NetworkSegmentId],
     ) -> SiteExplorerResult<bool> {
         let active_config_changed =
-            db::machine_interface::reconcile_admin_addresses_for_host(txn, host_machine_id).await?;
+            db::machine_interface::reconcile_admin_addresses_for_host_with_locked_admin_segments(
+                txn,
+                host_machine_id,
+                locked_admin_segment_ids,
+            )
+            .await?;
         if active_config_changed {
             let (network_config, network_config_version) =
                 db::machine::get_network_config(&mut *txn, host_machine_id)
@@ -1105,11 +1272,254 @@ impl MachineCreator {
             &predicted_machine_id,
             host_bmc_info,
             host_hardware_info,
+            machine_data,
         )
         .await?;
 
         Ok(predicted_machine_id)
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ExpectedMachineIngestionIdentity {
+    id: Option<uuid::Uuid>,
+    bmc_mac_address: MacAddress,
+    has_rack_id: bool,
+}
+
+impl From<&ExpectedMachine> for ExpectedMachineIngestionIdentity {
+    fn from(expected_machine: &ExpectedMachine) -> Self {
+        Self {
+            id: expected_machine.id,
+            bmc_mac_address: expected_machine.bmc_mac_address,
+            has_rack_id: expected_machine.data.rack_id.is_some(),
+        }
+    }
+}
+
+impl ExpectedMachineIngestionIdentity {
+    fn matches(&self, expected_machine: &ExpectedMachine) -> bool {
+        self == &Self::from(expected_machine)
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct BmcOwnerPreview {
+    address: IpAddr,
+    owner: Option<db::bmc_metadata::BmcInterfaceOwner>,
+}
+
+async fn preview_bmc_interface_owners(
+    txn: &mut PgConnection,
+    explored_host: &ExploredManagedHost,
+) -> SiteExplorerResult<Vec<BmcOwnerPreview>> {
+    let mut bmc_ips = std::iter::once(explored_host.host_bmc_ip)
+        .chain(explored_host.dpus.iter().map(|dpu| dpu.bmc_ip))
+        .collect::<Vec<_>>();
+    bmc_ips.sort_unstable();
+    bmc_ips.dedup();
+
+    let mut owners = Vec::with_capacity(bmc_ips.len());
+    for address in bmc_ips {
+        let owner = db::bmc_metadata::find_interface_by_bmc_ip(txn, address).await?;
+        owners.push(BmcOwnerPreview { address, owner });
+    }
+    Ok(owners)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct ManagedHostIngestionLockInputs {
+    admin_segment_ids: Vec<NetworkSegmentId>,
+    segment_ids: Vec<NetworkSegmentId>,
+    fixed_allocations: Vec<(NetworkSegmentId, IpAddr)>,
+}
+
+fn merge_managed_host_ingestion_lock_inputs(
+    mut admin_segment_ids: Vec<NetworkSegmentId>,
+    mut segment_ids: Vec<NetworkSegmentId>,
+    interface_lock_inputs: &[db::machine_interface::ExpectedInterfaceDiscoveryLockInputs],
+    mut fixed_allocations: Vec<(NetworkSegmentId, IpAddr)>,
+) -> ManagedHostIngestionLockInputs {
+    admin_segment_ids.sort_unstable();
+    admin_segment_ids.dedup();
+    segment_ids.extend(admin_segment_ids.iter().copied());
+    for inputs in interface_lock_inputs {
+        segment_ids.extend(inputs.existing_segment_id);
+        fixed_allocations.extend(inputs.fixed_allocations.iter().copied());
+    }
+    segment_ids.extend(fixed_allocations.iter().map(|(segment_id, _)| *segment_id));
+    segment_ids.sort_unstable();
+    segment_ids.dedup();
+    fixed_allocations.sort_unstable();
+    fixed_allocations.dedup();
+
+    ManagedHostIngestionLockInputs {
+        admin_segment_ids,
+        segment_ids,
+        fixed_allocations,
+    }
+}
+
+async fn managed_host_interface_discovery_lock_inputs(
+    txn: &mut PgConnection,
+    expected_machine: &ExpectedMachine,
+    mac_addresses: &[MacAddress],
+) -> SiteExplorerResult<Vec<db::machine_interface::ExpectedInterfaceDiscoveryLockInputs>> {
+    let mut lock_inputs = Vec::with_capacity(mac_addresses.len());
+    for mac_address in mac_addresses {
+        let expected_interface = expected_machine
+            .data
+            .expected_interface_for_mac(*mac_address);
+        lock_inputs.push(
+            db::machine_interface::expected_interface_discovery_lock_inputs(
+                txn,
+                *mac_address,
+                expected_interface.as_ref(),
+            )
+            .await?,
+        );
+    }
+    Ok(lock_inputs)
+}
+
+async fn managed_host_ingestion_lock_inputs(
+    txn: &mut PgConnection,
+    expected_machine: &ExpectedMachine,
+    bmc_interface_owners: &[BmcOwnerPreview],
+    interface_lock_inputs: &[db::machine_interface::ExpectedInterfaceDiscoveryLockInputs],
+) -> SiteExplorerResult<ManagedHostIngestionLockInputs> {
+    let admin_segment_ids =
+        db::network_segment::list_segment_ids(txn, Some(NetworkSegmentType::Admin)).await?;
+    let mut segment_ids = bmc_interface_owners
+        .iter()
+        .filter_map(|preview| preview.owner.as_ref().map(|owner| owner.segment_id))
+        .collect::<Vec<_>>();
+
+    // A missing BMC owner remains compatible with the existing enrichment
+    // path, but its address segment must stay locked so an owner cannot appear
+    // between revalidation and the later lookup.
+    let mut missing_owner_addresses = bmc_interface_owners
+        .iter()
+        .filter(|preview| preview.owner.is_none())
+        .map(|preview| preview.address)
+        .collect::<Vec<_>>();
+    missing_owner_addresses.sort_unstable();
+    missing_owner_addresses.dedup();
+    for address in missing_owner_addresses {
+        let segment = db::network_segment::for_static_address(txn, address, None).await?;
+        segment_ids.push(segment.id);
+    }
+
+    let mut fixed_allocations = Vec::new();
+    if let Some(address) = expected_machine.data.bmc_ip_address {
+        let segment = db::network_segment::for_static_address(txn, address, None).await?;
+        fixed_allocations.push((segment.id, address));
+    }
+
+    Ok(merge_managed_host_ingestion_lock_inputs(
+        admin_segment_ids,
+        segment_ids,
+        interface_lock_inputs,
+        fixed_allocations,
+    ))
+}
+
+fn bmc_interface_owner_matches(
+    preview: Option<&db::bmc_metadata::BmcInterfaceOwner>,
+    current: Option<&db::bmc_metadata::BmcInterfaceOwner>,
+) -> bool {
+    match (preview, current) {
+        (None, None) => true,
+        (Some(preview), Some(current)) => {
+            current.interface_id == preview.interface_id
+                && current.mac_address == preview.mac_address
+                && current.segment_id == preview.segment_id
+        }
+        _ => false,
+    }
+}
+
+async fn lock_and_revalidate_bmc_interface_owners(
+    txn: &mut PgConnection,
+    previews: &[BmcOwnerPreview],
+) -> SiteExplorerResult<()> {
+    for preview in previews {
+        let current =
+            db::bmc_metadata::find_interface_by_bmc_ip_for_update(txn, preview.address).await?;
+        if !bmc_interface_owner_matches(preview.owner.as_ref(), current.as_ref()) {
+            return Err(db::DatabaseError::FailedPrecondition(format!(
+                "BMC interface ownership for {} changed while managed-host ingestion was waiting for network locks; retry ingestion",
+                preview.address,
+            ))
+            .into());
+        }
+    }
+    Ok(())
+}
+
+fn host_bmc_owner_matches_expected_machine(
+    previews: &[BmcOwnerPreview],
+    host_bmc_ip: IpAddr,
+    expected_bmc_mac_address: MacAddress,
+) -> bool {
+    previews
+        .iter()
+        .find(|preview| preview.address == host_bmc_ip)
+        .is_some_and(|preview| {
+            preview
+                .owner
+                .as_ref()
+                .is_none_or(|owner| owner.mac_address == expected_bmc_mac_address)
+        })
+}
+
+fn dpu_oob_mac_address(explored_dpu: &ExploredDpu) -> Option<MacAddress> {
+    explored_dpu.report.systems.iter().find_map(|system| {
+        system.ethernet_interfaces.iter().find_map(|interface| {
+            if interface
+                .id
+                .as_ref()
+                .is_some_and(|id| id.to_lowercase().contains("oob"))
+            {
+                interface.mac_address
+            } else {
+                None
+            }
+        })
+    })
+}
+
+fn managed_host_ingestion_interface_macs(
+    expected_machine: &ExpectedMachine,
+    explored_host: &ExploredManagedHost,
+    report: &EndpointExplorationReport,
+    bmc_owner_macs: impl IntoIterator<Item = MacAddress>,
+) -> Vec<MacAddress> {
+    let mut mac_addresses = expected_machine
+        .data
+        .host_nics
+        .iter()
+        .map(|interface| interface.mac_address)
+        .chain(std::iter::once(expected_machine.bmc_mac_address))
+        .chain(report.all_mac_addresses())
+        .chain(explored_host.dpus.iter().filter_map(dpu_oob_mac_address))
+        .chain(
+            explored_host
+                .dpus
+                .iter()
+                .filter_map(|dpu| dpu.bmc_info().mac),
+        )
+        .chain(
+            explored_host
+                .dpus
+                .iter()
+                .filter_map(|dpu| dpu.host_pf_mac_address),
+        )
+        .chain(bmc_owner_macs)
+        .collect::<Vec<_>>();
+    mac_addresses.sort_unstable();
+    mac_addresses.dedup();
+    mac_addresses
 }
 
 /// Host inband MACs used when minting `predicted_machine_interface` rows for zero-DPU hosts.
@@ -1124,7 +1534,12 @@ fn host_mac_addresses_for_predicted_machine(
         [_, ..] => from_redfish,
         [] => machine_data
             .filter(|_| !(report.is_dpu() || report.is_switch() || report.is_power_shelf()))
-            .map(|data| data.host_nics.as_slice())
+            .map(|data| {
+                data.host_nics
+                    .iter()
+                    .filter(|interface| interface.role.is_host())
+                    .collect::<Vec<_>>()
+            })
             .none_if_empty()
             .map(|host_nics| {
                 tracing::info!(
@@ -1138,5 +1553,460 @@ fn host_mac_addresses_for_predicted_machine(
                     .collect()
             })
             .unwrap_or_default(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use carbide_test_harness::prelude::{TestHarness, sqlx_test, sqlx_testing};
+    use model::allocation_type::AllocationType;
+    use model::expected_machine::{ExpectedHostNic, ExpectedInterfaceRole};
+    use model::site_explorer::{ComputerSystem, EthernetInterface, Manager};
+
+    use super::*;
+
+    async fn wait_for_advisory_lock_wait(pool: &PgPool) {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let waiting = sqlx::query_scalar::<_, i64>(
+                    "SELECT COUNT(*)
+                     FROM pg_stat_activity
+                     WHERE datname = current_database()
+                       AND wait_event_type = 'Lock'
+                       AND wait_event = 'advisory'
+                       AND query LIKE '%pg_advisory_xact_lock%'",
+                )
+                .fetch_one(pool)
+                .await
+                .expect("inspect advisory lock wait");
+                if waiting > 0 {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("managed-host ingestion did not reach the segment-lock queue");
+    }
+
+    #[test]
+    fn zero_dpu_fallback_uses_only_host_interface_declarations() {
+        let host_mac = MacAddress::new([0x02, 0x00, 0x00, 0x00, 0x00, 0x01]);
+        let dpu_os_mac = MacAddress::new([0x02, 0x00, 0x00, 0x00, 0x00, 0x02]);
+        let dpu_bmc_mac = MacAddress::new([0x02, 0x00, 0x00, 0x00, 0x00, 0x03]);
+        let machine_data = ExpectedMachineData {
+            host_nics: vec![
+                ExpectedHostNic {
+                    mac_address: host_mac,
+                    role: ExpectedInterfaceRole::Host,
+                    ..Default::default()
+                },
+                ExpectedHostNic {
+                    mac_address: dpu_os_mac,
+                    role: ExpectedInterfaceRole::DpuOs,
+                    ..Default::default()
+                },
+                ExpectedHostNic {
+                    mac_address: dpu_bmc_mac,
+                    role: ExpectedInterfaceRole::DpuBmc,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+
+        let mac_addresses = host_mac_addresses_for_predicted_machine(
+            &EndpointExplorationReport::default(),
+            Some(&machine_data),
+        );
+
+        assert_eq!(mac_addresses, vec![host_mac]);
+    }
+
+    #[test]
+    fn ingestion_mac_locks_cover_config_report_and_dpu_interfaces() {
+        let configured_mac = MacAddress::new([0x02, 0x00, 0x00, 0x00, 0x00, 0x01]);
+        let report_host_mac = MacAddress::new([0x02, 0x00, 0x00, 0x00, 0x00, 0x02]);
+        let dpu_oob_mac = MacAddress::new([0x02, 0x00, 0x00, 0x00, 0x00, 0x03]);
+        let dpu_host_mac = MacAddress::new([0x02, 0x00, 0x00, 0x00, 0x00, 0x04]);
+        let unrelated_dpu_mac = MacAddress::new([0x02, 0x00, 0x00, 0x00, 0x00, 0x05]);
+        let dpu_bmc_mac = MacAddress::new([0x02, 0x00, 0x00, 0x00, 0x00, 0x06]);
+        let resolved_bmc_owner_mac = MacAddress::new([0x02, 0x00, 0x00, 0x00, 0x00, 0x07]);
+        let host_bmc_mac = MacAddress::new([0x02, 0x00, 0x00, 0x00, 0x00, 0x10]);
+        let expected_machine = ExpectedMachine {
+            id: None,
+            bmc_mac_address: host_bmc_mac,
+            data: ExpectedMachineData {
+                host_nics: vec![
+                    ExpectedHostNic {
+                        mac_address: configured_mac,
+                        ..Default::default()
+                    },
+                    ExpectedHostNic {
+                        mac_address: report_host_mac,
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            },
+        };
+        let host_report = EndpointExplorationReport {
+            systems: vec![ComputerSystem {
+                ethernet_interfaces: vec![EthernetInterface {
+                    id: Some("host0".to_string()),
+                    mac_address: Some(report_host_mac),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let dpu_report = EndpointExplorationReport {
+            managers: vec![Manager {
+                ethernet_interfaces: vec![EthernetInterface {
+                    mac_address: Some(dpu_bmc_mac),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            systems: vec![ComputerSystem {
+                ethernet_interfaces: vec![
+                    EthernetInterface {
+                        id: Some("OOB_NET0".to_string()),
+                        mac_address: Some(dpu_oob_mac),
+                        ..Default::default()
+                    },
+                    EthernetInterface {
+                        id: Some("tmfifo_net0".to_string()),
+                        mac_address: Some(unrelated_dpu_mac),
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let explored_host = ExploredManagedHost {
+            host_bmc_ip: "192.0.2.10".parse().unwrap(),
+            dpus: vec![ExploredDpu {
+                bmc_ip: "192.0.2.11".parse().unwrap(),
+                host_pf_mac_address: Some(dpu_host_mac),
+                report: Arc::new(dpu_report),
+            }],
+        };
+
+        let mac_addresses = managed_host_ingestion_interface_macs(
+            &expected_machine,
+            &explored_host,
+            &host_report,
+            [resolved_bmc_owner_mac],
+        );
+
+        assert_eq!(
+            mac_addresses,
+            vec![
+                configured_mac,
+                report_host_mac,
+                dpu_oob_mac,
+                dpu_host_mac,
+                dpu_bmc_mac,
+                resolved_bmc_owner_mac,
+                host_bmc_mac,
+            ]
+        );
+        assert!(!mac_addresses.contains(&unrelated_dpu_mac));
+    }
+
+    #[test]
+    fn bmc_owner_revalidation_checks_row_mac_segment_and_presence() {
+        let preview_mac = MacAddress::new([0x02, 0x00, 0x00, 0x00, 0x00, 0x01]);
+        let preview = db::bmc_metadata::BmcInterfaceOwner {
+            interface_id: uuid::Uuid::from_u128(1).into(),
+            mac_address: preview_mac,
+            segment_id: uuid::Uuid::from_u128(2).into(),
+        };
+
+        assert!(bmc_interface_owner_matches(Some(&preview), Some(&preview)));
+        assert!(bmc_interface_owner_matches(None, None));
+        assert!(!bmc_interface_owner_matches(Some(&preview), None));
+        assert!(!bmc_interface_owner_matches(None, Some(&preview)));
+
+        let mut changed_id = preview;
+        changed_id.interface_id = uuid::Uuid::from_u128(3).into();
+        assert!(!bmc_interface_owner_matches(
+            Some(&preview),
+            Some(&changed_id)
+        ));
+
+        let mut changed_mac = preview;
+        changed_mac.mac_address = MacAddress::new([0x02, 0x00, 0x00, 0x00, 0x00, 0x04]);
+        assert!(!bmc_interface_owner_matches(
+            Some(&preview),
+            Some(&changed_mac)
+        ));
+
+        let mut changed_segment = preview;
+        changed_segment.segment_id = uuid::Uuid::from_u128(5).into();
+        assert!(!bmc_interface_owner_matches(
+            Some(&preview),
+            Some(&changed_segment)
+        ));
+    }
+
+    #[test]
+    fn host_bmc_owner_must_match_expected_machine_bmc_mac() {
+        let host_bmc_ip = "192.0.2.10".parse().unwrap();
+        let expected_bmc_mac = MacAddress::new([0x02, 0x00, 0x00, 0x00, 0x00, 0x01]);
+        let owner = db::bmc_metadata::BmcInterfaceOwner {
+            interface_id: uuid::Uuid::from_u128(1).into(),
+            mac_address: expected_bmc_mac,
+            segment_id: uuid::Uuid::from_u128(2).into(),
+        };
+        let matching = [BmcOwnerPreview {
+            address: host_bmc_ip,
+            owner: Some(owner),
+        }];
+        assert!(host_bmc_owner_matches_expected_machine(
+            &matching,
+            host_bmc_ip,
+            expected_bmc_mac,
+        ));
+
+        let absent = [BmcOwnerPreview {
+            address: host_bmc_ip,
+            owner: None,
+        }];
+        assert!(host_bmc_owner_matches_expected_machine(
+            &absent,
+            host_bmc_ip,
+            expected_bmc_mac,
+        ));
+
+        let mismatched = [BmcOwnerPreview {
+            address: host_bmc_ip,
+            owner: Some(db::bmc_metadata::BmcInterfaceOwner {
+                mac_address: MacAddress::new([0x02, 0x00, 0x00, 0x00, 0x00, 0x03]),
+                ..owner
+            }),
+        }];
+        assert!(!host_bmc_owner_matches_expected_machine(
+            &mismatched,
+            host_bmc_ip,
+            expected_bmc_mac,
+        ));
+        assert!(!host_bmc_owner_matches_expected_machine(
+            &[],
+            host_bmc_ip,
+            expected_bmc_mac,
+        ));
+    }
+
+    #[test]
+    fn expected_machine_ingestion_identity_covers_credentials_lookup_inputs() {
+        let expected_machine = ExpectedMachine {
+            id: Some(uuid::Uuid::from_u128(1)),
+            bmc_mac_address: MacAddress::new([0x02, 0x00, 0x00, 0x00, 0x00, 0x01]),
+            data: ExpectedMachineData {
+                rack_id: Some("rack-a".into()),
+                ..Default::default()
+            },
+        };
+        let identity = ExpectedMachineIngestionIdentity::from(&expected_machine);
+        assert!(identity.matches(&expected_machine));
+
+        let mut changed_id = expected_machine.clone();
+        changed_id.id = Some(uuid::Uuid::from_u128(3));
+        assert!(!identity.matches(&changed_id));
+
+        let mut changed_mac = expected_machine.clone();
+        changed_mac.bmc_mac_address = MacAddress::new([0x02, 0x00, 0x00, 0x00, 0x00, 0x04]);
+        assert!(!identity.matches(&changed_mac));
+
+        let mut changed_credential_path = expected_machine.clone();
+        changed_credential_path.data.rack_id = None;
+        assert!(!identity.matches(&changed_credential_path));
+
+        let mut same_credential_path = expected_machine;
+        same_credential_path.data.rack_id = Some("rack-b".into());
+        assert!(identity.matches(&same_credential_path));
+    }
+
+    #[test]
+    fn ingestion_lock_input_union_includes_existing_and_fixed_segments() {
+        let legacy_segment: NetworkSegmentId = uuid::Uuid::from_u128(1).into();
+        let fixed_segment: NetworkSegmentId = uuid::Uuid::from_u128(2).into();
+        let owner_segment: NetworkSegmentId = uuid::Uuid::from_u128(3).into();
+        let existing_segment: NetworkSegmentId = uuid::Uuid::from_u128(4).into();
+        let admin_segment: NetworkSegmentId = uuid::Uuid::from_u128(5).into();
+        let fixed_address = "192.0.2.10".parse().unwrap();
+        let legacy_address = "192.0.2.11".parse().unwrap();
+        let interface_lock_inputs = [
+            db::machine_interface::ExpectedInterfaceDiscoveryLockInputs {
+                existing_segment_id: Some(existing_segment),
+                fixed_allocations: vec![
+                    (fixed_segment, fixed_address),
+                    (fixed_segment, fixed_address),
+                ],
+            },
+            db::machine_interface::ExpectedInterfaceDiscoveryLockInputs {
+                existing_segment_id: Some(admin_segment),
+                fixed_allocations: Vec::new(),
+            },
+        ];
+
+        let lock_inputs = merge_managed_host_ingestion_lock_inputs(
+            vec![admin_segment, admin_segment],
+            vec![owner_segment],
+            &interface_lock_inputs,
+            vec![(legacy_segment, legacy_address)],
+        );
+
+        assert_eq!(lock_inputs.admin_segment_ids, vec![admin_segment]);
+        assert_eq!(
+            lock_inputs.segment_ids,
+            vec![
+                legacy_segment,
+                fixed_segment,
+                owner_segment,
+                existing_segment,
+                admin_segment,
+            ]
+        );
+        assert_eq!(
+            lock_inputs.fixed_allocations,
+            vec![
+                (legacy_segment, legacy_address),
+                (fixed_segment, fixed_address),
+            ]
+        );
+    }
+
+    #[sqlx_test]
+    #[allow(txn_held_across_await)] // Intentional: this test changes state while ingestion waits on a lock.
+    async fn missing_bmc_owner_inserted_while_waiting_rejects_without_partial_ingestion(
+        pool: PgPool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let test_harness = TestHarness::builder(pool.clone()).build().await;
+        let domain = test_harness.test_domain().await;
+        let underlay_segment = test_harness
+            .network_controller()
+            .create_underlay_segment(&domain)
+            .await;
+        let bmc_ip = underlay_segment.relay_address;
+        let bmc_mac_address: MacAddress = "02:00:00:00:00:21".parse()?;
+
+        let mut setup = Transaction::begin(&pool).await?;
+        let expected_machine = db::expected_machine::create(
+            setup.as_pgconn(),
+            ExpectedMachine {
+                id: None,
+                bmc_mac_address,
+                data: ExpectedMachineData::default(),
+            },
+        )
+        .await?;
+        setup.commit().await?;
+
+        let creator = MachineCreator::new(
+            pool.clone(),
+            SiteExplorerConfig::default(),
+            test_harness.api().common_pools().clone(),
+            Arc::new(RackProfileConfig::default()),
+            None,
+            test_harness.api().credential_manager().clone(),
+        );
+        let explored_host = ExploredManagedHost {
+            host_bmc_ip: bmc_ip,
+            dpus: Vec::new(),
+        };
+
+        let mut segment_owner = Transaction::begin(&pool).await?;
+        db::machine_interface::lock_network_segments_exclusive(
+            segment_owner.as_pgconn(),
+            std::slice::from_ref(&underlay_segment.id),
+        )
+        .await?;
+
+        let create_pool = pool.clone();
+        let creation = tokio::spawn(async move {
+            let mut report = EndpointExplorationReport::default();
+            creator
+                .create_managed_host(
+                    &explored_host,
+                    &mut report,
+                    Some(&expected_machine),
+                    &create_pool,
+                )
+                .await
+        });
+        wait_for_advisory_lock_wait(&pool).await;
+
+        let mut writer = Transaction::begin(&pool).await?;
+        let interface_id = sqlx::query_scalar(
+            "INSERT INTO machine_interfaces
+                 (segment_id, mac_address, primary_interface, hostname)
+             VALUES ($1, $2, false, 'concurrent-bmc-owner')
+             RETURNING id",
+        )
+        .bind(underlay_segment.id)
+        .bind(bmc_mac_address)
+        .fetch_one(writer.as_pgconn())
+        .await?;
+        db::machine_interface_address::insert(
+            writer.as_pgconn(),
+            interface_id,
+            bmc_ip,
+            AllocationType::Static,
+        )
+        .await?;
+        writer.commit().await?;
+
+        segment_owner.commit().await?;
+        let error = tokio::time::timeout(std::time::Duration::from_secs(5), creation)
+            .await
+            .expect("managed-host ingestion did not finish after releasing the segment lock")
+            .expect("managed-host ingestion task panicked")
+            .expect_err("new BMC owner must reject the stale ingestion attempt");
+        assert!(matches!(
+            error,
+            SiteExplorerError::DatabaseError(db::DatabaseError::FailedPrecondition(_))
+        ));
+
+        let mut check = Transaction::begin(&pool).await?;
+        let owner = db::bmc_metadata::find_interface_by_bmc_ip(check.as_pgconn(), bmc_ip)
+            .await?
+            .expect("concurrent BMC owner must remain");
+        assert_eq!(owner.interface_id, interface_id);
+        assert_eq!(owner.mac_address, bmc_mac_address);
+        assert_eq!(owner.segment_id, underlay_segment.id);
+
+        let owner_unchanged = sqlx::query_scalar::<_, bool>(
+            "SELECT machine_id IS NULL
+                 AND switch_id IS NULL
+                 AND power_shelf_id IS NULL
+                 AND attached_dpu_machine_id IS NULL
+                 AND association_type = 'None'::association_type
+                 AND expected_interface IS NULL
+                 AND expected_interface_captured = false
+             FROM machine_interfaces
+             WHERE id = $1",
+        )
+        .bind(interface_id)
+        .fetch_one(check.as_pgconn())
+        .await?;
+        assert!(owner_unchanged);
+
+        let partial_rows = sqlx::query_as::<_, (i64, i64, i64)>(
+            "SELECT
+                (SELECT COUNT(*) FROM machines),
+                (SELECT COUNT(*) FROM machine_topologies),
+                (SELECT COUNT(*) FROM predicted_machine_interfaces)",
+        )
+        .fetch_one(check.as_pgconn())
+        .await?;
+        assert_eq!(partial_rows, (0, 0, 0));
+        check.rollback().await?;
+
+        Ok(())
     }
 }

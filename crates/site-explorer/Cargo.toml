@@ -58,6 +58,7 @@ tokio = { workspace = true }
 tokio-util = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
+uuid = { workspace = true }
 version-compare = { workspace = true }
 
 [dev-dependencies]
@@ -79,7 +80,6 @@ carbide-test-support = { path = "../test-support" }
 
 tokio = { workspace = true, features = ["macros", "rt"] }
 tonic = { workspace = true }
-uuid = { workspace = true }
 
 [lints]
 workspace = true

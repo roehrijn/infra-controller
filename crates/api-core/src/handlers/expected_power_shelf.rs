@@ -112,6 +112,7 @@ pub async fn update_expected_power_shelf(
             &mut txn,
             power_shelf.bmc_mac_address,
             bmc_ip,
+            model::machine_interface::InterfaceType::Bmc,
             api.runtime_config.retained_boot_interface_window,
         )
         .await?;

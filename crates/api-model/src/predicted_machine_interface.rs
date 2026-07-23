@@ -19,6 +19,7 @@ use mac_address::MacAddress;
 use sqlx::FromRow;
 use uuid::Uuid;
 
+use crate::expected_machine::ExpectedHostNic;
 use crate::machine_boot_interface::MachineBootInterface;
 use crate::network_segment::NetworkSegmentType;
 
@@ -38,6 +39,13 @@ pub struct PredictedMachineInterface {
     /// leaves the row non-primary and the boot interface falls to the
     /// `pick_boot_interface` automation.
     pub primary_interface: bool,
+    /// ExpectedMachine interface settings captured when this prediction was
+    /// created. A captured missing value identifies predictions created
+    /// without a matching declaration.
+    pub expected_interface: Option<sqlx::types::Json<ExpectedHostNic>>,
+    /// Distinguishes an intentionally missing declaration from a prediction
+    /// inserted by an older process during a rolling upgrade.
+    pub expected_interface_captured: bool,
 }
 
 impl PredictedMachineInterface {
@@ -47,6 +55,10 @@ impl PredictedMachineInterface {
     /// `None` until the id has been captured from an exploration report.
     pub fn boot_interface(&self) -> Option<MachineBootInterface> {
         MachineBootInterface::for_mac(self.mac_address, self.boot_interface_id.clone())
+    }
+
+    pub fn expected_interface(&self) -> Option<&ExpectedHostNic> {
+        self.expected_interface.as_deref()
     }
 }
 
@@ -58,4 +70,6 @@ pub struct NewPredictedMachineInterface<'a> {
     pub boot_interface_id: Option<String>,
     /// See [`PredictedMachineInterface::primary_interface`].
     pub primary_interface: bool,
+    /// See [`PredictedMachineInterface::expected_interface`].
+    pub expected_interface: Option<&'a ExpectedHostNic>,
 }

@@ -20,9 +20,10 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use carbide_authn::middleware::ConnectionAttributes;
-use carbide_uuid::machine::MachineInterfaceId;
+use carbide_uuid::machine::{MachineId, MachineInterfaceId};
 use common::api_fixtures::dpu::create_dpu_machine;
 use common::api_fixtures::host::{host_discover_dhcp, host_discover_machine_with_reporter};
+use common::api_fixtures::network_segment::create_network_segment;
 use common::api_fixtures::{
     FIXTURE_DHCP_RELAY_ADDRESS, create_managed_host, create_managed_host_with_config,
     create_test_env,
@@ -79,6 +80,30 @@ fn discovery_request_from(
             peer_certificates: vec![],
         }));
     request
+}
+
+async fn wait_for_advisory_lock_wait(pool: &sqlx::PgPool) {
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let waiting = sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*)
+                 FROM pg_stat_activity
+                 WHERE datname = current_database()
+                   AND wait_event_type = 'Lock'
+                   AND wait_event = 'advisory'
+                   AND query LIKE '%pg_advisory_xact_lock%'",
+            )
+            .fetch_one(pool)
+            .await
+            .expect("inspect advisory lock wait");
+            if waiting > 0 {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("discovery did not reach the advisory-lock queue");
 }
 
 async fn allocated_host_for_secure_discovery(
@@ -142,6 +167,49 @@ async fn allocated_host_for_secure_discovery(
         instance_address.address,
         admin_interface,
     )
+}
+
+async fn assert_retained_dpu_bmc_policy(
+    pool: &sqlx::PgPool,
+    interface_id: MachineInterfaceId,
+    machine_id: MachineId,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut txn = pool.begin().await?;
+    let interface = db::machine_interface::find_one(&mut *txn, interface_id).await?;
+    assert_eq!(interface.machine_id, Some(machine_id));
+    assert_eq!(
+        interface.interface_type,
+        model::machine_interface::InterfaceType::Bmc
+    );
+    assert!(!interface.primary_interface);
+
+    let addresses =
+        db::machine_interface_address::find_for_interface(&mut txn, interface.id).await?;
+    assert!(!addresses.is_empty());
+    assert!(
+        addresses.iter().all(
+            |address| address.allocation_type == model::allocation_type::AllocationType::Static
+        )
+    );
+
+    let saved_interface = sqlx::query_scalar::<
+        _,
+        sqlx::types::Json<model::expected_machine::ExpectedHostNic>,
+    >("SELECT expected_interface FROM machine_interfaces WHERE id = $1")
+    .bind(interface.id)
+    .fetch_one(&mut *txn)
+    .await?;
+    assert_eq!(
+        saved_interface.role,
+        model::expected_machine::ExpectedInterfaceRole::DpuBmc
+    );
+    assert_eq!(
+        saved_interface.resolved_ip_allocation(),
+        model::expected_machine::ExpectedInterfaceIpAllocation::Retained
+    );
+    txn.rollback().await?;
+
+    Ok(())
 }
 
 #[crate::sqlx_test]
@@ -324,8 +392,24 @@ async fn test_discover_dpu_by_source_ip(
         .unwrap()
         .into_inner();
 
+    env.api
+        .add_expected_machine(Request::new(rpc::forge::ExpectedMachine {
+            bmc_mac_address: host_config.bmc_mac_address.to_string(),
+            bmc_username: "ADMIN".into(),
+            bmc_password: "PASS".into(),
+            chassis_serial_number: host_config.serial.clone(),
+            host_nics: vec![rpc::forge::ExpectedHostNic {
+                mac_address: dpu.oob_mac_address.to_string(),
+                role: Some(rpc::forge::ExpectedInterfaceRole::DpuBmc as i32),
+                ip_allocation: Some(rpc::forge::ExpectedInterfaceIpAllocation::Retained as i32),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }))
+        .await?;
+
     let mut req = Request::new(rpc::MachineDiscoveryInfo {
-        machine_interface_id: None,
+        machine_interface_id: Some(uuid::Uuid::new_v4().into()),
         discovery_data: Some(rpc::DiscoveryData::Info(
             rpc::DiscoveryInfo::try_from(HardwareInfo::from(dpu)).unwrap(),
         )),
@@ -342,10 +426,245 @@ async fn test_discover_dpu_by_source_ip(
 
     let response = env.api.discover_machine(req).await.unwrap().into_inner();
 
-    assert!(response.machine_id.is_some());
+    let machine_id = response
+        .machine_id
+        .expect("discovery must return a machine");
+    let interface_id = response
+        .machine_interface_id
+        .expect("discovery must return the caller interface");
+    assert_eq!(Some(interface_id), dhcp_response.machine_interface_id);
+    assert_retained_dpu_bmc_policy(&env.pool, interface_id, machine_id).await?;
+
+    Ok(())
+}
+
+#[crate::sqlx_test]
+async fn test_dpu_discovery_applies_expected_interfaces_before_association(
+    pool: sqlx::PgPool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let env = create_test_env(pool).await;
+    let host_config = env.managed_host_config();
+    let dpu = host_config.get_and_assert_single_dpu().clone();
+
+    let dpu_interface_id =
+        common::api_fixtures::dpu::dpu_discover_dhcp(&env, &dpu.oob_mac_address.to_string()).await;
+
+    env.api
+        .add_expected_machine(Request::new(rpc::forge::ExpectedMachine {
+            bmc_mac_address: host_config.bmc_mac_address.to_string(),
+            bmc_username: "ADMIN".into(),
+            bmc_password: "PASS".into(),
+            chassis_serial_number: host_config.serial.clone(),
+            host_nics: vec![
+                rpc::forge::ExpectedHostNic {
+                    mac_address: dpu.oob_mac_address.to_string(),
+                    role: Some(rpc::forge::ExpectedInterfaceRole::DpuBmc as i32),
+                    ip_allocation: Some(rpc::forge::ExpectedInterfaceIpAllocation::Retained as i32),
+                    ..Default::default()
+                },
+                rpc::forge::ExpectedHostNic {
+                    mac_address: dpu.host_mac_address.to_string(),
+                    role: Some(rpc::forge::ExpectedInterfaceRole::Host as i32),
+                    ip_allocation: Some(rpc::forge::ExpectedInterfaceIpAllocation::Retained as i32),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        }))
+        .await?;
+
+    let dpu_machine_id =
+        common::api_fixtures::dpu::dpu_discover_machine(&env, &dpu, dpu_interface_id).await;
+
+    assert_retained_dpu_bmc_policy(&env.pool, dpu_interface_id, dpu_machine_id).await?;
+
+    let mut txn = env.pool.begin().await?;
+    let host_interfaces =
+        db::machine_interface::find_by_mac_address(&mut *txn, dpu.host_mac_address).await?;
+    assert_eq!(host_interfaces.len(), 1);
+    let host_interface = &host_interfaces[0];
+    assert_eq!(host_interface.attached_dpu_machine_id, Some(dpu_machine_id));
+    assert!(host_interface.machine_id.is_some());
     assert_eq!(
-        response.machine_interface_id,
-        dhcp_response.machine_interface_id
+        host_interface.interface_type,
+        model::machine_interface::InterfaceType::Data
+    );
+    assert!(host_interface.primary_interface);
+
+    let addresses =
+        db::machine_interface_address::find_for_interface(&mut txn, host_interface.id).await?;
+    assert!(!addresses.is_empty());
+    assert!(
+        addresses.iter().all(
+            |address| address.allocation_type == model::allocation_type::AllocationType::Static
+        )
+    );
+
+    let saved_interface = sqlx::query_scalar::<
+        _,
+        sqlx::types::Json<model::expected_machine::ExpectedHostNic>,
+    >("SELECT expected_interface FROM machine_interfaces WHERE id = $1")
+    .bind(host_interface.id)
+    .fetch_one(&mut *txn)
+    .await?;
+    assert_eq!(
+        saved_interface.role,
+        model::expected_machine::ExpectedInterfaceRole::Host
+    );
+    assert_eq!(
+        saved_interface.resolved_ip_allocation(),
+        model::expected_machine::ExpectedInterfaceIpAllocation::Retained
+    );
+    txn.rollback().await?;
+
+    Ok(())
+}
+
+#[crate::sqlx_test]
+async fn test_dpu_discovery_places_fixed_proactive_host_interface_by_address(
+    pool: sqlx::PgPool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let env = create_test_env(pool).await;
+    let host_config = env.managed_host_config();
+    let dpu = host_config.get_and_assert_single_dpu().clone();
+    let fixed_ip: IpAddr = "192.0.1.230".parse()?;
+
+    let dpu_interface_id =
+        common::api_fixtures::dpu::dpu_discover_dhcp(&env, &dpu.oob_mac_address.to_string()).await;
+
+    env.api
+        .add_expected_machine(Request::new(rpc::forge::ExpectedMachine {
+            bmc_mac_address: host_config.bmc_mac_address.to_string(),
+            bmc_username: "ADMIN".into(),
+            bmc_password: "PASS".into(),
+            chassis_serial_number: host_config.serial.clone(),
+            host_nics: vec![
+                rpc::forge::ExpectedHostNic {
+                    mac_address: dpu.oob_mac_address.to_string(),
+                    role: Some(rpc::forge::ExpectedInterfaceRole::DpuBmc as i32),
+                    ip_allocation: Some(rpc::forge::ExpectedInterfaceIpAllocation::Retained as i32),
+                    ..Default::default()
+                },
+                rpc::forge::ExpectedHostNic {
+                    mac_address: dpu.host_mac_address.to_string(),
+                    fixed_ip: Some(fixed_ip.to_string()),
+                    role: Some(rpc::forge::ExpectedInterfaceRole::Host as i32),
+                    ip_allocation: Some(rpc::forge::ExpectedInterfaceIpAllocation::Fixed as i32),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        }))
+        .await?;
+
+    let dpu_machine_id =
+        common::api_fixtures::dpu::dpu_discover_machine(&env, &dpu, dpu_interface_id).await;
+
+    let mut txn = env.pool.begin().await?;
+    let host_interfaces =
+        db::machine_interface::find_by_mac_address(&mut *txn, dpu.host_mac_address).await?;
+    let [host_interface] = host_interfaces.as_slice() else {
+        return Err(std::io::Error::other(format!(
+            "expected one proactive host interface, got {}",
+            host_interfaces.len()
+        ))
+        .into());
+    };
+    assert_eq!(host_interface.attached_dpu_machine_id, Some(dpu_machine_id));
+    assert!(host_interface.machine_id.is_some());
+    assert_eq!(
+        host_interface.segment_id,
+        env.underlay_segment
+            .expect("test environment should have an Underlay segment")
+    );
+
+    let addresses =
+        db::machine_interface_address::find_for_interface(&mut txn, host_interface.id).await?;
+    assert_eq!(addresses.len(), 1);
+    assert_eq!(addresses[0].address, fixed_ip);
+    assert_eq!(
+        addresses[0].allocation_type,
+        model::allocation_type::AllocationType::Static
+    );
+
+    let saved_interface = sqlx::query_scalar::<
+        _,
+        sqlx::types::Json<model::expected_machine::ExpectedHostNic>,
+    >("SELECT expected_interface FROM machine_interfaces WHERE id = $1")
+    .bind(host_interface.id)
+    .fetch_one(&mut *txn)
+    .await?;
+    assert_eq!(saved_interface.fixed_ip, Some(fixed_ip));
+    assert_eq!(
+        saved_interface.resolved_ip_allocation(),
+        model::expected_machine::ExpectedInterfaceIpAllocation::Fixed
+    );
+    txn.rollback().await?;
+
+    Ok(())
+}
+
+#[crate::sqlx_test]
+async fn test_dpu_discovery_rejects_expected_interfaces_from_different_machines(
+    pool: sqlx::PgPool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let env = create_test_env(pool).await;
+    let host_config = env.managed_host_config();
+    let dpu = host_config.get_and_assert_single_dpu().clone();
+    let dpu_interface_id =
+        common::api_fixtures::dpu::dpu_discover_dhcp(&env, &dpu.oob_mac_address.to_string()).await;
+
+    for (bmc_mac_address, serial, interface) in [
+        (
+            "02:00:00:00:20:01",
+            "EM-DIRECT-OWNER-A",
+            rpc::forge::ExpectedHostNic {
+                mac_address: dpu.oob_mac_address.to_string(),
+                role: Some(rpc::forge::ExpectedInterfaceRole::DpuBmc as i32),
+                ip_allocation: Some(rpc::forge::ExpectedInterfaceIpAllocation::Retained as i32),
+                ..Default::default()
+            },
+        ),
+        (
+            "02:00:00:00:20:02",
+            "EM-DIRECT-OWNER-B",
+            rpc::forge::ExpectedHostNic {
+                mac_address: dpu.host_mac_address.to_string(),
+                role: Some(rpc::forge::ExpectedInterfaceRole::Host as i32),
+                ip_allocation: Some(rpc::forge::ExpectedInterfaceIpAllocation::Retained as i32),
+                ..Default::default()
+            },
+        ),
+    ] {
+        env.api
+            .add_expected_machine(Request::new(rpc::forge::ExpectedMachine {
+                bmc_mac_address: bmc_mac_address.into(),
+                bmc_username: "ADMIN".into(),
+                bmc_password: "PASS".into(),
+                chassis_serial_number: serial.into(),
+                host_nics: vec![interface],
+                ..Default::default()
+            }))
+            .await?;
+    }
+
+    let status = env
+        .api
+        .discover_machine(Request::new(rpc::MachineDiscoveryInfo {
+            machine_interface_id: Some(dpu_interface_id),
+            discovery_data: Some(rpc::DiscoveryData::Info(rpc::DiscoveryInfo::try_from(
+                HardwareInfo::from(&dpu),
+            )?)),
+            create_machine: true,
+            ..Default::default()
+        }))
+        .await
+        .expect_err("one discovery must not combine policies from two ExpectedMachines");
+    assert_eq!(status.code(), Code::InvalidArgument);
+    assert!(
+        status
+            .message()
+            .contains("belong to different ExpectedMachines")
     );
 
     Ok(())
@@ -726,6 +1045,114 @@ async fn test_secure_discovery_promotes_predicted_host_by_remote_ip(
 }
 
 #[crate::sqlx_test]
+async fn test_secure_discovery_rejects_ip_mapping_ambiguity_after_preview(
+    pool: sqlx::PgPool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let env = create_test_env(pool).await;
+    let host_config = env.managed_host_config();
+    let dpu_machine_id = create_dpu_machine(&env, &host_config).await;
+    let host_interface_id = host_discover_dhcp(&env, &host_config, &dpu_machine_id).await;
+    let competing_interface_id =
+        common::api_fixtures::dpu::dpu_discover_dhcp(&env, "02:00:00:00:20:05").await;
+
+    let mut txn = env.pool.begin().await?;
+    let host_interface = db::machine_interface::find_one(&mut *txn, host_interface_id).await?;
+    txn.rollback().await?;
+    let remote_ip = host_interface.addresses[0];
+
+    let mut blocker = env.pool.begin().await?;
+    db::machine_interface::lock_network_segments_exclusive(
+        &mut blocker,
+        std::slice::from_ref(&host_interface.segment_id),
+    )
+    .await?;
+
+    let secure_api = secure_api_for(&env);
+    let request = discovery_request_from(&HardwareInfo::from(&host_config), None, remote_ip);
+    let discovery = tokio::spawn(async move { secure_api.discover_machine(request).await });
+    wait_for_advisory_lock_wait(&env.pool).await;
+
+    let updated = sqlx::query(
+        "UPDATE machine_interface_addresses
+         SET address = $1
+         WHERE id = (
+             SELECT id
+             FROM machine_interface_addresses
+             WHERE interface_id = $2
+             ORDER BY id
+             LIMIT 1
+         )",
+    )
+    .bind(remote_ip)
+    .bind(competing_interface_id)
+    .execute(&env.pool)
+    .await?;
+    assert_eq!(updated.rows_affected(), 1);
+
+    blocker.commit().await?;
+    let status = tokio::time::timeout(std::time::Duration::from_secs(5), discovery)
+        .await
+        .expect("discovery did not finish after the segment lock was released")
+        .expect("discovery task panicked")
+        .expect_err("discovery must reject an IP mapping that became ambiguous");
+    assert_eq!(status.code(), Code::FailedPrecondition);
+    assert!(
+        status
+            .message()
+            .contains("machine interface identity changed")
+    );
+    Ok(())
+}
+
+#[crate::sqlx_test]
+async fn test_host_discovery_does_not_lock_unrelated_admin_segments(
+    pool: sqlx::PgPool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let env = create_test_env(pool).await;
+    let host_config = env.managed_host_config();
+    let dpu_machine_id = create_dpu_machine(&env, &host_config).await;
+    let host_interface_id = host_discover_dhcp(&env, &host_config, &dpu_machine_id).await;
+    let mut txn = env.pool.begin().await?;
+    let host_interface = db::machine_interface::find_one(&mut *txn, host_interface_id).await?;
+    txn.rollback().await?;
+
+    let unrelated_admin_segment = create_network_segment(
+        &env.api,
+        "UNRELATED_ADMIN",
+        "192.0.12.0/24",
+        "192.0.12.1",
+        rpc::forge::NetworkSegmentType::Admin,
+        None,
+        true,
+    )
+    .await;
+    let mut blocker = env.pool.begin().await?;
+    db::machine_interface::lock_network_segments_exclusive(
+        &mut blocker,
+        std::slice::from_ref(&unrelated_admin_segment),
+    )
+    .await?;
+
+    let secure_api = secure_api_for(&env);
+    let request = discovery_request_from(
+        &HardwareInfo::from(&host_config),
+        None,
+        host_interface.addresses[0],
+    );
+    let response = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        secure_api.discover_machine(request),
+    )
+    .await
+    .expect("host discovery waited for an unrelated Admin segment")?
+    .into_inner();
+    blocker.rollback().await?;
+
+    assert_eq!(response.machine_interface_id, Some(host_interface_id));
+    Ok(())
+}
+
+#[crate::sqlx_test]
 async fn test_secure_discovery_rejects_stable_host_identity_mismatch_without_mutation(
     pool: sqlx::PgPool,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -867,9 +1294,10 @@ async fn test_discovery_ip_lookup_rejects_missing_and_ambiguous_mappings(
         common::api_fixtures::dpu::dpu_discover_dhcp(&env, "02:00:00:00:10:02").await;
 
     let mut txn = env.pool.begin().await?;
-    let missing =
-        db::machine_interface::find_for_update_by_ip(&mut txn, "203.0.113.253".parse().unwrap())
-            .await;
+    let missing_ip = "203.0.113.253".parse().unwrap();
+    let missing = db::machine_interface::find_optional_unique_by_ip(&mut txn, missing_ip).await?;
+    assert!(missing.is_none());
+    let missing = db::machine_interface::find_for_update_by_ip(&mut txn, missing_ip).await;
     assert!(missing.is_err());
 
     let first_interface = db::machine_interface::find_one(&mut *txn, first_interface_id).await?;
@@ -880,6 +1308,9 @@ async fn test_discovery_ip_lookup_rejects_missing_and_ambiguous_mappings(
         .execute(&mut *txn)
         .await?;
 
+    let ambiguous =
+        db::machine_interface::find_optional_unique_by_ip(&mut txn, first_address).await;
+    assert!(ambiguous.is_err());
     let ambiguous = db::machine_interface::find_for_update_by_ip(&mut txn, first_address).await;
     assert!(ambiguous.is_err());
     Ok(())

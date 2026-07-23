@@ -347,7 +347,8 @@ async fn test_update_with_bmc_ip_assigns_to_empty_interface(
         }))
         .await?;
 
-    // Verify the interface now has the static IP.
+    // Verify the interface now has the static IP and its DNS identity was
+    // resynchronized from the formerly addressless state.
     let mut txn = env.api().database_connection.begin().await?;
     let addrs = db::machine_interface_address::find_for_interface(&mut txn, iface.id).await?;
     assert_eq!(addrs.len(), 1);
@@ -359,6 +360,13 @@ async fn test_update_with_bmc_ip_assigns_to_empty_interface(
         addrs[0].allocation_type,
         model::allocation_type::AllocationType::Static
     );
+    let interface = db::machine_interface::find_one(&mut *txn, iface.id).await?;
+    let segment =
+        db::network_segment::for_prefix_containing_address(&mut txn, "192.0.1.194".parse()?)
+            .await?
+            .unwrap();
+    assert_eq!(interface.hostname, "192-0-1-194");
+    assert_eq!(interface.domain_id, segment.config.subdomain_id);
 
     txn.rollback().await?;
 

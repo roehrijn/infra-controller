@@ -6159,6 +6159,29 @@ message IpxeTemplateList {
 }
 
 
+// Identifies which machine endpoint owns an entry in ExpectedMachine.host_nics.
+// The role controls interface behavior, not network-segment selection.
+//
+// Missing and EXPECTED_INTERFACE_ROLE_UNSPECIFIED preserve the legacy Host
+// behavior. Host BMC identity remains on ExpectedMachine.bmc_mac_address; it is
+// intentionally not represented here yet.
+enum ExpectedInterfaceRole {
+  EXPECTED_INTERFACE_ROLE_UNSPECIFIED = 0;
+  EXPECTED_INTERFACE_ROLE_HOST = 1;
+  EXPECTED_INTERFACE_ROLE_DPU_OS = 2;
+  EXPECTED_INTERFACE_ROLE_DPU_BMC = 3;
+}
+
+// Controls how an expected interface receives and retains its IP address.
+// Missing and EXPECTED_INTERFACE_IP_ALLOCATION_UNSPECIFIED preserve legacy
+// behavior: fixed_ip implies FIXED, while its absence implies DYNAMIC.
+enum ExpectedInterfaceIpAllocation {
+  EXPECTED_INTERFACE_IP_ALLOCATION_UNSPECIFIED = 0;
+  EXPECTED_INTERFACE_IP_ALLOCATION_DYNAMIC = 1;
+  EXPECTED_INTERFACE_IP_ALLOCATION_FIXED = 2;
+  EXPECTED_INTERFACE_IP_ALLOCATION_RETAINED = 3;
+}
+
 message ExpectedHostNic {
   string mac_address = 1;
   // Legacy free-form segment hint (bf3, onboard, oob, ...). Kept for backward
@@ -6177,12 +6200,18 @@ message ExpectedHostNic {
   // Some day this could be even possibly used to say "this dumb NIC
   // *is* the primary interface, even though I know I have a DPU."
   optional bool primary = 6;
-  // The network segment type this NIC's first DHCP lease should come from.
-  // A NIC's segment normally follows its DHCP relay; where segment prefixes
-  // nest or overlap and a relay matches several, this narrows the choice to
-  // the segment of this type. Supersedes nic_type; absent both, the relay's
-  // match stands.
+  // Optional guard for this interface's network segment type. For dynamic
+  // allocation, the DHCP relay selects candidates and this value narrows that
+  // set. For a fixed IP, prefix containment selects the segment and this value
+  // verifies its type. Supersedes nic_type for DHCP; absent both, relay-based
+  // DHCP selection remains unconstrained.
   optional NetworkSegmentType network_segment_type = 7;
+  // Machine endpoint that owns this interface. Missing values retain the
+  // legacy host-interface behavior.
+  optional ExpectedInterfaceRole role = 8;
+  // Optional allocation policy. When absent, fixed_ip implies FIXED and an
+  // interface without fixed_ip uses DYNAMIC allocation.
+  optional ExpectedInterfaceIpAllocation ip_allocation = 9;
 }
 
 // Forge RPC representation of the per-host policy for how NICo treats DPU

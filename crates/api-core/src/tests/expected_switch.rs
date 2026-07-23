@@ -18,13 +18,56 @@ use std::default::Default;
 
 use carbide_uuid::rack::RackId;
 use common::api_fixtures::create_test_env;
-use common::api_fixtures::site_explorer::create_expected_switches;
+use common::api_fixtures::site_explorer::{create_expected_switch, create_expected_switches};
 use mac_address::MacAddress;
 use rpc::forge::forge_server::Forge;
 use rpc::forge::{ExpectedSwitchList, ExpectedSwitchRequest};
 use rpc::forge_api_client::EXPECTED_SWITCH_UPDATE_MASK_HEADER;
 
 use crate::tests::common;
+
+async fn wait_for_expected_switch_advisory_lock_waiters(
+    pool: &sqlx::PgPool,
+    blocker_pid: i32,
+    expected_waiters: i64,
+) {
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let waiters = sqlx::query_scalar::<_, i64>(
+                "SELECT count(*)
+                 FROM pg_stat_activity
+                 WHERE datname = current_database()
+                   AND wait_event_type = 'Lock'
+                   AND wait_event = 'advisory'
+                   AND $1::integer = ANY(pg_blocking_pids(pid))",
+            )
+            .bind(blocker_pid)
+            .fetch_one(pool)
+            .await
+            .expect("inspect ExpectedSwitch advisory lock waiters");
+            if waiters >= expected_waiters {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("ExpectedSwitch replacement did not reach the advisory lock wait");
+}
+
+fn assert_lock_not_available(result: Result<(), db::DatabaseError>, context: &str) {
+    let Err(db::DatabaseError::Sqlx(error)) = result else {
+        panic!("{context}: expected an annotated database error");
+    };
+    let sqlx::Error::Database(error) = error.source else {
+        panic!("{context}: expected a PostgreSQL error");
+    };
+    assert_eq!(
+        error.code().as_deref(),
+        Some("55P03"),
+        "{context}: expected lock_not_available"
+    );
+}
 
 #[crate::sqlx_test()]
 async fn test_add_expected_switch(pool: sqlx::PgPool) {
@@ -216,6 +259,81 @@ async fn test_add_expected_switch_rejects_claimed_nvos_mac(pool: sqlx::PgPool) {
 }
 
 #[crate::sqlx_test]
+async fn test_concurrent_expected_switch_creates_reject_claimed_nvos_mac(
+    pool: sqlx::PgPool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let env = create_test_env(pool.clone()).await;
+    let nvos_mac = "4A:4B:4C:4D:4E:52";
+    let expected_switch = |bmc_mac: &str, serial: &str| rpc::forge::ExpectedSwitch {
+        expected_switch_id: None,
+        bmc_mac_address: bmc_mac.into(),
+        nvos_mac_addresses: vec![nvos_mac.into()],
+        bmc_username: "ADMIN".into(),
+        bmc_password: "PASS".into(),
+        switch_serial_number: serial.into(),
+        nvos_username: None,
+        nvos_password: None,
+        metadata: None,
+        rack_id: None,
+        bmc_ip_address: String::new(),
+        bmc_retain_credentials: None,
+        nvos_ip_address: None,
+    };
+
+    let mut blocker = pool.begin().await?;
+    let blocker_pid = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *blocker)
+        .await?;
+    db::expected_switch::lock_writes(&mut blocker).await?;
+
+    let first_api = env.api.clone();
+    let first = tokio::spawn(async move {
+        first_api
+            .add_expected_switch(tonic::Request::new(expected_switch(
+                "3A:3B:3C:3D:3E:52",
+                "SW-NVOS-CONCURRENT-001",
+            )))
+            .await
+    });
+    let second_api = env.api.clone();
+    let second = tokio::spawn(async move {
+        second_api
+            .add_expected_switch(tonic::Request::new(expected_switch(
+                "3A:3B:3C:3D:3E:53",
+                "SW-NVOS-CONCURRENT-002",
+            )))
+            .await
+    });
+    wait_for_expected_switch_advisory_lock_waiters(&pool, blocker_pid, 2).await;
+    blocker.commit().await?;
+
+    let results = [
+        first
+            .await
+            .expect("first ExpectedSwitch create task panicked"),
+        second
+            .await
+            .expect("second ExpectedSwitch create task panicked"),
+    ];
+    assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+    let errors = results
+        .iter()
+        .filter_map(|result| result.as_ref().err())
+        .collect::<Vec<_>>();
+    assert_eq!(errors.len(), 1);
+    assert_eq!(errors[0].code(), tonic::Code::FailedPrecondition);
+
+    let stored = env
+        .api
+        .get_all_expected_switches(tonic::Request::new(()))
+        .await?
+        .into_inner();
+    assert_eq!(stored.expected_switches.len(), 1);
+    assert_eq!(stored.expected_switches[0].nvos_mac_addresses, [nvos_mac]);
+    Ok(())
+}
+
+#[crate::sqlx_test]
 async fn test_update_expected_switch_rejects_claimed_nvos_mac(pool: sqlx::PgPool) {
     let env = create_test_env(pool.clone()).await;
 
@@ -284,6 +402,247 @@ async fn test_replace_all_expected_switches_rejects_intra_list_nvos_dup(pool: sq
         .await
         .expect_err("intra-list NVOS MAC duplicate should fail");
     assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+}
+
+#[crate::sqlx_test]
+async fn test_replace_all_expected_switches_rejects_invalid_nvos_pairing(pool: sqlx::PgPool) {
+    let env = create_test_env(pool.clone()).await;
+    let mut txn = pool.begin().await.unwrap();
+    create_expected_switch(&mut txn, 0).await;
+    txn.commit().await.unwrap();
+
+    let status = env
+        .api
+        .replace_all_expected_switches(tonic::Request::new(rpc::forge::ExpectedSwitchList {
+            expected_switches: vec![rpc::forge::ExpectedSwitch {
+                bmc_mac_address: "3A:3B:3C:3D:3E:62".into(),
+                bmc_username: "ADMIN".into(),
+                bmc_password: "PASS".into(),
+                switch_serial_number: "SW-REPLACE-INVALID".into(),
+                nvos_ip_address: Some("192.0.2.250".into()),
+                metadata: Some(rpc::forge::Metadata::default()),
+                ..Default::default()
+            }],
+        }))
+        .await
+        .expect_err("replace-all must reject an NVOS IP without one NVOS MAC");
+    assert_eq!(status.code(), tonic::Code::InvalidArgument);
+
+    let stored = env
+        .api
+        .get_all_expected_switches(tonic::Request::new(()))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(stored.expected_switches.len(), 1);
+}
+
+#[crate::sqlx_test]
+async fn test_replace_all_expected_switches_repairs_malformed_stored_nvos_pairing(
+    pool: sqlx::PgPool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let env = create_test_env(pool.clone()).await;
+    let bmc_mac: MacAddress = "3A:3B:3C:3D:3E:63".parse()?;
+    let retained_nvos_mac: MacAddress = "4A:4B:4C:4D:4E:63".parse()?;
+    let extra_nvos_mac: MacAddress = "4A:4B:4C:4D:4E:64".parse()?;
+    let nvos_ip: std::net::IpAddr = "192.0.1.179".parse()?;
+
+    let mut txn = pool.begin().await?;
+    db::expected_switch::create(
+        &mut txn,
+        model::expected_switch::ExpectedSwitch {
+            bmc_mac_address: bmc_mac,
+            nvos_mac_addresses: vec![retained_nvos_mac, extra_nvos_mac],
+            bmc_username: "ADMIN".into(),
+            bmc_password: "PASS".into(),
+            serial_number: "SW-MALFORMED-NVOS".into(),
+            nvos_ip_address: Some(nvos_ip),
+            ..Default::default()
+        },
+    )
+    .await?;
+    txn.commit().await?;
+
+    env.api
+        .replace_all_expected_switches(tonic::Request::new(rpc::forge::ExpectedSwitchList {
+            expected_switches: vec![rpc::forge::ExpectedSwitch {
+                bmc_mac_address: bmc_mac.to_string(),
+                nvos_mac_addresses: vec![retained_nvos_mac.to_string()],
+                bmc_username: "ADMIN".into(),
+                bmc_password: "PASS".into(),
+                switch_serial_number: "SW-REPAIRED-NVOS".into(),
+                nvos_ip_address: Some(nvos_ip.to_string()),
+                metadata: Some(rpc::forge::Metadata::default()),
+                ..Default::default()
+            }],
+        }))
+        .await?;
+
+    let mut txn = pool.begin().await?;
+    let stored = db::expected_switch::find_by_bmc_mac_address(&mut txn, bmc_mac)
+        .await?
+        .expect("repaired ExpectedSwitch should remain");
+    assert_eq!(stored.nvos_mac_addresses, [retained_nvos_mac]);
+    assert!(
+        db::machine_interface::find_by_mac_address(&mut *txn, retained_nvos_mac)
+            .await?
+            .is_empty(),
+        "bulk replacement should defer interface materialization"
+    );
+    txn.rollback().await?;
+    Ok(())
+}
+
+#[crate::sqlx_test]
+async fn test_replace_all_expected_switches_locks_old_and_new_macs_together(
+    pool: sqlx::PgPool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let env = create_test_env(pool.clone()).await;
+    let old_bmc_mac: MacAddress = "10:00:00:00:00:01".parse()?;
+    let new_bmc_mac: MacAddress = "20:00:00:00:00:01".parse()?;
+    let blocker_mac: MacAddress = "F0:00:00:00:00:01".parse()?;
+
+    env.api
+        .add_expected_switch(tonic::Request::new(rpc::forge::ExpectedSwitch {
+            bmc_mac_address: old_bmc_mac.to_string(),
+            bmc_username: "ADMIN".into(),
+            bmc_password: "PASS".into(),
+            switch_serial_number: "SW-REPLACE-OLD".into(),
+            nvos_mac_addresses: vec!["11:00:00:00:00:01".into()],
+            metadata: Some(rpc::forge::Metadata::default()),
+            ..Default::default()
+        }))
+        .await?;
+
+    let mut blocker = pool.begin().await?;
+    let blocker_pid = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *blocker)
+        .await?;
+    db::machine_interface::lock_expected_machine_interface_macs(&mut blocker, [blocker_mac])
+        .await?;
+
+    let replace_api = env.api.clone();
+    let replace = tokio::spawn(async move {
+        replace_api
+            .replace_all_expected_switches(tonic::Request::new(rpc::forge::ExpectedSwitchList {
+                expected_switches: vec![rpc::forge::ExpectedSwitch {
+                    bmc_mac_address: new_bmc_mac.to_string(),
+                    bmc_username: "ADMIN".into(),
+                    bmc_password: "PASS".into(),
+                    switch_serial_number: "SW-REPLACE-NEW".into(),
+                    nvos_mac_addresses: vec![blocker_mac.to_string()],
+                    metadata: Some(rpc::forge::Metadata::default()),
+                    ..Default::default()
+                }],
+            }))
+            .await
+    });
+    wait_for_expected_switch_advisory_lock_waiters(&pool, blocker_pid, 1).await;
+
+    for (name, mac_address) in [("old", old_bmc_mac), ("new", new_bmc_mac)] {
+        let mut contender = pool.begin().await?;
+        sqlx::query("SET LOCAL lock_timeout = '250ms'")
+            .execute(&mut *contender)
+            .await?;
+        let result = db::machine_interface::lock_expected_machine_interface_macs(
+            &mut contender,
+            [mac_address],
+        )
+        .await;
+        assert_lock_not_available(
+            result,
+            &format!("ExpectedSwitch replacement did not hold its {name} MAC lock"),
+        );
+        contender.rollback().await?;
+    }
+
+    let mut row_probe = pool.begin().await?;
+    sqlx::query(
+        "SELECT bmc_mac_address
+         FROM expected_switches
+         WHERE bmc_mac_address = $1
+         FOR UPDATE NOWAIT",
+    )
+    .bind(old_bmc_mac)
+    .fetch_one(&mut *row_probe)
+    .await
+    .expect("ExpectedSwitch replacement cleared rows before locking every replacement MAC");
+    row_probe.rollback().await?;
+
+    blocker.commit().await?;
+    tokio::time::timeout(std::time::Duration::from_secs(5), replace)
+        .await
+        .expect("ExpectedSwitch replacement did not resume")
+        .expect("ExpectedSwitch replacement task panicked")?;
+    Ok(())
+}
+
+#[crate::sqlx_test]
+async fn test_replace_all_expected_switches_defers_static_interface_materialization(
+    pool: sqlx::PgPool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let env = create_test_env(pool.clone()).await;
+    let bmc_mac: MacAddress = "32:00:00:00:00:01".parse()?;
+    let nvos_mac: MacAddress = "33:00:00:00:00:01".parse()?;
+    let bmc_ip: std::net::IpAddr = "192.0.1.182".parse()?;
+    let nvos_ip: std::net::IpAddr = "192.0.1.183".parse()?;
+
+    env.api
+        .replace_all_expected_switches(tonic::Request::new(rpc::forge::ExpectedSwitchList {
+            expected_switches: vec![rpc::forge::ExpectedSwitch {
+                bmc_mac_address: bmc_mac.to_string(),
+                bmc_username: "ADMIN".into(),
+                bmc_password: "PASS".into(),
+                switch_serial_number: "SW-REPLACE-NEW-STATIC".into(),
+                nvos_mac_addresses: vec![nvos_mac.to_string()],
+                bmc_ip_address: bmc_ip.to_string(),
+                nvos_ip_address: Some(nvos_ip.to_string()),
+                metadata: Some(rpc::forge::Metadata::default()),
+                ..Default::default()
+            }],
+        }))
+        .await?;
+
+    let mut txn = pool.begin().await?;
+    for mac_address in [bmc_mac, nvos_mac] {
+        assert!(
+            db::machine_interface::find_by_mac_address(&mut *txn, mac_address)
+                .await?
+                .is_empty(),
+            "new ExpectedSwitch identities should keep add's deferred materialization"
+        );
+    }
+    txn.rollback().await?;
+
+    let transferred_bmc_mac: MacAddress = "34:00:00:00:00:01".parse()?;
+    let transferred_bmc_ip: std::net::IpAddr = "192.0.1.184".parse()?;
+    env.api
+        .replace_all_expected_switches(tonic::Request::new(rpc::forge::ExpectedSwitchList {
+            expected_switches: vec![rpc::forge::ExpectedSwitch {
+                bmc_mac_address: transferred_bmc_mac.to_string(),
+                bmc_username: "ADMIN".into(),
+                bmc_password: "PASS".into(),
+                switch_serial_number: "SW-REPLACE-TRANSFERRED-STATIC".into(),
+                nvos_mac_addresses: vec![nvos_mac.to_string()],
+                bmc_ip_address: transferred_bmc_ip.to_string(),
+                nvos_ip_address: Some(nvos_ip.to_string()),
+                metadata: Some(rpc::forge::Metadata::default()),
+                ..Default::default()
+            }],
+        }))
+        .await?;
+
+    let mut txn = pool.begin().await?;
+    for mac_address in [bmc_mac, transferred_bmc_mac, nvos_mac] {
+        assert!(
+            db::machine_interface::find_by_mac_address(&mut *txn, mac_address)
+                .await?
+                .is_empty(),
+            "bulk replacement should not materialize static interfaces"
+        );
+    }
+    txn.rollback().await?;
+    Ok(())
 }
 
 #[crate::sqlx_test]

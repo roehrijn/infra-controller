@@ -208,7 +208,7 @@ pub struct Args {
         long = "host_nics",
         value_name = "HOST_NICS",
         group = "group",
-        help = "Host NICs as a JSON array of ExpectedHostNic objects (fields: mac_address, network_segment_type, fixed_ip, fixed_mask, fixed_gateway, primary; legacy: nic_type). Replaces the machine's full host NIC list."
+        help = "Host NICs as a JSON array of ExpectedHostNic objects (fields: mac_address, role, ip_allocation, network_segment_type, fixed_ip, fixed_mask, fixed_gateway, primary; legacy: nic_type). Replaces the machine's full host NIC list."
     )]
     pub host_nics: Option<String>,
 

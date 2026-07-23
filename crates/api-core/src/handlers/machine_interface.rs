@@ -84,7 +84,10 @@ pub(crate) async fn delete_interface(
         return Err(CarbideError::MissingArgument("delete interface.interface_id").into());
     };
 
-    let interface = db::machine_interface::find_one(&mut txn, id).await?;
+    let prepared = db::machine_interface::prepare_delete(&mut txn, id)
+        .await?
+        .ok_or_else(|| db::DatabaseError::FindOneReturnedNoResultsError(id.into()))?;
+    let interface = prepared.interface();
 
     // There should not be any machine associated with this interface.
     if let Some(machine_id) = interface.machine_id {
@@ -114,7 +117,7 @@ pub(crate) async fn delete_interface(
         }
     }
 
-    db::machine_interface::delete(&interface.id, &mut txn).await?;
+    db::machine_interface::delete_prepared(prepared, &mut txn).await?;
 
     txn.commit().await?;
 

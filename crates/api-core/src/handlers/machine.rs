@@ -22,11 +22,12 @@ use ::rpc::forge as rpc;
 use ::rpc::model::machine::ManagedHostStateSnapshotRpc;
 use carbide_redfish::libredfish::RedfishAuth;
 use carbide_secrets::credentials::{BmcCredentialType, CredentialKey, Credentials};
-use carbide_uuid::machine::MachineId;
+use carbide_uuid::machine::{MachineId, MachineInterfaceId};
 use libredfish::SystemPowerControl;
 use model::hardware_info::MachineNvLinkInfo;
 use model::machine::machine_search_config::MachineSearchConfig;
 use model::machine::{LoadSnapshotOptions, Machine, ManagedHostState, ManagedHostStateSnapshot};
+use model::machine_interface::InterfaceType;
 use model::metadata::Metadata;
 use tonic::{Request, Response, Status};
 
@@ -329,6 +330,75 @@ pub(crate) async fn update_machine_metadata(
     Ok(tonic::Response::new(()))
 }
 
+async fn delete_prepared_machine_interfaces(
+    txn: &mut db::Transaction<'_>,
+    prepared_interfaces: &mut HashMap<
+        MachineInterfaceId,
+        db::machine_interface::PreparedMachineInterfaceDelete,
+    >,
+    machine_id: MachineId,
+) -> Result<(), CarbideError> {
+    let interface_ids = prepared_interfaces
+        .iter()
+        .filter_map(|(interface_id, prepared)| {
+            let interface = prepared.interface();
+            (interface.interface_type != InterfaceType::Bmc
+                && interface.machine_id == Some(machine_id))
+            .then_some(*interface_id)
+        })
+        .collect::<Vec<_>>();
+    for interface_id in interface_ids {
+        let prepared = prepared_interfaces.remove(&interface_id).ok_or_else(|| {
+            CarbideError::FailedPrecondition(format!(
+                "machine interface {interface_id} changed while preparing force deletion; retry the request",
+            ))
+        })?;
+        db::machine_interface::delete_prepared(prepared, txn.as_pgconn()).await?;
+    }
+    Ok(())
+}
+
+async fn revalidate_force_delete_machine_group(
+    txn: &mut db::Transaction<'_>,
+    host_machine: Option<&Machine>,
+    dpu_machines: &[Machine],
+) -> Result<(), CarbideError> {
+    let changed = if let Some(host_machine) = host_machine {
+        let mut preview_dpu_ids = dpu_machines
+            .iter()
+            .map(|machine| machine.id)
+            .collect::<Vec<_>>();
+        preview_dpu_ids.sort_unstable();
+        preview_dpu_ids.dedup();
+        let mut current_dpu_ids =
+            db::machine::find_dpus_by_host_machine_id(txn.as_pgconn(), &host_machine.id)
+                .await?
+                .into_iter()
+                .map(|machine| machine.id)
+                .collect::<Vec<_>>();
+        current_dpu_ids.sort_unstable();
+        current_dpu_ids.dedup();
+        current_dpu_ids != preview_dpu_ids
+    } else {
+        let Some(dpu_machine) = dpu_machines.first() else {
+            return Err(CarbideError::FailedPrecondition(
+                "machine group changed while preparing force deletion; retry the request"
+                    .to_string(),
+            ));
+        };
+        dpu_machines.len() != 1
+            || db::machine::find_host_by_dpu_machine_id(txn.as_pgconn(), &dpu_machine.id)
+                .await?
+                .is_some()
+    };
+    if changed {
+        return Err(CarbideError::FailedPrecondition(
+            "machine group changed while preparing force deletion; retry the request".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) async fn admin_force_delete_machine(
     api: &Api,
     request: Request<rpc::AdminForceDeleteMachineRequest>,
@@ -469,6 +539,13 @@ pub(crate) async fn admin_force_delete_machine(
 
     // So far we only inspected state - now we start the deletion process
     // TODO: In the new model we might just need to move one Machine to this state
+    let machine_ids = host_machine
+        .iter()
+        .chain(dpu_machines.iter())
+        .map(|machine| machine.id)
+        .collect::<Vec<_>>();
+    db::machine::lock_force_deletion_targets(&mut txn, &machine_ids).await?;
+    revalidate_force_delete_machine_group(&mut txn, host_machine.as_ref(), &dpu_machines).await?;
     if let Some(host_machine) = &host_machine {
         db::machine::advance(
             host_machine,
@@ -641,22 +718,10 @@ pub(crate) async fn admin_force_delete_machine(
     let mut txn = api.txn_begin().await?;
     let mut machines_to_clear_credentials = Vec::new();
 
-    // Advisory-lock the admin segments before any row locks so the deletion
-    // follows the allocator lock order -- segment advisory lock first, then
-    // machine interface/address rows (the convention
-    // `reconcile_admin_addresses_for_host` documents). This serializes the
-    // deletion against the allocator, reconcile, and discovery transactions
-    // that hold those locks while they touch interface rows, so the two
-    // sides can't hold segment locks and interface rows in opposite orders.
-    // All admin segments, rather than a set computed from this machine's
-    // interfaces: the snapshots predate the BMC work above, and they omit
-    // BMC-typed interfaces that `force_cleanup` still row-locks.
-    db::machine_interface::lock_all_admin_segments(&mut txn).await?;
-
-    // Clean up the explored tables next, in site-explorer's write order
-    // (`explored_managed_hosts`, then `explored_endpoints`, then interface
-    // rows), so this delete and a concurrent exploration pass can't hold the
-    // same tables in opposite orders.
+    // Clean up the explored tables first, in site-explorer's write order
+    // (`explored_managed_hosts`, then `explored_endpoints`). Interface and
+    // allocator locks come afterward, so this delete and a concurrent
+    // exploration pass cannot hold the same tables in opposite orders.
     if let Some(machine) = &host_machine
         && let Some(addr) = machine.status.bmc_info.ip
     {
@@ -686,27 +751,75 @@ pub(crate) async fn admin_force_delete_machine(
         db::explored_endpoints::delete(&mut txn, addr).await?;
     }
 
+    // `ForceDeletion` is already committed, and every production machine
+    // association helper checks that state under a shared machine-row lock.
+    // The association set is therefore stable while this transaction moves
+    // from explored-table cleanup into allocator and interface locks.
+    let mut affected_interface_ids =
+        db::machine_interface::find_ids_by_machine_associations(&mut txn, &machine_ids).await?;
+
+    let mut bmc_interface_ids = HashMap::new();
+    if request.delete_bmc_interfaces {
+        for bmc_ip in host_machine
+            .iter()
+            .chain(dpu_machines.iter())
+            .filter_map(|machine| machine.status.bmc_info.ip)
+        {
+            if let Some(interface) = db::machine_interface::find_by_ip(&mut txn, bmc_ip).await? {
+                affected_interface_ids.push(interface.id);
+                bmc_interface_ids.insert(bmc_ip, interface.id);
+            }
+        }
+    }
+    affected_interface_ids.sort_unstable();
+    affected_interface_ids.dedup();
+
+    // Batch preparation takes all MAC locks first, every Admin and current
+    // interface segment next, then address keys and rows. Keeping the
+    // prepared values lets deletion consume the exact rows revalidated under
+    // those locks.
+    let admin_segment_ids = db::network_segment::list_segment_ids(
+        &mut txn,
+        Some(model::network_segment::NetworkSegmentType::Admin),
+    )
+    .await?;
+    let mut prepared_interfaces = db::machine_interface::prepare_deletes_with_exclusive_segments(
+        &mut txn,
+        &affected_interface_ids,
+        &admin_segment_ids,
+    )
+    .await?
+    .into_iter()
+    .map(|prepared| (prepared.interface().id, prepared))
+    .collect::<HashMap<_, _>>();
+    if prepared_interfaces.len() != affected_interface_ids.len() {
+        return Err(CarbideError::FailedPrecondition(
+            "machine interfaces changed while preparing force deletion; retry the request"
+                .to_string(),
+        )
+        .into());
+    }
+
     if let Some(machine) = &host_machine {
         if request.delete_bmc_interfaces
             && let Some(bmc_ip) = machine.status.bmc_info.ip
         {
             response.host_bmc_interface_associated = true;
-            if db::machine_interface::delete_by_ip(&mut txn, bmc_ip)
-                .await?
-                .is_some()
-            {
+            if let Some(interface_id) = bmc_interface_ids.remove(&bmc_ip) {
+                let prepared = prepared_interfaces.remove(&interface_id).ok_or_else(|| {
+                    CarbideError::FailedPrecondition(format!(
+                        "machine interface {interface_id} changed while preparing force deletion; retry the request",
+                    ))
+                })?;
+                db::machine_interface::delete_prepared(prepared, &mut txn).await?;
                 response.host_bmc_interface_deleted = true;
             }
         }
         db::machine::force_cleanup(&mut txn, &machine.id).await?;
 
         if request.delete_interfaces {
-            for interface in &machine.status.interfaces {
-                // The delete retains each row's boot interface pair in
-                // `retained_boot_interfaces`, so a re-ingested machine
-                // recovers its boot target before its first DHCP.
-                db::machine_interface::delete(&interface.id, &mut txn).await?;
-            }
+            delete_prepared_machine_interfaces(&mut txn, &mut prepared_interfaces, machine.id)
+                .await?;
             response.host_interfaces_deleted = true;
         }
 
@@ -767,10 +880,13 @@ pub(crate) async fn admin_force_delete_machine(
             && let Some(bmc_ip) = dpu_machine.status.bmc_info.ip
         {
             response.dpu_bmc_interface_associated = true;
-            if db::machine_interface::delete_by_ip(&mut txn, bmc_ip)
-                .await?
-                .is_some()
-            {
+            if let Some(interface_id) = bmc_interface_ids.remove(&bmc_ip) {
+                let prepared = prepared_interfaces.remove(&interface_id).ok_or_else(|| {
+                    CarbideError::FailedPrecondition(format!(
+                        "machine interface {interface_id} changed while preparing force deletion; retry the request",
+                    ))
+                })?;
+                db::machine_interface::delete_prepared(prepared, &mut txn).await?;
                 response.dpu_bmc_interface_deleted = true;
             }
         }
@@ -781,9 +897,8 @@ pub(crate) async fn admin_force_delete_machine(
         db::machine::force_cleanup(&mut txn, &dpu_machine.id).await?;
 
         if request.delete_interfaces {
-            for interface in &dpu_machine.status.interfaces {
-                db::machine_interface::delete(&interface.id, &mut txn).await?;
-            }
+            delete_prepared_machine_interfaces(&mut txn, &mut prepared_interfaces, dpu_machine.id)
+                .await?;
             response.dpu_interfaces_deleted = true;
         }
 

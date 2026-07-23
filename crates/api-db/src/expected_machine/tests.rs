@@ -15,7 +15,7 @@
  * limitations under the License.
  */
 
-use model::expected_machine::{ExpectedMachineData, HostDpuPolicy};
+use model::expected_machine::{ExpectedHostNic, ExpectedMachineData, HostDpuPolicy};
 use model::metadata::Metadata;
 
 use super::*;
@@ -82,6 +82,95 @@ async fn test_lookup_by_mac(pool: sqlx::PgPool) -> Result<(), Box<dyn std::error
             .serial_number,
         "VVG121GG"
     );
+    Ok(())
+}
+
+#[crate::sqlx_test]
+async fn test_host_mac_lookup_rejects_duplicate_declarations_within_one_legacy_row(
+    pool: sqlx::PgPool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let interface_mac = "0a:0b:0c:0d:0e:10".parse()?;
+    let mut txn = pool.begin().await?;
+    db::expected_machine::create(
+        &mut txn,
+        ExpectedMachine {
+            id: None,
+            bmc_mac_address: "0a:0b:0c:0d:0e:11".parse()?,
+            data: ExpectedMachineData {
+                bmc_username: "ADMIN".into(),
+                bmc_password: "PASS".into(),
+                serial_number: "LEGACY-DUPLICATE-NESTED-MAC".into(),
+                host_nics: vec![
+                    ExpectedHostNic {
+                        mac_address: interface_mac,
+                        ..Default::default()
+                    },
+                    ExpectedHostNic {
+                        mac_address: interface_mac,
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            },
+        },
+    )
+    .await?;
+
+    let error = match db::expected_machine::find_by_host_mac_address(&mut txn, interface_mac).await
+    {
+        Ok(_) => panic!("ambiguous legacy declarations must not select one interface"),
+        Err(error) => error,
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("multiple ExpectedMachine interface declarations"),
+    );
+    txn.rollback().await?;
+    Ok(())
+}
+
+#[crate::sqlx_test]
+async fn test_host_mac_lookup_rejects_duplicate_declarations_across_legacy_rows(
+    pool: sqlx::PgPool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let interface_mac = "0a:0b:0c:0d:0e:20".parse()?;
+    let mut txn = pool.begin().await?;
+    for (bmc_mac_address, serial_number) in [
+        ("0a:0b:0c:0d:0e:21", "LEGACY-DUPLICATE-OWNER-A"),
+        ("0a:0b:0c:0d:0e:22", "LEGACY-DUPLICATE-OWNER-B"),
+    ] {
+        db::expected_machine::create(
+            &mut txn,
+            ExpectedMachine {
+                id: None,
+                bmc_mac_address: bmc_mac_address.parse()?,
+                data: ExpectedMachineData {
+                    bmc_username: "ADMIN".into(),
+                    bmc_password: "PASS".into(),
+                    serial_number: serial_number.into(),
+                    host_nics: vec![ExpectedHostNic {
+                        mac_address: interface_mac,
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+            },
+        )
+        .await?;
+    }
+
+    let error = match db::expected_machine::find_by_host_mac_address(&mut txn, interface_mac).await
+    {
+        Ok(_) => panic!("ambiguous legacy declarations must not select one owner"),
+        Err(error) => error,
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("multiple ExpectedMachine interface declarations"),
+    );
+    txn.rollback().await?;
     Ok(())
 }
 
