@@ -118,6 +118,7 @@ func (c *Client) applyInsecureTLS() {
 		transport.TLSClientConfig = &tls.Config{}
 	}
 	transport.TLSClientConfig.InsecureSkipVerify = true //nolint:gosec // Intentional for dev/test with self-signed certs
+	transport.TLSClientConfig.MinVersion = tls.VersionTLS12
 
 	c.httpClient.Transport = transport
 }

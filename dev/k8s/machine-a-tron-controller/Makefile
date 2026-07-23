@@ -1,9 +1,11 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-.PHONY: build test test-coverage lint fmt docker-build docker-build-latest clean run verify
+.PHONY: all build test test-coverage lint fmt docker-build docker-build-latest clean run verify
 
 TAG ?= dev
+
+all: build
 
 build:
 	@mkdir -p bin

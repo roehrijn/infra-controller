@@ -68,7 +68,7 @@ Created Services have:
 ```bash
 make build
 make test
-make run KUBECONFIG=~/.kube/config
+make run KUBECONFIG="$HOME/.kube/config"
 ```
 
 ## Troubleshooting

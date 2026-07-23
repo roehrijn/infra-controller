@@ -12,6 +12,7 @@ package main
 import (
 	"context"
 	"flag"
+	"fmt"
 	"os"
 	"os/signal"
 	"strconv"
@@ -48,6 +49,12 @@ func main() {
 		"Port number for bmc-mock service")
 
 	flag.Parse()
+
+	// Validate sync interval
+	if *syncInterval <= 0 {
+		fmt.Fprintf(os.Stderr, "error: sync-interval must be positive, got %v\n", *syncInterval)
+		os.Exit(1)
+	}
 
 	// Setup logger
 	level, err := zerolog.ParseLevel(*logLevel)

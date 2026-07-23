@@ -2045,6 +2045,8 @@ jobs:
       - security-secret-scan
       - lint-police
       - check-rest-core-proto-sync
+      - build-machine-a-tron
+      - build-mat-k8s-controller
     steps:
       - name: Decide pass/fail
         env:
