@@ -16,6 +16,7 @@ Machine-a-tron itself remains Kubernetes-agnostic. This controller bridges the g
 - Creates one Service per mock BMC (hosts and DPUs)
 - Exposes Redfish TCP (port 443 → internal listen port)
 - Exposes IPMI UDP when enabled (port 623 → internal listen port)
+- Uses BMC IP directly as Service ClusterIP
 - Labels and annotates Services with machine/BMC identity
 - Updates Services when machine status changes
 - Deletes stale Services when machines disappear
@@ -43,7 +44,47 @@ kind load docker-image mat-k8s-controller:latest --name <cluster>
 | `--target-selector` | `TARGET_SELECTOR` | `app.kubernetes.io/name=nico-machine-a-tron` | Pod selector |
 | `--insecure-skip-verify` | `INSECURE_SKIP_VERIFY` | `true` | Skip TLS verification |
 | `--log-level` | `LOG_LEVEL` | `info` | Log level |
-| `--cluster-ip-prefix` | `CLUSTER_IP_PREFIX` | (none) | Static ClusterIP prefix |
+
+## ClusterIP Assignment
+
+The controller uses BMC IP directly as Service ClusterIP. This requires machine-a-tron's
+`oobDhcpRelayAddress` to be within the Kubernetes ServiceCIDR range.
+
+### Setup
+
+1. Configure machine-a-tron with `oobDhcpRelayAddress` from K8s ServiceCIDR:
+   ```yaml
+   pods:
+     pod-0:
+       machines:
+         compute:
+           oobDhcpRelayAddress: "10.100.0.1"  # Must be in K8s ServiceCIDR
+   ```
+
+2. Add the network to NICo configuration:
+   ```toml
+   [networks.MAT-BMC-SERVICES]
+   type = "underlay"
+   prefix = "10.100.0.0/20"
+   ```
+
+3. Result: BMC IP `10.100.0.5` → Service ClusterIP `10.100.0.5`
+
+### CIDR Reservation (Recommended)
+
+To avoid conflicts with other Services, reserve a CIDR range for machine-a-tron.
+Kubernetes 1.29+ supports multiple ServiceCIDRs with the `MultiCIDRServiceAllocator`
+feature gate:
+
+```yaml
+apiVersion: networking.k8s.io/v1beta1
+kind: ServiceCIDR
+metadata:
+  name: machine-a-tron
+spec:
+  cidrs:
+    - 10.100.0.0/16
+```
 
 ## Helm Deployment
 
@@ -54,7 +95,6 @@ manages BMC Services instead of static Helm-generated ones.
 helm upgrade --install nico-machine-a-tron ./helm/charts/nico-machine-a-tron \
   --namespace nico-system \
   --create-namespace \
-  --set machineATron.enableIpmiSimulation=true \
   --set mat-k8s-controller.enabled=true \
   --set mat-k8s-controller.image.pullPolicy=Never
 ```
@@ -91,6 +131,57 @@ go test ./...
 # Run locally
 ./mat-k8s-controller --kubeconfig ~/.kube/config --mat-url https://localhost:1266
 ```
+
+## Troubleshooting
+
+### ClusterIP already allocated
+
+**Error:**
+```
+creating service mat-bmc-host-xxxxx: Service "mat-bmc-host-xxxxx" is invalid: 
+spec.clusterIP: Invalid value: "10.100.0.5": provided IP is already allocated
+```
+
+**Cause:** Another Service is using the same ClusterIP. This happens when the
+BMC IP range overlaps with Kubernetes' auto-allocated ClusterIPs.
+
+**Solutions:**
+
+1. **Reserve a ServiceCIDR** (Kubernetes 1.29+, recommended for production):
+   ```yaml
+   apiVersion: networking.k8s.io/v1beta1
+   kind: ServiceCIDR
+   metadata:
+     name: machine-a-tron
+   spec:
+     cidrs:
+       - 10.100.0.0/16
+   ```
+
+2. **Use a different CIDR range** in machine-a-tron `oobDhcpRelayAddress` that
+   doesn't overlap with existing Services.
+
+3. **Delete the conflicting Service** if it's no longer needed:
+   ```bash
+   kubectl get svc -A -o wide | grep 10.100.0.5
+   kubectl delete svc <conflicting-service> -n <namespace>
+   ```
+
+**Impact:** The affected machine's BMC Service is not created. In NICo site-explorer,
+the machine appears unhealthy until the conflict is resolved.
+
+### BMC IP outside ServiceCIDR
+
+**Error:**
+```
+creating service mat-bmc-host-xxxxx: Service "mat-bmc-host-xxxxx" is invalid:
+spec.clusterIP: Invalid value: "192.168.100.5": provided IP is not in the valid range
+```
+
+**Cause:** Machine-a-tron's `oobDhcpRelayAddress` is not within Kubernetes ServiceCIDR.
+
+**Solution:** Update `oobDhcpRelayAddress` to use IPs from K8s ServiceCIDR (default
+`10.96.0.0/12` for kind/k3d clusters).
 
 ## Architecture
 

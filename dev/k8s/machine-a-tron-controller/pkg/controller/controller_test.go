@@ -184,13 +184,12 @@ func TestServiceBuilder_BuildService_DPU(t *testing.T) {
 	assert.Equal(t, "parent-host-uuid", svc.Labels[LabelParentMatID])
 }
 
-func TestServiceBuilder_BuildService_StaticClusterIP(t *testing.T) {
+func TestServiceBuilder_BuildService_BMCIPAsClusterIP(t *testing.T) {
 	builder := &ServiceBuilder{
 		Namespace: "test-ns",
 		TargetSelector: map[string]string{
 			"app": "machine-a-tron",
 		},
-		ClusterIPPrefix: "10.96",
 	}
 
 	machine := &matclient.MachineStatus{
@@ -198,7 +197,7 @@ func TestServiceBuilder_BuildService_StaticClusterIP(t *testing.T) {
 		APIState:   "Ready",
 		PowerState: "On",
 		BMC: matclient.BMCStatus{
-			IP: ptr("172.20.0.20"),
+			IP: ptr("10.100.0.20"),
 			Redfish: matclient.EndpointStatus{
 				ReachablePort: 443,
 				ListenPort:    8443,
@@ -208,8 +207,8 @@ func TestServiceBuilder_BuildService_StaticClusterIP(t *testing.T) {
 
 	svc := builder.BuildService(machine, MachineTypeHost, "")
 
-	// Check static ClusterIP was set
-	assert.Equal(t, "10.96.0.20", svc.Spec.ClusterIP)
+	// Check BMC IP is used directly as ClusterIP
+	assert.Equal(t, "10.100.0.20", svc.Spec.ClusterIP)
 }
 
 func TestServiceBuilder_BuildServicesFromStatus(t *testing.T) {

@@ -22,11 +22,9 @@ resources:
 
 ## Controller configuration
 config:
-  ## Machine-a-tron URL (optional)
   ## Default: https://<release-name>-bmc-mock.<namespace>.svc.cluster.local:1266
   matUrl: ""
 
-  ## Target selector for Services (optional)
   ## Default: app.kubernetes.io/name=nico-machine-a-tron
   targetSelector: ""
 
@@ -39,17 +37,11 @@ config:
   ## Log level (debug, info, warn, error)
   logLevel: "info"
 
-  ## Optional: Prefix for static ClusterIP assignment
-  ## Leave empty for Kubernetes auto-assigned ClusterIPs
-  clusterIpPrefix: ""
-
-## Service account configuration
 serviceAccount:
   create: true
   name: ""
   annotations: {}
 
-## RBAC configuration
 rbac:
   create: true
 

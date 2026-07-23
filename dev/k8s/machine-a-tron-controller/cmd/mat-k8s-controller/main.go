@@ -39,8 +39,6 @@ func main() {
 		"Path to kubeconfig (uses in-cluster config if empty)")
 	targetSelector := flag.String("target-selector", envOrDefault("TARGET_SELECTOR", "app.kubernetes.io/name=nico-machine-a-tron"),
 		"Pod selector for Services (comma-separated key=value pairs)")
-	clusterIPPrefix := flag.String("cluster-ip-prefix", os.Getenv("CLUSTER_IP_PREFIX"),
-		"Prefix for static ClusterIP assignment (e.g., 10.96)")
 	insecureSkipVerify := flag.Bool("insecure-skip-verify", envBoolOrDefault("INSECURE_SKIP_VERIFY", true),
 		"Skip TLS certificate verification (for self-signed certs)")
 	logLevel := flag.String("log-level", envOrDefault("LOG_LEVEL", "info"),
@@ -65,7 +63,6 @@ func main() {
 		Str("namespace", *namespace).
 		Dur("sync_interval", *syncInterval).
 		Str("target_selector", *targetSelector).
-		Str("cluster_ip_prefix", *clusterIPPrefix).
 		Bool("insecure_skip_verify", *insecureSkipVerify).
 		Msg("starting controller")
 
@@ -101,9 +98,8 @@ func main() {
 
 	// Create service builder
 	builder := &controller.ServiceBuilder{
-		Namespace:       *namespace,
-		TargetSelector:  selector,
-		ClusterIPPrefix: *clusterIPPrefix,
+		Namespace:      *namespace,
+		TargetSelector: selector,
 	}
 
 	// Create reconciler

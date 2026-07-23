@@ -28,9 +28,6 @@ spec:
             - --insecure-skip-verify={{ .Values.config.insecureSkipVerify }}
             - --log-level={{ .Values.config.logLevel }}
             - --target-selector={{ include "mat-k8s-controller.targetSelector" . }}
-            {{- if .Values.config.clusterIpPrefix }}
-            - --cluster-ip-prefix={{ .Values.config.clusterIpPrefix }}
-            {{- end }}
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
           securityContext:

@@ -63,10 +63,6 @@ type ServiceBuilder struct {
 	// TargetSelector is the pod selector that Services should target.
 	// This should match the machine-a-tron pod labels.
 	TargetSelector map[string]string
-	// ClusterIPPrefix is a prefix for static ClusterIP assignment.
-	// If set along with BMC IP, Services get predictable IPs.
-	// Format: "10.96.{last-two-octets-of-bmc-ip}"
-	ClusterIPPrefix string
 }
 
 // BuildServiceName generates a consistent service name for a machine.
@@ -147,12 +143,10 @@ func (b *ServiceBuilder) BuildService(machine *matclient.MachineStatus, machineT
 		},
 	}
 
-	// Set static ClusterIP if configured and BMC IP is known
-	if b.ClusterIPPrefix != "" && machine.BMC.IP != nil {
-		clusterIP := buildStaticClusterIP(b.ClusterIPPrefix, *machine.BMC.IP)
-		if clusterIP != "" {
-			svc.Spec.ClusterIP = clusterIP
-		}
+	// Use BMC IP directly as ClusterIP
+	// Requires machine-a-tron oobDhcpRelayAddress to be within K8s ServiceCIDR
+	if machine.BMC.IP != nil {
+		svc.Spec.ClusterIP = *machine.BMC.IP
 	}
 
 	return svc
@@ -178,21 +172,6 @@ func (b *ServiceBuilder) BuildServicesFromStatus(status *matclient.MachinesStatu
 	}
 
 	return services
-}
-
-// buildStaticClusterIP constructs a ClusterIP from a prefix and BMC IP.
-// For example, with prefix "10.96" and bmcIP "172.20.0.20",
-// it produces "10.96.0.20" (uses last two octets of BMC IP).
-func buildStaticClusterIP(prefix, bmcIP string) string {
-	// Parse last two octets from BMC IP
-	// This is a simple implementation; production might need more robust parsing
-	var a, b, c, d int
-	n, err := fmt.Sscanf(bmcIP, "%d.%d.%d.%d", &a, &b, &c, &d)
-	if err != nil || n != 4 {
-		return ""
-	}
-
-	return fmt.Sprintf("%s.%d.%d", prefix, c, d)
 }
 
 // ServiceDiff represents changes between desired and existing services.
