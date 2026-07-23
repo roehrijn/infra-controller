@@ -1145,6 +1145,7 @@ dependencies = [
  "carbide-metrics-utils",
  "carbide-secrets",
  "carbide-site-explorer",
+ "carbide-test-support",
  "carbide-version",
  "clap",
  "eyre",

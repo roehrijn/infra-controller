@@ -92,6 +92,7 @@ carbide-version = { path = "../version" }
 
 [dev-dependencies]
 # Internal dependencies. PLEASE KEEP ALPHABETIZED ORDER.
+carbide-test-support = { path = "../test-support" }
 trace-propagation = { path = "../trace-propagation" }
 
 # External dependencies. PLEASE KEEP ALPHABETIZED ORDER.
