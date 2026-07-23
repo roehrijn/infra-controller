@@ -13,7 +13,7 @@ import (
 
 // DefaultDiscoverySelector is the default label selector for discovering
 // machine-a-tron bmc-mock Services.
-const DefaultDiscoverySelector = "machine-a-tron.nvidia.com/service=true"
+const DefaultDiscoverySelector = "nvidia-infra-controller/mat-service=true"
 
 // DiscoveredInstance represents a discovered machine-a-tron instance.
 type DiscoveredInstance struct {

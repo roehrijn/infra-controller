@@ -98,7 +98,7 @@ pods:
       compute:
         hwType: wiwynn_gb200_nvl
         hostCount: 252      # 18 trays × 14 racks
-        dpuPerHostCount: 2  # 2 BF3 per tray → 504 DPU BMCs
+        dpuPerHostCount: 2  # 2 BF3 per tray -> 504 DPU BMCs
         oobDhcpRelayAddress: "10.100.0.1"
       switches:
         hwType: nvidia_switch_nd5200_ld

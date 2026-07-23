@@ -362,7 +362,7 @@ configFiles:
 ## Enable for multi-pod deployments to dynamically manage BMC Services.
 ##
 ## Auto-discovered:
-##   - Finds bmc-mock Services via label: machine-a-tron.nvidia.com/service=true
+##   - Finds bmc-mock Services via label: nvidia-infra-controller/mat-service=true
 ##   - Polls /machines/status from each discovered instance
 ##
 ## Note: BMC IP must be within Kubernetes ServiceCIDR (default 10.96.0.0/12)

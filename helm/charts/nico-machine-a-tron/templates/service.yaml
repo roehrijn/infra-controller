@@ -45,7 +45,7 @@ metadata:
   labels:
     {{- include "nico-machine-a-tron.labels" $root | nindent 4 }}
     app: {{ $baseName }}
-    machine-a-tron.nvidia.com/service: "true"
+    nvidia-infra-controller/mat-service: "true"
     {{- if gt $activePods 1 }}
     nvidia-infra-controller/pod-name: {{ $podName | quote }}
     {{- end }}

@@ -107,7 +107,7 @@ metadata:
   labels:
     {{- include "nico-machine-a-tron.labels" $root | nindent 4 }}
     app.kubernetes.io/component: bmc-service
-    nvidia-infra-controller/bmc-ip: "{{ $currentIP }}"
+    nvidia-infra-controller/mat-bmc-ip: "{{ $currentIP }}"
     nvidia-infra-controller/bmc-index: "{{ $bmcIndex }}"
     nvidia-infra-controller/pod-name: {{ $podName | quote }}
   annotations:

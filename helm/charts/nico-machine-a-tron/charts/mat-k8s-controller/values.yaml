@@ -23,7 +23,7 @@ resources:
 ## Controller configuration
 config:
   ## Label selector for discovering machine-a-tron Services
-  ## Default: machine-a-tron.nvidia.com/service=true,app.kubernetes.io/instance=<release>
+  ## Default: nvidia-infra-controller/mat-service=true,app.kubernetes.io/instance=<release>
   discoverySelector: ""
 
   ## Pod selector for created Services (routes traffic to mat pods)

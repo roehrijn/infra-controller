@@ -1,10 +1,12 @@
 # Machine-a-tron Kubernetes Controller
 
-Kubernetes controller that auto-discovers machine-a-tron pods and creates Services for mock BMC endpoints.
+Kubernetes controller that auto-discovers machine-a-tron pods and creates
+Services for mock BMC endpoints.
 
 ## Features
 
-- Auto-discovers machine-a-tron pods via `machine-a-tron.nvidia.com/service=true` label
+- Auto-discovers machine-a-tron pods via `nvidia-infra-controller/mat-service=true`
+  label
 - Creates ClusterIP Services with BMC IP for each mock BMC
 - Supports Redfish (TCP 443) ports
 - Multi-pod deployments with pod-specific routing
@@ -22,7 +24,7 @@ kind load docker-image mat-k8s-controller:latest --name <cluster>
 | Flag | Env Var | Default | Description |
 |------|---------|---------|-------------|
 | `--namespace` | `NAMESPACE` | `nico-system` | Kubernetes namespace |
-| `--discovery-selector` | `DISCOVERY_SELECTOR` | `machine-a-tron.nvidia.com/service=true` | Label selector for discovery |
+| `--discovery-selector` | `DISCOVERY_SELECTOR` | `nvidia-infra-controller/mat-service=true` | Label selector for discovery |
 | `--sync-interval` | `SYNC_INTERVAL` | `30s` | Reconciliation interval |
 | `--target-selector` | `TARGET_SELECTOR` | `app.kubernetes.io/name=nico-machine-a-tron` | Pod selector for Services |
 | `--insecure-skip-verify` | `INSECURE_SKIP_VERIFY` | `false` | Skip TLS verification (dev only) |
@@ -48,16 +50,18 @@ mat-k8s-controller:
 Created Services have:
 
 **Labels:**
+
 - `app.kubernetes.io/managed-by: mat-k8s-controller`
-- `machine-a-tron.nvidia.com/mat-id: <uuid>`
-- `machine-a-tron.nvidia.com/machine-type: host|dpu`
+- `nvidia-infra-controller/mat-id: <uuid>`
+- `nvidia-infra-controller/mat-machine-type: host|dpu`
 - `nvidia-infra-controller/pod-name: <pod>` (multi-pod)
 
 **Annotations:**
-- `machine-a-tron.nvidia.com/bmc-ip`
-- `machine-a-tron.nvidia.com/api-state`
-- `machine-a-tron.nvidia.com/power-state`
-- `machine-a-tron.nvidia.com/hardware-type`
+
+- `nvidia-infra-controller/mat-bmc-ip`
+- `nvidia-infra-controller/mat-api-state`
+- `nvidia-infra-controller/mat-power-state`
+- `nvidia-infra-controller/mat-hardware-type`
 
 ## Development
 
@@ -74,13 +78,15 @@ make run KUBECONFIG=~/.kube/config
 BMC IP is outside ServiceCIDR or already in use.
 
 **Solutions:**
+
 1. Reserve a ServiceCIDR for machine-a-tron (K8s 1.29+)
 2. Use a CIDR within the cluster's ServiceCIDR
 3. Delete conflicting Services
 
 ### ClusterIP change detected
 
-BMC IP changed but ClusterIP is immutable. Controller will delete and recreate the Service.
+BMC IP changed but ClusterIP is immutable. Controller will delete and recreate
+the Service.
 
 ## Architecture
 

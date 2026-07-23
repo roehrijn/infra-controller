@@ -69,7 +69,7 @@ Discovery selector - finds machine-a-tron bmc-mock Services scoped to this relea
 {{- if .Values.config.discoverySelector }}
 {{- .Values.config.discoverySelector }}
 {{- else }}
-{{- printf "machine-a-tron.nvidia.com/service=true,app.kubernetes.io/instance=%s" .Release.Name }}
+{{- printf "nvidia-infra-controller/mat-service=true,app.kubernetes.io/instance=%s" .Release.Name }}
 {{- end }}
 {{- end }}
 

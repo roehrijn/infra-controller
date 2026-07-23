@@ -32,7 +32,7 @@ func main() {
 	// Flags
 	namespace := flag.String("namespace", envOrDefault("NAMESPACE", "nico-system"),
 		"Kubernetes namespace for Services and machine-a-tron discovery")
-	discoverySelector := flag.String("discovery-selector", envOrDefault("DISCOVERY_SELECTOR", "machine-a-tron.nvidia.com/service=true"),
+	discoverySelector := flag.String("discovery-selector", envOrDefault("DISCOVERY_SELECTOR", "nvidia-infra-controller/mat-service=true"),
 		"Label selector for discovering machine-a-tron bmc-mock Services")
 	syncInterval := flag.Duration("sync-interval", parseDurationOrDefault("SYNC_INTERVAL", 30*time.Second),
 		"Interval between reconciliation passes")

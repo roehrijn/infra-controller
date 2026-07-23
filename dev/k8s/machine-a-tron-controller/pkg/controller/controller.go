@@ -28,26 +28,26 @@ const (
 	LabelPodName = "nvidia-infra-controller/pod-name"
 
 	// LabelMatID is the machine-a-tron ID label.
-	LabelMatID = "machine-a-tron.nvidia.com/mat-id"
+	LabelMatID = "nvidia-infra-controller/mat-id"
 	// LabelMachineID is the NICo machine ID label.
-	LabelMachineID = "machine-a-tron.nvidia.com/machine-id"
+	LabelMachineID = "nvidia-infra-controller/mat-machine-id"
 	// LabelMachineType indicates if this is a host or DPU.
-	LabelMachineType = "machine-a-tron.nvidia.com/machine-type"
+	LabelMachineType = "nvidia-infra-controller/mat-machine-type"
 	// LabelParentMatID is the parent host's mat-id for DPU services.
-	LabelParentMatID = "machine-a-tron.nvidia.com/parent-mat-id"
+	LabelParentMatID = "nvidia-infra-controller/mat-parent-id"
 
 	// AnnotationBMCIP stores the BMC IP address.
-	AnnotationBMCIP = "machine-a-tron.nvidia.com/bmc-ip"
+	AnnotationBMCIP = "nvidia-infra-controller/mat-bmc-ip"
 	// AnnotationAPIState stores the machine's API state.
-	AnnotationAPIState = "machine-a-tron.nvidia.com/api-state"
+	AnnotationAPIState = "nvidia-infra-controller/mat-api-state"
 	// AnnotationPowerState stores the machine's power state.
-	AnnotationPowerState = "machine-a-tron.nvidia.com/power-state"
+	AnnotationPowerState = "nvidia-infra-controller/mat-power-state"
 	// AnnotationHardwareType stores the hardware type.
-	AnnotationHardwareType = "machine-a-tron.nvidia.com/hardware-type"
+	AnnotationHardwareType = "nvidia-infra-controller/mat-hardware-type"
 	// AnnotationRedfishListenPort stores the internal Redfish listen port.
-	AnnotationRedfishListenPort = "machine-a-tron.nvidia.com/redfish-listen-port"
+	AnnotationRedfishListenPort = "nvidia-infra-controller/mat-redfish-listen-port"
 	// AnnotationIPMIListenPort stores the internal IPMI listen port.
-	AnnotationIPMIListenPort = "machine-a-tron.nvidia.com/ipmi-listen-port"
+	AnnotationIPMIListenPort = "nvidia-infra-controller/mat-ipmi-listen-port"
 
 	// MachineTypeHost indicates a host machine.
 	MachineTypeHost = "host"
