@@ -883,6 +883,7 @@ dependencies = [
  "axum",
  "axum-extra",
  "axum-server",
+ "bmc-vendor",
  "bytes",
  "chrono",
  "clap",
@@ -1138,14 +1139,34 @@ dependencies = [
  "carbide-api-core",
  "carbide-api-db",
  "carbide-api-web",
+ "carbide-http-connector",
+ "carbide-instrument",
+ "carbide-machine-controller",
+ "carbide-metrics-utils",
  "carbide-secrets",
+ "carbide-site-explorer",
  "carbide-version",
  "clap",
  "eyre",
+ "http",
+ "ipnetwork",
+ "logfmt",
+ "metrics-endpoint",
+ "opentelemetry 0.32.0",
+ "opentelemetry-otlp",
+ "opentelemetry-prometheus",
+ "opentelemetry-semantic-conventions",
+ "opentelemetry_sdk",
+ "prometheus",
+ "spancounter",
  "sqlx",
+ "sqlx-query-tracing",
  "tokio",
  "tokio-util",
+ "trace-propagation",
  "tracing",
+ "tracing-opentelemetry 0.33.0",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -1170,7 +1191,6 @@ dependencies = [
  "carbide-health-metrics",
  "carbide-health-report",
  "carbide-host-support",
- "carbide-http-connector",
  "carbide-ib-fabric",
  "carbide-ib-partition-controller",
  "carbide-instrument",
@@ -1234,22 +1254,16 @@ dependencies = [
  "libnmxc",
  "libredfish",
  "librms",
- "logfmt",
  "mac_address",
- "metrics-endpoint",
  "mockito",
  "mqttea",
  "nras",
  "num_cpus",
  "nv-redfish",
  "opentelemetry 0.32.0",
- "opentelemetry-otlp",
- "opentelemetry-prometheus",
- "opentelemetry-semantic-conventions",
  "opentelemetry_sdk",
  "p256 0.14.0-rc.9",
  "pkcs1 0.7.5",
- "prometheus",
  "prometheus-text-parser",
  "prost",
  "rand 0.10.1",
@@ -1288,7 +1302,6 @@ dependencies = [
  "trace-propagation",
  "tracing",
  "tracing-log",
- "tracing-opentelemetry 0.33.0",
  "tracing-subscriber",
  "tss-esapi",
  "url",
@@ -1356,6 +1369,7 @@ dependencies = [
  "askama_escape",
  "base64",
  "bmc-mock",
+ "bmc-vendor",
  "carbide-api-core",
  "carbide-api-db",
  "carbide-api-test-helper",
@@ -1437,6 +1451,7 @@ version = "0.0.0"
 dependencies = [
  "async-trait",
  "bmc-mock",
+ "bmc-vendor",
  "carbide-api",
  "carbide-api-db",
  "carbide-instrument",
@@ -1611,6 +1626,26 @@ dependencies = [
  "rand 0.10.1",
  "tokio",
  "tonic",
+ "tracing",
+]
+
+[[package]]
+name = "carbide-credential-rotation"
+version = "0.0.0"
+dependencies = [
+ "async-trait",
+ "carbide-api-db",
+ "carbide-macros",
+ "carbide-redfish",
+ "carbide-secrets",
+ "carbide-sqlx-testing",
+ "chrono",
+ "libredfish",
+ "mac_address",
+ "serde_json",
+ "sqlx",
+ "thiserror 2.0.18",
+ "tokio",
  "tracing",
 ]
 
@@ -6768,7 +6803,7 @@ dependencies = [
 [[package]]
 name = "librms"
 version = "0.0.14"
-source = "git+https://github.com/NVIDIA/nv-rms-client.git?tag=v0.9.1#d6d1c3545bdea108c27ec2d0be67fe22c5069a72"
+source = "git+https://github.com/NVIDIA/nv-rms-client.git?tag=v0.10.0#0769455549f85e64c4fcc471bd24aa7fa6622609"
 dependencies = [
  "async-trait",
  "chrono",
@@ -7032,6 +7067,7 @@ name = "metrics-endpoint"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "carbide-instrument",
  "carbide-metrics-utils",
  "eyre",
  "http-body-util",
@@ -11785,7 +11821,7 @@ dependencies = [
 [[package]]
 name = "tonic-client-wrapper"
 version = "1.0.0"
-source = "git+https://github.com/NVIDIA/nv-rms-client.git?tag=v0.9.1#d6d1c3545bdea108c27ec2d0be67fe22c5069a72"
+source = "git+https://github.com/NVIDIA/nv-rms-client.git?tag=v0.10.0#0769455549f85e64c4fcc471bd24aa7fa6622609"
 dependencies = [
  "async-trait",
  "heck",
