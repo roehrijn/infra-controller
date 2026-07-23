@@ -50,7 +50,7 @@ func TestBuildServiceName(t *testing.T) {
 func TestServiceBuilder_BuildService(t *testing.T) {
 	builder := &ServiceBuilder{
 		Namespace: "test-ns",
-		TargetSelector: map[string]string{
+		BaseSelector: map[string]string{
 			"app": "machine-a-tron",
 		},
 	}
@@ -70,7 +70,7 @@ func TestServiceBuilder_BuildService(t *testing.T) {
 		},
 	}
 
-	svc := builder.BuildService(machine, MachineTypeHost, "")
+	svc := builder.BuildService(machine, MachineTypeHost, "", "")
 
 	// Check basic metadata
 	assert.Equal(t, "mat-bmc-host-host-uui", svc.Name)
@@ -97,13 +97,13 @@ func TestServiceBuilder_BuildService(t *testing.T) {
 	assert.Equal(t, intstr.FromInt32(8443), svc.Spec.Ports[0].TargetPort)
 
 	// Check selector
-	assert.Equal(t, builder.TargetSelector, svc.Spec.Selector)
+	assert.Equal(t, builder.BaseSelector, svc.Spec.Selector)
 }
 
 func TestServiceBuilder_BuildService_WithIPMI(t *testing.T) {
 	builder := &ServiceBuilder{
 		Namespace: "test-ns",
-		TargetSelector: map[string]string{
+		BaseSelector: map[string]string{
 			"app": "machine-a-tron",
 		},
 	}
@@ -125,7 +125,7 @@ func TestServiceBuilder_BuildService_WithIPMI(t *testing.T) {
 		},
 	}
 
-	svc := builder.BuildService(machine, MachineTypeHost, "")
+	svc := builder.BuildService(machine, MachineTypeHost, "", "")
 
 	// Check we have both ports
 	require.Len(t, svc.Spec.Ports, 2)
@@ -158,7 +158,7 @@ func TestServiceBuilder_BuildService_WithIPMI(t *testing.T) {
 func TestServiceBuilder_BuildService_DPU(t *testing.T) {
 	builder := &ServiceBuilder{
 		Namespace: "test-ns",
-		TargetSelector: map[string]string{
+		BaseSelector: map[string]string{
 			"app": "machine-a-tron",
 		},
 	}
@@ -177,7 +177,7 @@ func TestServiceBuilder_BuildService_DPU(t *testing.T) {
 		},
 	}
 
-	svc := builder.BuildService(dpu, MachineTypeDPU, "parent-host-uuid")
+	svc := builder.BuildService(dpu, MachineTypeDPU, "parent-host-uuid", "")
 
 	// Check DPU-specific labels
 	assert.Equal(t, MachineTypeDPU, svc.Labels[LabelMachineType])
@@ -187,7 +187,7 @@ func TestServiceBuilder_BuildService_DPU(t *testing.T) {
 func TestServiceBuilder_BuildService_BMCIPAsClusterIP(t *testing.T) {
 	builder := &ServiceBuilder{
 		Namespace: "test-ns",
-		TargetSelector: map[string]string{
+		BaseSelector: map[string]string{
 			"app": "machine-a-tron",
 		},
 	}
@@ -205,7 +205,7 @@ func TestServiceBuilder_BuildService_BMCIPAsClusterIP(t *testing.T) {
 		},
 	}
 
-	svc := builder.BuildService(machine, MachineTypeHost, "")
+	svc := builder.BuildService(machine, MachineTypeHost, "", "")
 
 	// Check BMC IP is used directly as ClusterIP
 	assert.Equal(t, "10.100.0.20", svc.Spec.ClusterIP)
@@ -214,7 +214,7 @@ func TestServiceBuilder_BuildService_BMCIPAsClusterIP(t *testing.T) {
 func TestServiceBuilder_BuildServicesFromStatus(t *testing.T) {
 	builder := &ServiceBuilder{
 		Namespace: "test-ns",
-		TargetSelector: map[string]string{
+		BaseSelector: map[string]string{
 			"app": "machine-a-tron",
 		},
 	}
@@ -258,7 +258,7 @@ func TestServiceBuilder_BuildServicesFromStatus(t *testing.T) {
 		},
 	}
 
-	services := builder.BuildServicesFromStatus(status)
+	services := builder.BuildServicesFromStatus(status, "")
 
 	// Should have 4 services: 2 hosts + 2 DPUs
 	assert.Len(t, services, 4)
@@ -397,7 +397,7 @@ func TestReconcileLogic(t *testing.T) {
 
 	builder := &ServiceBuilder{
 		Namespace: "test-ns",
-		TargetSelector: map[string]string{
+		BaseSelector: map[string]string{
 			"app": "machine-a-tron",
 		},
 	}
@@ -445,7 +445,7 @@ func TestReconcileLogic(t *testing.T) {
 func runTestReconcile(ctx context.Context, builder *ServiceBuilder, k8s *mockK8sClient, status *matclient.MachinesStatusResponse) ReconcileResult {
 	result := ReconcileResult{}
 
-	desired := builder.BuildServicesFromStatus(status)
+	desired := builder.BuildServicesFromStatus(status, "")
 
 	selector := LabelManagedBy + "=" + LabelManagedByValue
 	existing, _ := k8s.List(ctx, builder.Namespace, selector)
@@ -542,3 +542,4 @@ func (m *mockK8sClient) Delete(ctx context.Context, namespace, name string) erro
 func ptr[T any](v T) *T {
 	return &v
 }
+

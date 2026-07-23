@@ -24,6 +24,9 @@ const (
 	// LabelManagedByValue is the value for the managed-by label.
 	LabelManagedByValue = "mat-k8s-controller"
 
+	// LabelPodName is the label that identifies which machine-a-tron pod owns this service.
+	LabelPodName = "nvidia-infra-controller/pod-name"
+
 	// LabelMatID is the machine-a-tron ID label.
 	LabelMatID = "machine-a-tron.nvidia.com/mat-id"
 	// LabelMachineID is the NICo machine ID label.
@@ -61,8 +64,8 @@ const (
 type ServiceBuilder struct {
 	// Namespace is the target namespace for Services.
 	Namespace string
-	// TargetSelector is the pod selector that Services should target.
-	TargetSelector map[string]string
+	// BaseSelector is the base pod selector (e.g., app.kubernetes.io/name=nico-machine-a-tron).
+	BaseSelector map[string]string
 }
 
 // BuildServiceName generates a consistent service name for a machine.
@@ -75,7 +78,8 @@ func BuildServiceName(machineType, matID string) string {
 }
 
 // BuildService creates a Kubernetes Service for a machine's BMC.
-func (b *ServiceBuilder) BuildService(machine *matclient.MachineStatus, machineType, parentMatID string) *corev1.Service {
+// podName is used to create a pod-specific selector for multi-pod deployments.
+func (b *ServiceBuilder) BuildService(machine *matclient.MachineStatus, machineType, parentMatID, podName string) *corev1.Service {
 	name := BuildServiceName(machineType, machine.MatID)
 
 	labels := map[string]string{
@@ -95,6 +99,9 @@ func (b *ServiceBuilder) BuildService(machine *matclient.MachineStatus, machineT
 	}
 	if parentMatID != "" {
 		labels[LabelParentMatID] = parentMatID
+	}
+	if podName != "" {
+		labels[LabelPodName] = podName
 	}
 	if machine.BMC.IP != nil {
 		annotations[AnnotationBMCIP] = *machine.BMC.IP
@@ -124,6 +131,15 @@ func (b *ServiceBuilder) BuildService(machine *matclient.MachineStatus, machineT
 		})
 	}
 
+	// Build selector: base selector + pod-specific selector for multi-pod
+	selector := make(map[string]string)
+	for k, v := range b.BaseSelector {
+		selector[k] = v
+	}
+	if podName != "" {
+		selector[LabelPodName] = podName
+	}
+
 	svc := &corev1.Service{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:        name,
@@ -133,7 +149,7 @@ func (b *ServiceBuilder) BuildService(machine *matclient.MachineStatus, machineT
 		},
 		Spec: corev1.ServiceSpec{
 			Type:     corev1.ServiceTypeClusterIP,
-			Selector: b.TargetSelector,
+			Selector: selector,
 			Ports:    ports,
 		},
 	}
@@ -147,17 +163,18 @@ func (b *ServiceBuilder) BuildService(machine *matclient.MachineStatus, machineT
 }
 
 // BuildServicesFromStatus generates all Services from a machines status response.
-func (b *ServiceBuilder) BuildServicesFromStatus(status *matclient.MachinesStatusResponse) []*corev1.Service {
+// podName identifies which machine-a-tron pod these machines belong to.
+func (b *ServiceBuilder) BuildServicesFromStatus(status *matclient.MachinesStatusResponse, podName string) []*corev1.Service {
 	var services []*corev1.Service
 
 	for i := range status.Machines {
 		machine := &status.Machines[i]
-		svc := b.BuildService(machine, MachineTypeHost, "")
+		svc := b.BuildService(machine, MachineTypeHost, "", podName)
 		services = append(services, svc)
 
 		for j := range machine.DPUs {
 			dpu := &machine.DPUs[j]
-			dpuSvc := b.BuildService(dpu, MachineTypeDPU, machine.MatID)
+			dpuSvc := b.BuildService(dpu, MachineTypeDPU, machine.MatID, podName)
 			services = append(services, dpuSvc)
 		}
 	}
@@ -241,6 +258,13 @@ func needsUpdate(desired, existing *corev1.Service) bool {
 		}
 	}
 
+	// Check selector changes (important for multi-pod)
+	for k, v := range desired.Spec.Selector {
+		if existing.Spec.Selector[k] != v {
+			return true
+		}
+	}
+
 	return false
 }
 
@@ -294,38 +318,42 @@ func NewReconciler(
 func (r *Reconciler) Reconcile(ctx context.Context) ReconcileResult {
 	result := ReconcileResult{}
 
-	// Discover machine-a-tron URLs
-	urls, err := r.discovery.DiscoverURLs(ctx)
+	// Discover machine-a-tron instances
+	instances, err := r.discovery.Discover(ctx)
 	if err != nil {
 		result.Errors = append(result.Errors, fmt.Errorf("discovering machine-a-tron instances: %w", err))
 		return result
 	}
 
-	if len(urls) == 0 {
+	if len(instances) == 0 {
 		r.logger.Warn().Msg("no machine-a-tron instances discovered")
 		return result
 	}
 
-	r.logger.Debug().Strs("urls", urls).Msg("discovered machine-a-tron instances")
+	r.logger.Debug().Int("count", len(instances)).Msg("discovered machine-a-tron instances")
 
 	// Collect all machines from all instances
 	var allDesired []*corev1.Service
 
-	for _, url := range urls {
-		client, err := matclient.NewClient(url, r.clientOpts...)
+	for _, instance := range instances {
+		client, err := matclient.NewClient(instance.URL, r.clientOpts...)
 		if err != nil {
-			result.Errors = append(result.Errors, fmt.Errorf("creating client for %s: %w", url, err))
+			result.Errors = append(result.Errors, fmt.Errorf("creating client for %s: %w", instance.URL, err))
 			continue
 		}
 
 		status, err := client.GetMachinesStatus(ctx)
 		if err != nil {
-			result.Errors = append(result.Errors, fmt.Errorf("fetching status from %s: %w", url, err))
+			result.Errors = append(result.Errors, fmt.Errorf("fetching status from %s: %w", instance.URL, err))
 			continue
 		}
 
-		services := r.serviceBuilder.BuildServicesFromStatus(status)
-		r.logger.Debug().Str("url", url).Int("machines", len(services)).Msg("fetched machines from instance")
+		services := r.serviceBuilder.BuildServicesFromStatus(status, instance.PodName)
+		r.logger.Debug().
+			Str("url", instance.URL).
+			Str("pod", instance.PodName).
+			Int("machines", len(services)).
+			Msg("fetched machines from instance")
 		allDesired = append(allDesired, services...)
 	}
 

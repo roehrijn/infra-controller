@@ -98,7 +98,7 @@ func main() {
 	// Create service builder
 	builder := &controller.ServiceBuilder{
 		Namespace:      *namespace,
-		TargetSelector: selector,
+		BaseSelector: selector,
 	}
 
 	// Create discovery and reconciler

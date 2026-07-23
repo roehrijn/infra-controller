@@ -15,6 +15,12 @@ import (
 // machine-a-tron bmc-mock Services.
 const DefaultDiscoverySelector = "machine-a-tron.nvidia.com/service=true"
 
+// DiscoveredInstance represents a discovered machine-a-tron instance.
+type DiscoveredInstance struct {
+	URL     string
+	PodName string
+}
+
 // MatPodDiscovery discovers machine-a-tron pods via their bmc-mock Services.
 type MatPodDiscovery struct {
 	clientset     kubernetes.Interface
@@ -37,8 +43,8 @@ func NewMatPodDiscovery(clientset kubernetes.Interface, namespace string, port i
 	}
 }
 
-// DiscoverURLs finds all machine-a-tron bmc-mock service URLs.
-func (d *MatPodDiscovery) DiscoverURLs(ctx context.Context) ([]string, error) {
+// Discover finds all machine-a-tron bmc-mock services and returns their URLs with pod names.
+func (d *MatPodDiscovery) Discover(ctx context.Context) ([]DiscoveredInstance, error) {
 	services, err := d.clientset.CoreV1().Services(d.namespace).List(ctx, metav1.ListOptions{
 		LabelSelector: d.labelSelector,
 	})
@@ -46,11 +52,15 @@ func (d *MatPodDiscovery) DiscoverURLs(ctx context.Context) ([]string, error) {
 		return nil, fmt.Errorf("listing services with selector %q: %w", d.labelSelector, err)
 	}
 
-	var urls []string
+	var instances []DiscoveredInstance
 	for _, svc := range services.Items {
 		url := fmt.Sprintf("https://%s.%s.svc.cluster.local:%d", svc.Name, d.namespace, d.port)
-		urls = append(urls, url)
+		podName := svc.Labels[LabelPodName]
+		instances = append(instances, DiscoveredInstance{
+			URL:     url,
+			PodName: podName,
+		})
 	}
 
-	return urls, nil
+	return instances, nil
 }
