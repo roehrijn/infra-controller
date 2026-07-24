@@ -33,6 +33,7 @@ use crate::tests::common::api_fixtures::create_test_env;
 mod error_state;
 mod fixtures;
 mod maintenance;
+mod reprovisioning;
 use carbide_secrets::test_support::credentials::TestCredentialManager;
 use fixtures::power_shelf::{mark_power_shelf_as_deleted, set_power_shelf_controller_state};
 
@@ -130,6 +131,7 @@ async fn test_power_shelf_deletion_with_state_controller(
                 component_manager: None,
                 credential_manager: credential_manager.clone(),
                 per_object_metrics_registry: env.per_object_metrics_registry(),
+                rack_firmware_reprovisioning_enabled: false,
             }
             .into(),
         )

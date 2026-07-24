@@ -18,24 +18,26 @@
 //! Handler for SwitchControllerState::Ready.
 
 use carbide_uuid::switch::SwitchId;
-use model::switch::{ReProvisioningState, Switch, SwitchControllerState};
+use db::switch as db_switch;
+use model::switch::{Switch, SwitchControllerState};
 use state_controller::state_handler::{
     StateHandlerContext, StateHandlerError, StateHandlerOutcome,
 };
 
 use crate::context::SwitchStateHandlerContextObjects;
+use crate::reprovisioning::first_reprovisioning_state;
 
 /// Handles the Ready state for a switch.
 ///
 /// If the switch is marked for deletion, transitions to `Deleting`.
 /// If a maintenance request has been posted via `switch_maintenance_requested`,
 /// transitions to `Maintenance` with the requested operation. If rack-level
-/// reprovisioning has been requested, transitions to `ReProvisioning`.
-/// Otherwise idles.
+/// reprovisioning has been requested, transitions to the first
+/// `ReProvisioning` sub-state selected by the request activities. Otherwise idles.
 pub async fn handle_ready(
-    _switch_id: &SwitchId,
+    switch_id: &SwitchId,
     state: &mut Switch,
-    _ctx: &mut StateHandlerContext<'_, SwitchStateHandlerContextObjects>,
+    ctx: &mut StateHandlerContext<'_, SwitchStateHandlerContextObjects>,
 ) -> Result<StateHandlerOutcome<SwitchControllerState>, StateHandlerError> {
     if state.is_marked_as_deleted() {
         return Ok(StateHandlerOutcome::transition(
@@ -55,27 +57,39 @@ pub async fn handle_ready(
     }
 
     if let Some(req) = &state.switch_reprovisioning_requested {
-        if req.initiator.starts_with("rack-") {
-            tracing::info!(
-                "Rack-level firmware upgrade requested — transitioning to WaitingForRackFirmwareUpgrade"
+        if !req.initiator.starts_with("rack-") {
+            tracing::warn!(
+                initiator = %req.initiator,
+                "Unknown initiator for switch reprovisioning request",
             );
             return Ok(StateHandlerOutcome::transition(
-                SwitchControllerState::ReProvisioning {
-                    reprovisioning_state: ReProvisioningState::WaitingForRackFirmwareUpgrade,
+                SwitchControllerState::Error {
+                    cause: format!(
+                        "unknown initiator for switch reprovisioning request: {}",
+                        req.initiator
+                    ),
                 },
             ));
         }
 
-        tracing::warn!(
-            initiator = %req.initiator,
-            "Unknown initiator for switch reprovisioning request",
+        let Some(reprovisioning_state) = first_reprovisioning_state(req) else {
+            tracing::warn!(
+                switch_id = %switch_id,
+                initiator = %req.initiator,
+                "Rack reprovision request has no switch-relevant activities; clearing request"
+            );
+            let mut txn = ctx.services.db_pool.begin().await?;
+            db_switch::clear_switch_reprovisioning_requested(txn.as_mut(), *switch_id).await?;
+            return Ok(StateHandlerOutcome::do_nothing().with_txn(txn));
+        };
+
+        tracing::info!(
+            ?reprovisioning_state,
+            "Rack-level reprovisioning requested — entering ReProvisioning"
         );
         return Ok(StateHandlerOutcome::transition(
-            SwitchControllerState::Error {
-                cause: format!(
-                    "unknown initiator for switch reprovisioning request: {}",
-                    req.initiator
-                ),
+            SwitchControllerState::ReProvisioning {
+                reprovisioning_state,
             },
         ));
     }
