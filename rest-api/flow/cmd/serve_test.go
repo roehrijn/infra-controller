@@ -4,10 +4,14 @@
 package cmd
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
+	"github.com/NVIDIA/infra-controller/rest-api/flow/internal/authz"
 	cmconfig "github.com/NVIDIA/infra-controller/rest-api/flow/internal/task/componentmanager/config"
 	"github.com/NVIDIA/infra-controller/rest-api/flow/pkg/common/devicetypes"
 )
@@ -89,3 +93,68 @@ func TestApplyComputeImplementationOverride(t *testing.T) {
 		assert.Equal(t, "nico", cfg.ComponentManagers[devicetypes.ComponentTypeCompute])
 	})
 }
+
+func TestLoadAuthorizationConfig(t *testing.T) {
+	originalIdentities := allowedServiceIdentities
+	t.Cleanup(func() {
+		allowedServiceIdentities = originalIdentities
+	})
+
+	t.Run("uses CLI identities when file environment variable is unset", func(t *testing.T) {
+		allowedServiceIdentities = []string{allowedServiceIdentityForTest}
+		t.Setenv(allowedServiceIdentitiesFileEnvVar, "temporary")
+		require.NoError(t, os.Unsetenv(allowedServiceIdentitiesFileEnvVar))
+
+		config, err := loadAuthorizationConfig()
+
+		require.NoError(t, err)
+		assert.Equal(t, []string{allowedServiceIdentityForTest}, config.AllowedServiceIdentities)
+	})
+
+	t.Run("rejects blank file environment variable", func(t *testing.T) {
+		allowedServiceIdentities = nil
+		t.Setenv(allowedServiceIdentitiesFileEnvVar, "   ")
+
+		_, err := loadAuthorizationConfig()
+
+		require.ErrorContains(t, err, "read allowed service identities file \"\"")
+	})
+
+	t.Run("loads plain-text identity list and audit mode", func(t *testing.T) {
+		allowedServiceIdentities = nil
+		path := filepath.Join(t.TempDir(), "allowed-services.txt")
+		content := "\n  " + allowedServiceIdentityForTest + "  \n\n"
+		require.NoError(t, os.WriteFile(path, []byte(content), 0o600))
+		t.Setenv(allowedServiceIdentitiesFileEnvVar, path)
+		t.Setenv(authorizationModeEnvVar, string(authz.ModeAudit))
+
+		config, err := loadAuthorizationConfig()
+
+		require.NoError(t, err)
+		assert.Equal(t, []string{allowedServiceIdentityForTest}, config.AllowedServiceIdentities)
+		assert.Equal(t, authz.ModeAudit, config.Mode)
+	})
+
+	t.Run("rejects file and CLI identities together", func(t *testing.T) {
+		allowedServiceIdentities = []string{allowedServiceIdentityForTest}
+		t.Setenv(allowedServiceIdentitiesFileEnvVar, "identities.txt")
+
+		_, err := loadAuthorizationConfig()
+
+		require.ErrorContains(t, err, "cannot be configured by both file and command-line options")
+	})
+
+	t.Run("does not interpret comments", func(t *testing.T) {
+		allowedServiceIdentities = nil
+		path := filepath.Join(t.TempDir(), "allowed-services.txt")
+		require.NoError(t, os.WriteFile(path, []byte("# service identities\n"), 0o600))
+		t.Setenv(allowedServiceIdentitiesFileEnvVar, path)
+
+		config, err := loadAuthorizationConfig()
+
+		require.NoError(t, err)
+		require.ErrorContains(t, config.Validate(), "not a valid SPIFFE ID")
+	})
+}
+
+const allowedServiceIdentityForTest = "spiffe://example.test/ns/site/sa/site-workflow"
