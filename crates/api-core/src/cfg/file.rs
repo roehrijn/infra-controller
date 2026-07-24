@@ -22,7 +22,9 @@ use std::path::PathBuf;
 
 use bmc_vendor::BMCVendor;
 use carbide_authn::config::{AllowedCertCriteria, TrustConfig};
-use carbide_dpf::types::DpfProxyDetails;
+use carbide_dpf::types::{
+    DOCA_WEAVE_SERVICE_NAME, DOCA_XPLANE_SERVICE_NAME, DpfProxyDetails, DpuDeploymentType,
+};
 use carbide_firmware::FirmwareConfig;
 use carbide_firmware::defaults::{
     BF2_BMC_VERSION, BF2_CEC_VERSION, BF2_NIC_VERSION, BF2_UEFI_VERSION, BF3_BMC_VERSION,
@@ -1396,14 +1398,28 @@ impl DpfConfig {
     pub fn resolved_services_for(
         &self,
         deployment: &DpfDeploymentConfig,
-    ) -> DpfMandatoryServicesConfig {
-        let mut services = deployment
+        deployment_type: DpuDeploymentType,
+    ) -> DpfResolvedMandatoryServicesConfig {
+        let mut base = deployment
             .services
             .as_deref()
             .cloned()
             .unwrap_or_else(|| (*self.services).clone());
-        self.apply_pull_secret_override(&mut services);
-        services
+        self.apply_pull_secret_override(&mut base);
+        let extra = match deployment_type {
+            DpuDeploymentType::Bf4Astra => HashMap::from([
+                (
+                    DOCA_WEAVE_SERVICE_NAME.to_string(),
+                    crate::dpf_services::default_doca_weave_service(),
+                ),
+                (
+                    DOCA_XPLANE_SERVICE_NAME.to_string(),
+                    crate::dpf_services::default_doca_xplane_service(),
+                ),
+            ]),
+            _ => HashMap::new(),
+        };
+        DpfResolvedMandatoryServicesConfig { base, extra }
     }
 
     /// Applies the optional [`Self::docker_image_pull_secret`] override to every
@@ -1469,6 +1485,13 @@ impl Default for DpfMandatoryServicesConfig {
     }
 }
 
+// DpfResolvedMandatoryServicesConfig - the compounded list of mandatory services
+// depending on deployment type
+pub struct DpfResolvedMandatoryServicesConfig {
+    pub base: DpfMandatoryServicesConfig,
+    pub extra: HashMap<String, DpfServiceConfig>,
+}
+
 /// Default name for the Kubernetes `imagePullSecrets` entry used by DPF workload charts.
 pub(crate) const DEFAULT_DPF_IMAGE_PULL_SECRET: &str = "dpf-pull-secret";
 
@@ -1530,7 +1553,6 @@ pub struct DpfDeploymentConfig {
     /// [`DpfConfig::services`]. When absent, the top-level services are inherited.
     #[serde(default)]
     pub services: Option<Box<DpfMandatoryServicesConfig>>,
-    // A new field can be added here similar to mandatory services but specific to deployment.
 }
 
 impl Default for DpfDeploymentConfig {
@@ -1576,6 +1598,9 @@ pub struct DpfDeploymentsConfig {
     /// BF4 generic deployment (NICo + BF4 via DPF).
     #[serde(default)]
     pub bf4_generic: Option<DpfDeploymentConfig>,
+    /// BF4 astra deployment (NICo + BF4 with Astra via DPF)
+    #[serde(default)]
+    pub bf4_astra: Option<DpfDeploymentConfig>,
 }
 
 impl DpfDeploymentsConfig {
@@ -1585,6 +1610,9 @@ impl DpfDeploymentsConfig {
         let mut v = vec![("bf3", &self.bf3)];
         if let Some(bf4) = &self.bf4_generic {
             v.push(("bf4_generic", bf4));
+        }
+        if let Some(bf4_astra) = &self.bf4_astra {
+            v.push(("bf4_astra", bf4_astra));
         }
         v
     }
@@ -1654,19 +1682,18 @@ impl DpfDeploymentsConfig {
             );
         }
 
-        // BF4 is BlueFieldSoftware-only. `bfb_url` is BF3-specific; a bf4_generic
-        // deployment must use `bluefield_software`. Reject the BFB-only case here
-        // so it fails at config validation rather than later at SDK startup,
-        // which unconditionally requires `bluefield_software` for bf4_generic.
-        if self
-            .bf4_generic
-            .as_ref()
-            .is_some_and(|cfg| cfg.bfb_url.is_some() && cfg.bluefield_software.is_none())
-        {
-            errors.push(
-                "deployment \"bf4_generic\" must set bluefield_software; BF4 does not support bfb_url"
-                    .to_string(),
-            );
+        // BF4 is BlueFieldSoftware-only. `bfb_url` is BF3-specific; bf4_generic and
+        // bf4_astra deployments must use `bluefield_software`. Reject the BFB-only case
+        // here so it fails at config validation rather than later at SDK startup.
+        for (name, cfg) in [
+            ("bf4_generic", self.bf4_generic.as_ref()),
+            ("bf4_astra", self.bf4_astra.as_ref()),
+        ] {
+            if cfg.is_some_and(|c| c.bfb_url.is_some() && c.bluefield_software.is_none()) {
+                errors.push(format!(
+                    "deployment \"{name}\" must set bluefield_software; BF4 does not support bfb_url"
+                ));
+            }
         }
 
         for (name, cfg) in self.all() {
@@ -5896,6 +5923,7 @@ object_kind = "secret"
                     )]),
                 }),
             )),
+            bf4_astra: None,
         };
         assert!(deployments.validate_provisioning_sources().is_ok());
     }
@@ -5915,6 +5943,7 @@ object_kind = "secret"
                     )]),
                 }),
             )),
+            bf4_astra: None,
         };
         assert!(both.validate_provisioning_sources().is_err());
 
@@ -5922,6 +5951,7 @@ object_kind = "secret"
         let neither = DpfDeploymentsConfig {
             bf3: DpfDeploymentConfig::default(),
             bf4_generic: Some(bf4_config(None, None)),
+            bf4_astra: None,
         };
         assert!(neither.validate_provisioning_sources().is_err());
 
@@ -5935,6 +5965,7 @@ object_kind = "secret"
                     pldm_fw_bundle: BTreeMap::new(),
                 }),
             )),
+            bf4_astra: None,
         };
         assert!(empty_map.validate_provisioning_sources().is_err());
     }
@@ -5946,6 +5977,7 @@ object_kind = "secret"
         let deployments = DpfDeploymentsConfig {
             bf3: bf4_config(None, Some(bf4_with_psids(&["MT_0000000884"]))),
             bf4_generic: None,
+            bf4_astra: None,
         };
         assert!(deployments.validate_provisioning_sources().is_err());
     }
@@ -5967,6 +5999,7 @@ object_kind = "secret"
         let deployments = DpfDeploymentsConfig {
             bf3: DpfDeploymentConfig::default(),
             bf4_generic: Some(bf4_config(Some("http://example.com/test.bfb"), None)),
+            bf4_astra: None,
         };
         assert!(deployments.validate_provisioning_sources().is_err());
     }
@@ -5977,6 +6010,7 @@ object_kind = "secret"
         let one = DpfDeploymentsConfig {
             bf3: DpfDeploymentConfig::default(),
             bf4_generic: Some(bf4_config(None, Some(bf4_with_psids(&["MT_0000000884"])))),
+            bf4_astra: None,
         };
         assert!(one.validate_provisioning_sources().is_ok());
 
@@ -5987,6 +6021,7 @@ object_kind = "secret"
                 None,
                 Some(bf4_with_psids(&["MT_0000000884", "MT_0000000992"])),
             )),
+            bf4_astra: None,
         };
         assert!(many.validate_provisioning_sources().is_err());
     }
