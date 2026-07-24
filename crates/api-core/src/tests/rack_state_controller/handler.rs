@@ -15,6 +15,7 @@
  * limitations under the License.
  */
 
+use carbide_rack_controller::config::ScaleUpFabricManagerApiVersion;
 use carbide_rack_controller::context::RackStateHandlerContextObjects;
 use carbide_rack_controller::handler::RackStateHandler;
 use carbide_rack_controller::maintenance::apply_nvos_job_status_response;
@@ -29,7 +30,7 @@ use db::db_read::DbReader;
 use db::{
     ObjectColumnFilter, expected_rack as db_expected_rack, rack as db_rack, switch as db_switch,
 };
-use librms::protos::rack_manager as rms;
+use librms::protos::{rack_manager as rms, rack_manager_v2 as rms_v2};
 use model::expected_machine::ExpectedMachineData;
 use model::expected_rack::ExpectedRack;
 use model::rack::{
@@ -43,7 +44,10 @@ use model::rack_type::{
     RackHardwareClass, RackHardwareTopology, RackHardwareType, RackProductFamily, RackProfile,
     RackProfileConfig,
 };
-use model::switch::{NewSwitch, SwitchConfig};
+use model::switch::{
+    CONTROL_PLANE_STATE_CONFIGURED, FabricManagerState, FabricManagerStatus, NewSwitch,
+    SwitchConfig,
+};
 use model::test_support::ManagedHostConfig;
 use state_controller::db_write_batch::DbWriteBatch;
 use state_controller::state_handler::{StateHandler, StateHandlerContext, StateHandlerOutcome};
@@ -3347,6 +3351,405 @@ async fn test_configure_nmx_cluster_configure_failure_advances_to_wait_for_fabri
         .await?
         .expect("primary switch should exist");
     assert!(primary_switch.is_primary);
+
+    Ok(())
+}
+
+#[crate::sqlx_test]
+async fn test_configure_nmx_cluster_v2_uses_full_fabric_for_partial_switch_scope(
+    pool: sqlx::PgPool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut config = config_with_nmx_cluster_profile();
+    config.rms.scale_up_fabric_manager_api_version = ScaleUpFabricManagerApiVersion::V2;
+
+    let env = create_test_env_with_overrides(
+        pool.clone(),
+        TestEnvOverrides {
+            config: Some(config),
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let rack_id = new_rack_id();
+    let mut txn = pool.acquire().await?;
+
+    db_rack::create(
+        &mut txn,
+        &rack_id,
+        Some(&RackProfileId::new("NmxCluster")),
+        &RackConfig::default(),
+        None,
+    )
+    .await?;
+
+    drop(txn);
+
+    let switch_ids = attach_switches_with_nvos_credentials(&env, &rack_id, 2).await?;
+    let secondary_switch_id = switch_ids[0];
+    let primary_switch_id = switch_ids[1];
+    let topology_type = RackHardwareTopology::Gb200Nvl72r1C2g4Topology.to_string();
+
+    let rack_config = RackConfig {
+        maintenance_requested: Some(MaintenanceScope {
+            switch_ids: vec![primary_switch_id],
+            activities: vec![MaintenanceActivity::ConfigureNmxCluster],
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+
+    let mut txn = pool.acquire().await?;
+    db_rack::update(&mut txn, &rack_id, &rack_config).await?;
+    db_switch::set_primary_switch_for_rack(&mut txn, &rack_id, &secondary_switch_id).await?;
+    drop(txn);
+
+    env.rms_sim
+        .queue_configure_scale_up_fabric_manager_v2_response(Ok(
+            rms_v2::ConfigureScaleUpFabricManagerResponse {
+                job_id: "configure-scale-up-fabric-job".to_string(),
+            },
+        ))
+        .await;
+
+    env.rms_sim
+        .queue_get_job_status_response(Ok(rms::GetJobStatusResponse {
+            job_states: vec![rms::JobStatus {
+                job_id: "configure-scale-up-fabric-job".to_string(),
+                execution_state: rms::JobExecutionState::Completed as i32,
+                state_description: "completed".to_string(),
+                ..Default::default()
+            }],
+        }))
+        .await;
+
+    env.rms_sim
+        .queue_get_scale_up_fabric_status_response(Ok(rms::GetScaleUpFabricStatusResponse {
+            status: rms::ReturnCode::Success as i32,
+            fabric_status: Some(rms::ScaleUpFabricStatus {
+                topology_type: topology_type.clone(),
+                switches: vec![
+                    rms::ScaleUpFabricSwitchStatus {
+                        node_id: secondary_switch_id.to_string(),
+                        enabled: false,
+                        ..Default::default()
+                    },
+                    rms::ScaleUpFabricSwitchStatus {
+                        node_id: primary_switch_id.to_string(),
+                        enabled: true,
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            }),
+            error_message: String::new(),
+        }))
+        .await;
+
+    let fabric_manager_status_json =
+        format!(r#"{{"status":"ok","addition-info":"{CONTROL_PLANE_STATE_CONFIGURED}"}}"#);
+
+    env.rms_sim
+        .queue_batch_get_scale_up_fabric_service_status_response(Ok(
+            rms::BatchGetScaleUpFabricServiceStatusResponse {
+                status: rms::ReturnCode::Success as i32,
+                service_statuses: switch_ids
+                    .iter()
+                    .map(|switch_id| {
+                        (
+                            switch_id.to_string(),
+                            rms::ScaleUpFabricServiceStatusEntry {
+                                status_json: fabric_manager_status_json.clone(),
+                                error_message: String::new(),
+                            },
+                        )
+                    })
+                    .collect(),
+                ..Default::default()
+            },
+        ))
+        .await;
+
+    let mut certificate_switch_ids = switch_ids.clone();
+    certificate_switch_ids.sort();
+
+    for (index, switch_id) in certificate_switch_ids.iter().enumerate() {
+        let job_id = format!("nmx-cluster-cert-job-{index}");
+        env.rms_sim
+            .queue_configure_switch_certificate_response(Ok(
+                rms::ConfigureSwitchCertificateResponse {
+                    response: Some(rms::NodeBatchResponse {
+                        status: rms::ReturnCode::Success as i32,
+                        stats: Some(rms::NodeOperationStats {
+                            total_nodes: 1,
+                            successful_nodes: 1,
+                            failed_nodes: 0,
+                        }),
+                        node_results: vec![rms::NodeOperationResult {
+                            node_id: switch_id.to_string(),
+                            status: rms::ReturnCode::Success as i32,
+                            error_message: String::new(),
+                        }],
+                        ..Default::default()
+                    }),
+                    jobs: vec![rms::ConfigureSwitchCertificateJobInfo {
+                        node_id: switch_id.to_string(),
+                        job_id: job_id.clone(),
+                    }],
+                },
+            ))
+            .await;
+
+        env.rms_sim
+            .queue_get_configure_switch_certificate_job_status_response(Ok(
+                rms::GetConfigureSwitchCertificateJobStatusResponse {
+                    status: rms::ReturnCode::Success as i32,
+                    state: "completed".to_string(),
+                    job_id,
+                    ..Default::default()
+                },
+            ))
+            .await;
+    }
+
+    let mut rack = get_db_rack(env.db_reader().as_mut(), &rack_id).await;
+    let handler_instance = RackStateHandler::default();
+
+    let mut services = env.rack_state_handler_services();
+    let mut metrics = RackMetrics::default();
+    let mut db_writes = DbWriteBatch::default();
+
+    let mut ctx = StateHandlerContext::<RackStateHandlerContextObjects> {
+        services: &mut services,
+        metrics: &mut metrics,
+        pending_db_writes: &mut db_writes,
+    };
+
+    let start = RackState::Maintenance {
+        maintenance_state: RackMaintenanceState::ConfigureNmxCluster {
+            configure_nmx_cluster: ConfigureNmxClusterState::Start,
+        },
+    };
+
+    let certificate_start = match handler_instance
+        .handle_object_state(&rack_id, &mut rack, &start, &mut ctx)
+        .await?
+    {
+        StateHandlerOutcome::Transition { next_state, .. } => next_state,
+        other => panic!(
+            "Expected Transition, got {:?}",
+            std::mem::discriminant(&other)
+        ),
+    };
+
+    assert!(matches!(
+        certificate_start,
+        RackState::Maintenance {
+            maintenance_state: RackMaintenanceState::ConfigureNmxCluster {
+                configure_nmx_cluster: ConfigureNmxClusterState::ConfigureCertificatesV2 {
+                    configure_certificate: ConfigureNmxClusterCertificateState::Start,
+                },
+            },
+        }
+    ));
+
+    let certificate_wait = match handler_instance
+        .handle_object_state(&rack_id, &mut rack, &certificate_start, &mut ctx)
+        .await?
+    {
+        StateHandlerOutcome::Transition { next_state, .. } => next_state,
+        other => panic!(
+            "Expected Transition, got {:?}",
+            std::mem::discriminant(&other)
+        ),
+    };
+
+    assert!(matches!(
+        certificate_wait,
+        RackState::Maintenance {
+            maintenance_state: RackMaintenanceState::ConfigureNmxCluster {
+                configure_nmx_cluster: ConfigureNmxClusterState::ConfigureCertificatesV2 {
+                    configure_certificate:
+                        ConfigureNmxClusterCertificateState::WaitForComplete {
+                            ref jobs,
+                        },
+                },
+            },
+        } if jobs.len() == switch_ids.len()
+            && jobs.iter().all(|job| switch_ids.contains(&job.switch_id))
+    ));
+
+    let configure = match handler_instance
+        .handle_object_state(&rack_id, &mut rack, &certificate_wait, &mut ctx)
+        .await?
+    {
+        StateHandlerOutcome::Transition { next_state, .. } => next_state,
+        other => panic!(
+            "Expected Transition, got {:?}",
+            std::mem::discriminant(&other)
+        ),
+    };
+
+    assert!(matches!(
+        configure,
+        RackState::Maintenance {
+            maintenance_state: RackMaintenanceState::ConfigureNmxCluster {
+                configure_nmx_cluster: ConfigureNmxClusterState::ConfigureScaleUpFabricManagerV2,
+            },
+        }
+    ));
+
+    let job_wait = match handler_instance
+        .handle_object_state(&rack_id, &mut rack, &configure, &mut ctx)
+        .await?
+    {
+        StateHandlerOutcome::Transition { next_state, .. } => next_state,
+        other => panic!(
+            "Expected Transition, got {:?}",
+            std::mem::discriminant(&other)
+        ),
+    };
+
+    assert!(matches!(
+        job_wait,
+        RackState::Maintenance {
+            maintenance_state: RackMaintenanceState::ConfigureNmxCluster {
+                configure_nmx_cluster:
+                    ConfigureNmxClusterState::WaitForScaleUpFabricManagerJob {
+                        ref job_id,
+                    },
+            },
+        } if job_id == "configure-scale-up-fabric-job"
+    ));
+
+    let next = match handler_instance
+        .handle_object_state(&rack_id, &mut rack, &job_wait, &mut ctx)
+        .await?
+    {
+        StateHandlerOutcome::Transition { next_state, .. } => next_state,
+        other => panic!(
+            "Expected Transition, got {:?}",
+            std::mem::discriminant(&other)
+        ),
+    };
+
+    assert!(matches!(
+        next,
+        RackState::Maintenance {
+            maintenance_state: RackMaintenanceState::Completed,
+        }
+    ));
+
+    let certificate_requests = env
+        .rms_sim
+        .submitted_configure_switch_certificate_requests()
+        .await;
+
+    assert_eq!(certificate_requests.len(), switch_ids.len());
+
+    assert!(
+        env.rms_sim
+            .submitted_batch_set_scale_up_fabric_state_requests()
+            .await
+            .is_empty()
+    );
+
+    assert!(
+        env.rms_sim
+            .submitted_batch_get_node_device_info_requests()
+            .await
+            .is_empty()
+    );
+
+    let configure_requests = env
+        .rms_sim
+        .submitted_configure_scale_up_fabric_manager_v2_requests()
+        .await;
+
+    assert_eq!(configure_requests.len(), 1);
+
+    let configure_request = &configure_requests[0];
+
+    let desired = configure_request
+        .config
+        .as_ref()
+        .ok_or_else(|| eyre::eyre!("configure request should include desired fabric config"))?;
+
+    assert_eq!(desired.topology_type, topology_type);
+    assert_eq!(configure_request.primary_switch_node_id, None);
+
+    let configure_nodes = &configure_request
+        .nodes
+        .as_ref()
+        .ok_or_else(|| eyre::eyre!("configure request should include all switches"))?
+        .nodes;
+
+    assert_eq!(configure_nodes.len(), switch_ids.len());
+
+    assert_eq!(
+        env.rms_sim.submitted_get_job_status_requests().await.len(),
+        1
+    );
+
+    let status_requests = env
+        .rms_sim
+        .submitted_get_scale_up_fabric_status_requests()
+        .await;
+
+    assert_eq!(status_requests.len(), 1);
+
+    let status_nodes = &status_requests[0]
+        .nodes
+        .as_ref()
+        .ok_or_else(|| eyre::eyre!("status request should include all switches"))?
+        .nodes;
+
+    assert_eq!(status_nodes.len(), switch_ids.len());
+
+    let fabric_manager_status_requests = env
+        .rms_sim
+        .submitted_batch_get_scale_up_fabric_service_status_requests()
+        .await;
+
+    assert_eq!(fabric_manager_status_requests.len(), 1);
+
+    let fabric_manager_status_nodes = &fabric_manager_status_requests[0]
+        .nodes
+        .as_ref()
+        .ok_or_else(|| eyre::eyre!("status persistence request should include all switches"))?
+        .nodes;
+
+    assert_eq!(fabric_manager_status_nodes.len(), switch_ids.len());
+
+    let mut txn = pool.acquire().await?;
+
+    let primary_switch = db_switch::find_by_id(&mut txn, &primary_switch_id)
+        .await?
+        .expect("primary switch should exist");
+
+    let secondary_switch = db_switch::find_by_id(&mut txn, &secondary_switch_id)
+        .await?
+        .expect("secondary switch should exist");
+
+    assert!(primary_switch.is_primary);
+    assert!(!secondary_switch.is_primary);
+
+    let expected_fabric_manager_status = FabricManagerStatus {
+        fabric_manager_state: FabricManagerState::Ok,
+        addition_info: Some(CONTROL_PLANE_STATE_CONFIGURED.to_string()),
+        reason: None,
+        error_message: None,
+    };
+
+    assert_eq!(
+        primary_switch.fabric_manager_status.as_ref(),
+        Some(&expected_fabric_manager_status)
+    );
+
+    assert_eq!(
+        secondary_switch.fabric_manager_status.as_ref(),
+        Some(&expected_fabric_manager_status)
+    );
 
     Ok(())
 }

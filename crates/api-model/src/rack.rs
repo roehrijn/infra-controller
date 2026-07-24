@@ -465,14 +465,43 @@ impl Display for RackMaintenanceState {
 /// configures only the primary switch. `WaitForFabricStatus` polls
 /// `BatchGetScaleUpFabricServiceStatus` and persists the per-switch
 /// `fabric_manager_status` before advancing.
+///
+/// The V2 states install certificates on all rack switches, submit asynchronous
+/// fabric configuration without a primary override, and persist the primary and
+/// per-switch Fabric Manager status reported by RMS after the job completes.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ConfigureNmxClusterState {
     Start,
     ConfigureCertificates {
         configure_certificate: ConfigureNmxClusterCertificateState,
     },
+
+    /// Installs and verifies mTLS certificates on every rack switch for V2.
+    ConfigureCertificatesV2 {
+        /// Current certificate configuration sub-state.
+        configure_certificate: ConfigureNmxClusterCertificateState,
+    },
+
     DisableScaleUpFabricState,
     ConfigureScaleUpFabricManager,
+
+    /// Submits the V2 desired topology and all rack switches to RMS.
+    ///
+    /// This path skips `DisableScaleUpFabricState` and leaves primary selection
+    /// to RMS.
+    ConfigureScaleUpFabricManagerV2,
+
+    /// Polls the asynchronous V2 configuration job.
+    ///
+    /// After the job completes, NICo reads the observed fabric status,
+    /// validates the RMS-selected primary, persists it with the per-switch
+    /// Fabric Manager status, and advances to the next requested maintenance
+    /// activity.
+    WaitForScaleUpFabricManagerJob {
+        /// RMS job identifier returned by V2 submission.
+        job_id: String,
+    },
+
     WaitForFabricStatus,
 }
 
@@ -503,11 +532,20 @@ impl Display for ConfigureNmxClusterState {
             ConfigureNmxClusterState::ConfigureCertificates {
                 configure_certificate,
             } => write!(f, "ConfigureCertificates({configure_certificate})"),
+            ConfigureNmxClusterState::ConfigureCertificatesV2 {
+                configure_certificate,
+            } => write!(f, "ConfigureCertificatesV2({configure_certificate})"),
             ConfigureNmxClusterState::DisableScaleUpFabricState => {
                 write!(f, "DisableScaleUpFabricState")
             }
             ConfigureNmxClusterState::ConfigureScaleUpFabricManager => {
                 write!(f, "ConfigureScaleUpFabricManager")
+            }
+            ConfigureNmxClusterState::ConfigureScaleUpFabricManagerV2 => {
+                write!(f, "ConfigureScaleUpFabricManagerV2")
+            }
+            ConfigureNmxClusterState::WaitForScaleUpFabricManagerJob { job_id } => {
+                write!(f, "WaitForScaleUpFabricManagerJob({job_id})")
             }
             ConfigureNmxClusterState::WaitForFabricStatus => write!(f, "WaitForFabricStatus"),
         }

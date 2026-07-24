@@ -55,6 +55,25 @@ impl RackValidationConfig {
     }
 }
 
+/// RMS API version used by the ScaleUpFabric Manager configuration workflow.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScaleUpFabricManagerApiVersion {
+    /// Uses the legacy synchronous API.
+    ///
+    /// This remains the default for backward compatibility. NICo selects the
+    /// primary switch and disables ScaleUpFabric state before configuration.
+    #[default]
+    V1,
+
+    /// Uses the asynchronous API introduced by RMS v0.10.0.
+    ///
+    /// NICo skips the V1 ScaleUpFabric disable step, sends every switch in the
+    /// rack without a primary override, polls the returned job, and then reads
+    /// and persists the primary and per-switch Fabric Manager status from RMS.
+    V2,
+}
+
 /// Rack Manager Service (RMS) configuration for API connectivity and mTLS.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct RmsConfig {
@@ -73,8 +92,58 @@ pub struct RmsConfig {
     /// Enforce TLS when connecting to RMS. Defaults to true.
     #[serde(default = "default_rms_enforce_tls")]
     pub enforce_tls: bool,
+
+    /// RMS API used to configure ScaleUpFabric Manager.
+    ///
+    /// `v1` is the default and preserves the synchronous workflow. `v2`
+    /// delegates primary selection to RMS and waits for its asynchronous job.
+    /// The version is captured when `ConfigureNmxCluster::Start` enters its
+    /// version-specific certificate state, so a configuration reload does not
+    /// redirect an in-progress workflow.
+    #[serde(default)]
+    pub scale_up_fabric_manager_api_version: ScaleUpFabricManagerApiVersion,
 }
 
 fn default_rms_enforce_tls() -> bool {
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{RmsConfig, ScaleUpFabricManagerApiVersion};
+
+    #[test]
+    fn rms_config_defaults_scale_up_fabric_manager_to_v1() {
+        let config: RmsConfig =
+            serde_json::from_value(serde_json::json!({})).expect("RMS config should deserialize");
+
+        assert_eq!(
+            config.scale_up_fabric_manager_api_version,
+            ScaleUpFabricManagerApiVersion::V1
+        );
+    }
+
+    #[test]
+    fn rms_config_accepts_supported_scale_up_fabric_manager_apis() {
+        for (value, expected) in [
+            ("v1", ScaleUpFabricManagerApiVersion::V1),
+            ("v2", ScaleUpFabricManagerApiVersion::V2),
+        ] {
+            let config: RmsConfig = serde_json::from_value(serde_json::json!({
+                "scale_up_fabric_manager_api_version": value
+            }))
+            .expect("supported RMS API config should deserialize");
+
+            assert_eq!(config.scale_up_fabric_manager_api_version, expected);
+        }
+    }
+
+    #[test]
+    fn rms_config_rejects_unknown_scale_up_fabric_manager_api() {
+        let result = serde_json::from_value::<RmsConfig>(serde_json::json!({
+            "scale_up_fabric_manager_api_version": "automatic"
+        }));
+
+        assert!(result.is_err());
+    }
 }

@@ -640,6 +640,22 @@ be propagated there by DPF.
 | `client_cert` | `Option<String>` | — | Path to the client certificate PEM for mTLS. |
 | `client_key` | `Option<String>` | — | Path to the client private key PEM for mTLS. |
 | `enforce_tls` | `bool` | `true` | Enforce TLS when connecting to RMS. |
+| `scale_up_fabric_manager_api_version` | `ScaleUpFabricManagerApiVersion` | `v1` | ScaleUpFabric Manager configuration API: `v1` uses the synchronous call after disabling ScaleUpFabric state; `v2` submits an asynchronous job and polls it to completion. |
+
+The selected API version is captured when `ConfigureNmxCluster::Start` enters
+its version-specific certificate state. Reloading configuration does not switch
+an in-progress workflow. With `v2`, NICo treats configuration as a rack-wide
+fabric operation: it configures certificates on every rack switch and sends the
+complete rack switch set without a primary override. It skips the V1
+`BatchSetScaleUpFabricState(false)` step. After the asynchronous job completes,
+NICo reads `GetScaleUpFabricStatus` to validate the primary selected by RMS, then
+reads `BatchGetScaleUpFabricServiceStatus` before persisting the selected primary
+and per-switch Fabric Manager status. It then advances to the next maintenance
+activity. Missing jobs and transient RPC failures are retried; failed jobs,
+non-retryable RPC errors, and malformed status responses transition the rack to
+an error state. V2 certificate submission failures also transition the rack to
+an error state because automatically replaying a partially submitted set could
+create duplicate jobs.
 
 ### `SpdmConfig`
 
