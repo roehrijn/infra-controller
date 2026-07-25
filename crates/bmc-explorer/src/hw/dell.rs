@@ -17,7 +17,7 @@
 
 use crate::hw::BiosAttr;
 
-pub const EXPECTED_BIOS_ATTRS: [BiosAttr; 14] = [
+pub const EXPECTED_BIOS_ATTRS: [BiosAttr; 13] = [
     BiosAttr::new_str("InBandManageabilityInterface", "Disabled"),
     BiosAttr::new_str("UefiVariableAccess", "Standard"),
     BiosAttr::new_any_str("SerialComm", &["OnConRedirAuto", "OnConRedir"]), // Second is legacy
@@ -26,10 +26,14 @@ pub const EXPECTED_BIOS_ATTRS: [BiosAttr; 14] = [
     BiosAttr::new_str("ConTermType", "Vt100Vt220"),
     BiosAttr::new_str("RedirAfterBoot", "Enabled"),
     BiosAttr::new_str("SriovGlobalEnable", "Enabled"),
-    BiosAttr::new_str("TpmSecurity", "On"),
+    // TpmSecurity dropped: legacy iDRAC8 (TPM 1.2 / T330) reports it Off, which
+    // is never a diff we can or want to remediate. Tpm2Hierarchy/Tpm2Algorithm
+    // are absent on such hosts, so verify_bios_attr already skips them.
     BiosAttr::new_str("Tpm2Hierarchy", "Enabled"), // Setup puts "Clear" here.
     BiosAttr::new_str("Tpm2Algorithm", "SHA256"),
     BiosAttr::new_str("HttpDev1EnDis", "Enabled"),
     BiosAttr::new_str("HttpDev1TlsMode", "None"),
-    BiosAttr::new_str("PxeDev1EnDis", "Disabled"),
+    // PxeDev1EnDis is Disabled on the iDRAC9 HTTP-boot profile but Enabled on
+    // the legacy iDRAC8 PXE-only path; accept both so one image serves both.
+    BiosAttr::new_any_str("PxeDev1EnDis", &["Disabled", "Enabled"]),
 ];
