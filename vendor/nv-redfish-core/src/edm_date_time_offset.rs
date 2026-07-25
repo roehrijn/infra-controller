@@ -1,0 +1,335 @@
+// SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! `Edm.DateTimeOffset` primitive wrapper
+//!
+//! Represents Redfish/OData `Edm.DateTimeOffset` values. Internally wraps
+//! `time::OffsetDateTime` and (de)serializes using RFC 3339. Display always
+//! uses canonical RFC 3339 formatting; `+00:00` is rendered as `Z` while
+//! non‑UTC offsets are preserved.
+//!
+//! References:
+//! - OASIS OData 4.01 CSDL, Primitive Types: Edm.DateTimeOffset — `https://docs.oasis-open.org/odata/`
+//! - DMTF Redfish Specification DSP0266 — `https://www.dmtf.org/standards/redfish`
+//! - RFC 3339: Date and Time on the Internet — `https://datatracker.ietf.org/doc/html/rfc3339`
+//!
+//! Examples
+//! ```rust
+//! use nv_redfish_core::EdmDateTimeOffset;
+//! use std::str::FromStr;
+//!
+//! let z = EdmDateTimeOffset::from_str("2021-03-04T05:06:07Z").unwrap();
+//! assert_eq!(z.to_string(), "2021-03-04T05:06:07Z".to_string());
+//!
+//! let plus = EdmDateTimeOffset::from_str("2021-03-04T10:36:07+05:30").unwrap();
+//! assert_eq!(plus.to_string(), "2021-03-04T10:36:07+05:30");
+//! ```
+//!
+//! ```rust
+//! use nv_redfish_core::EdmDateTimeOffset;
+//!
+//! // Serde JSON uses RFC3339 strings; +00:00 canonicalizes to Z
+//! let v: EdmDateTimeOffset = "2021-03-04T05:06:07+00:00".parse().unwrap();
+//! let s = serde_json::to_string(&v).unwrap();
+//! assert_eq!(s, r#""2021-03-04T05:06:07Z""#);
+//! ```
+//!
+
+use core::str::FromStr;
+use serde::{Deserialize, Serialize};
+use std::convert::TryFrom;
+use std::error::Error as StdError;
+use std::fmt::Display;
+use std::fmt::Error as FmtError;
+use std::fmt::Formatter;
+use std::fmt::Result as FmtResult;
+use std::time::Duration;
+use std::time::SystemTime;
+use time::format_description::well_known::Rfc3339;
+use time::OffsetDateTime;
+
+#[derive(Debug, PartialEq, Eq)]
+#[non_exhaustive]
+/// Errors for the [`EdmDateTimeOffset`].
+pub enum Error {
+    /// Conversion to [`SystemTime`] failed because the value is not
+    /// representable as a system time. In particular, on Windows any
+    /// time point before 1601 is not representable.
+    OutOfSystemTimeRange,
+}
+
+impl Display for Error {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
+        match self {
+            Self::OutOfSystemTimeRange => {
+                f.write_str("value is outside the representable system time range")
+            }
+        }
+    }
+}
+
+impl StdError for Error {}
+
+/// Type corresponding to `Edm.DateTimeOffset`.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct EdmDateTimeOffset(#[serde(with = "time::serde::rfc3339")] OffsetDateTime);
+
+impl From<OffsetDateTime> for EdmDateTimeOffset {
+    fn from(dt: OffsetDateTime) -> Self {
+        Self(dt)
+    }
+}
+
+impl From<EdmDateTimeOffset> for OffsetDateTime {
+    fn from(w: EdmDateTimeOffset) -> Self {
+        w.0
+    }
+}
+
+impl TryFrom<EdmDateTimeOffset> for SystemTime {
+    type Error = Error;
+    fn try_from(w: EdmDateTimeOffset) -> Result<Self, Self::Error> {
+        let unix_timestamp = w.0.unix_timestamp();
+        let nanos = w.0.nanosecond();
+
+        if unix_timestamp >= 0 {
+            let duration = Duration::new(unix_timestamp.unsigned_abs(), nanos);
+            Self::UNIX_EPOCH
+                .checked_add(duration)
+                .ok_or(Error::OutOfSystemTimeRange)
+        } else {
+            let duration = if nanos == 0 {
+                Duration::new(unix_timestamp.unsigned_abs(), nanos)
+            } else {
+                Duration::new(unix_timestamp.unsigned_abs() - 1, 1_000_000_000 - nanos)
+            };
+
+            Self::UNIX_EPOCH
+                .checked_sub(duration)
+                .ok_or(Error::OutOfSystemTimeRange)
+        }
+    }
+}
+
+impl Display for EdmDateTimeOffset {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
+        let s = self.0.format(&Rfc3339).map_err(|_| FmtError)?;
+        f.write_str(&s)
+    }
+}
+
+#[allow(clippy::absolute_paths)]
+impl FromStr for EdmDateTimeOffset {
+    type Err = time::error::Parse;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let dt = OffsetDateTime::parse(s, &Rfc3339)?;
+        Ok(Self(dt))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::convert::TryInto;
+    use time::UtcOffset;
+
+    #[test]
+    fn parses_and_displays_utc_z() {
+        let s = "2021-03-04T05:06:07Z";
+        let w: EdmDateTimeOffset = s.parse().unwrap();
+        assert_eq!(w.to_string(), s);
+
+        let dt: OffsetDateTime = w.into();
+        assert_eq!(dt.offset(), UtcOffset::UTC);
+    }
+
+    #[test]
+    fn parses_utc_plus00_canonicalizes_to_z_on_display() {
+        let s = "2021-03-04T05:06:07+00:00";
+        let w: EdmDateTimeOffset = s.parse().unwrap();
+        let displayed = w.to_string();
+        assert!(displayed.ends_with('Z'));
+    }
+
+    #[test]
+    fn parses_and_displays_positive_offset() {
+        let s = "2021-03-04T10:36:07+05:30"; // same instant as 05:06:07Z
+        let w: EdmDateTimeOffset = s.parse().unwrap();
+        assert_eq!(w.to_string(), s);
+
+        let dt: OffsetDateTime = w.into();
+        assert_eq!(dt.offset(), UtcOffset::from_hms(5, 30, 0).unwrap());
+    }
+
+    #[test]
+    fn parses_and_displays_fractional_seconds() {
+        let s = "2021-03-04T05:06:07.123456789Z";
+        let w: EdmDateTimeOffset = s.parse().unwrap();
+        assert_eq!(w.to_string(), s);
+    }
+
+    #[test]
+    fn rejects_invalid_inputs() {
+        assert!("not-a-date".parse::<EdmDateTimeOffset>().is_err());
+        // RFC3339 requires an explicit offset
+        assert!("2021-03-04T05:06:07".parse::<EdmDateTimeOffset>().is_err());
+    }
+
+    #[test]
+    fn serde_serializes_conformant_strings() {
+        // UTC Z
+        let w_z: EdmDateTimeOffset = "2021-03-04T05:06:07Z".parse().unwrap();
+        let json_z = serde_json::to_string(&w_z).unwrap();
+        assert_eq!(json_z, r#""2021-03-04T05:06:07Z""#);
+
+        // Non-UTC offset preserved
+        let w_pos: EdmDateTimeOffset = "2021-03-04T10:36:07+05:30".parse().unwrap();
+        let json_pos = serde_json::to_string(&w_pos).unwrap();
+        assert_eq!(json_pos, r#""2021-03-04T10:36:07+05:30""#);
+
+        // Fractional seconds retained
+        let w_frac: EdmDateTimeOffset = "2021-03-04T05:06:07.123456789Z".parse().unwrap();
+        let json_frac = serde_json::to_string(&w_frac).unwrap();
+        assert_eq!(json_frac, r#""2021-03-04T05:06:07.123456789Z""#);
+
+        // Canonicalize +00:00 to Z
+        let w_plus00: EdmDateTimeOffset = "2021-03-04T05:06:07+00:00".parse().unwrap();
+        let json_plus00 = serde_json::to_string(&w_plus00).unwrap();
+        assert_eq!(json_plus00, r#""2021-03-04T05:06:07Z""#);
+    }
+
+    #[test]
+    fn serde_deserializes_from_conformant_strings() {
+        // UTC Z
+        let s_z = r#""2021-03-04T05:06:07Z""#;
+        let w_z: EdmDateTimeOffset = serde_json::from_str(s_z).unwrap();
+        assert_eq!(w_z.to_string(), "2021-03-04T05:06:07Z");
+        let dt_z: OffsetDateTime = w_z.into();
+        assert_eq!(dt_z.offset(), UtcOffset::UTC);
+
+        // Non-UTC offset preserved
+        let s_pos = r#""2021-03-04T10:36:07+05:30""#;
+        let w_pos: EdmDateTimeOffset = serde_json::from_str(s_pos).unwrap();
+        assert_eq!(w_pos.to_string(), "2021-03-04T10:36:07+05:30");
+        let dt_pos: OffsetDateTime = w_pos.into();
+        assert_eq!(dt_pos.offset(), UtcOffset::from_hms(5, 30, 0).unwrap());
+
+        // Fractional seconds retained
+        let s_frac = r#""2021-03-04T05:06:07.123456789Z""#;
+        let w_frac: EdmDateTimeOffset = serde_json::from_str(s_frac).unwrap();
+        assert_eq!(w_frac.to_string(), "2021-03-04T05:06:07.123456789Z");
+    }
+
+    #[test]
+    fn parses_and_displays_negative_offset() {
+        let s = "2021-03-04T00:06:07-05:00";
+        let w: EdmDateTimeOffset = s.parse().unwrap();
+        assert_eq!(w.to_string(), s);
+
+        let dt: OffsetDateTime = w.into();
+        assert_eq!(dt.offset(), UtcOffset::from_hms(-5, 0, 0).unwrap());
+    }
+
+    #[test]
+    fn parses_fractional_with_non_utc_offset() {
+        let s = "2021-03-04T05:06:07.5+01:00";
+        let w: EdmDateTimeOffset = s.parse().unwrap();
+        assert_eq!(w.to_string(), s);
+    }
+
+    #[test]
+    fn parses_boundary_offsets() {
+        // Commonly used extrema
+        let s_plus = "2021-03-04T12:00:00+14:00";
+        let w_plus: EdmDateTimeOffset = s_plus.parse().unwrap();
+        assert_eq!(w_plus.to_string(), s_plus);
+
+        let s_minus = "2021-03-04T12:00:00-12:00";
+        let w_minus: EdmDateTimeOffset = s_minus.parse().unwrap();
+        assert_eq!(w_minus.to_string(), s_minus);
+    }
+
+    #[test]
+    fn rejects_leap_second() {
+        assert!("2021-03-04T23:59:60Z".parse::<EdmDateTimeOffset>().is_err());
+    }
+
+    #[test]
+    fn canonicalizes_negative_zero_offset_to_z() {
+        let s = "2021-03-04T05:06:07-00:00";
+        let w: EdmDateTimeOffset = s.parse().unwrap();
+        assert_eq!("2021-03-04T05:06:07Z", w.to_string());
+    }
+
+    #[test]
+    fn converts_to_system_time() {
+        let normal: EdmDateTimeOffset = "2021-03-04T05:06:07-00:00".parse().unwrap();
+        let time: SystemTime = normal.try_into().unwrap();
+        assert_eq!(
+            time.duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+            1614834367
+        );
+
+        let before_epoch: EdmDateTimeOffset = "1960-01-01T00:00:00-00:00".parse().unwrap();
+        let time: SystemTime = before_epoch.try_into().unwrap();
+        assert_eq!(
+            SystemTime::UNIX_EPOCH
+                .duration_since(time)
+                .unwrap()
+                .as_secs(),
+            315619200
+        );
+
+        let fractional_before_epoch: EdmDateTimeOffset = "1969-12-31T23:59:59.5Z".parse().unwrap();
+        let time: SystemTime = fractional_before_epoch.try_into().unwrap();
+        let duration = SystemTime::UNIX_EPOCH.duration_since(time).unwrap();
+        assert_eq!(duration.as_secs(), 0);
+        assert_eq!(duration.subsec_nanos(), 500_000_000);
+
+        // This can fail on Windows because it uses the FILETIME
+        // representation, whose epoch is the year 1601.
+        let very_old: EdmDateTimeOffset = "0001-01-01T00:00:00-00:00".parse().unwrap();
+        let _ = very_old.try_into().map(|time| {
+            assert_eq!(
+                SystemTime::UNIX_EPOCH
+                    .duration_since(time)
+                    .unwrap()
+                    .as_secs(),
+                62135596800
+            );
+        });
+        let windows_very_old: EdmDateTimeOffset = "1601-01-01T00:00:00-00:00".parse().unwrap();
+        let time = windows_very_old.try_into().unwrap();
+        assert_eq!(
+            SystemTime::UNIX_EPOCH
+                .duration_since(time)
+                .unwrap()
+                .as_secs(),
+            11644473600
+        );
+        let far_future: EdmDateTimeOffset = "9999-12-31T23:59:59-00:00".parse().unwrap();
+        let time: SystemTime = far_future.try_into().unwrap();
+        assert_eq!(
+            time.duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+            253402300799
+        );
+    }
+}
