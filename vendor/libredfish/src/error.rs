@@ -142,4 +142,45 @@ impl RedfishError {
                 response_body: _,
             } if *status_code == StatusCode::NOT_FOUND)
     }
+
+    /// Returns `true` if the operation failed with HTTP 405 Method Not Allowed.
+    ///
+    /// Legacy iDRAC8 answers a POST to an unsupported Dell OEM action path (e.g.
+    /// `DellJobService.DeleteJobQueue`) with 405 rather than 404, so the OEM
+    /// fallbacks must treat it the same as "resource absent".
+    pub fn method_not_allowed(&self) -> bool {
+        // clippy wants use of matches! macro
+        matches!(self, RedfishError::HTTPErrorCode {
+                url: _,
+                status_code,
+                response_body: _,
+            } if *status_code == StatusCode::METHOD_NOT_ALLOWED)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn http_err(status_code: StatusCode) -> RedfishError {
+        RedfishError::HTTPErrorCode {
+            url: "Managers/iDRAC.Embedded.1/Oem/Dell/DellJobService".to_string(),
+            status_code,
+            response_body: String::new(),
+        }
+    }
+
+    #[test]
+    fn not_found_matches_only_404() {
+        assert!(http_err(StatusCode::NOT_FOUND).not_found());
+        assert!(!http_err(StatusCode::METHOD_NOT_ALLOWED).not_found());
+        assert!(!http_err(StatusCode::OK).not_found());
+    }
+
+    #[test]
+    fn method_not_allowed_matches_only_405() {
+        assert!(http_err(StatusCode::METHOD_NOT_ALLOWED).method_not_allowed());
+        assert!(!http_err(StatusCode::NOT_FOUND).method_not_allowed());
+        assert!(!http_err(StatusCode::OK).method_not_allowed());
+    }
 }

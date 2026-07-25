@@ -6,6 +6,9 @@
 //   cargo build --example idrac8_probe
 //   scp target/debug/examples/idrac8_probe jroehrich@192.168.0.2:/tmp/idrac8_probe
 //   just mgmt '/tmp/idrac8_probe'
+use std::time::Duration;
+
+use libredfish::model::service_root::RedfishVendor;
 use libredfish::{BootInterfaceRef, Endpoint, RedfishClientPool, RedfishError};
 use mac_address::MacAddress;
 
@@ -34,18 +37,28 @@ async fn main() {
         }};
     }
 
-    let pool = RedfishClientPool::builder().build().expect("pool");
-    let ep = Endpoint {
+    // iDRAC8 BMCs are slow (observed ~18s/request when degraded); use generous
+    // timeouts so the probe tolerates it instead of reporting false failures.
+    let pool = RedfishClientPool::builder()
+        .danger_accept_invalid_certs() // iDRAC8 serves a self-signed cert (curl -k)
+        .connect_timeout(Duration::from_secs(60))
+        .timeout(Duration::from_secs(120))
+        .build()
+        .expect("pool");
+    let mk_ep = || Endpoint {
         host: HOST.to_string(),
         port: None,
         user: Some(USER.to_string()),
         password: Some(PASS.to_string()),
     };
 
-    // 0 -- baseline: create_client + vendor detection (Oem fallback -> Dell).
-    let client = match pool.create_client(ep).await {
+    // 0 -- baseline: create_client AUTO-DETECTS the vendor, exactly as NICo's
+    // machine-controller does (client_by_info passes vendor=None). This must
+    // resolve to the Dell client for the T330 (iDRAC8 reports "Dell Inc."), else
+    // every Dell-specific operation falls through to a NotSupported stub.
+    let client = match pool.create_client(mk_ep()).await {
         Ok(c) => {
-            println!("[PASS] 0 create_client");
+            println!("[PASS] 0 create_client (auto-detect)");
             c
         }
         Err(e) => {
@@ -56,8 +69,12 @@ async fn main() {
     match client.get_service_root().await {
         Ok(sr) => check!(
             "0 vendor",
-            format!("{:?}", sr.vendor()).contains("Dell"),
-            format!("vendor={:?}", sr.vendor())
+            sr.vendor() == Some(RedfishVendor::Dell),
+            format!(
+                "vendor={:?} vendor_string={:?}",
+                sr.vendor(),
+                sr.vendor_string()
+            )
         ),
         Err(e) => check!("0 vendor", false, format!("{e:?}")),
     }
@@ -124,8 +141,48 @@ async fn main() {
         Err(e) => check!("7 is_ipmi_over_lan_enabled", false, format!("{e:?}")),
     }
 
-    // Patch 2 (legacy job create/delete) is write-mostly and is exercised by the
-    // gated write-probe, not this read-only checklist.
+    // Patch 2 -- legacy job create/delete. WRITE paths, gated behind
+    // PROBE_ALLOW_WRITES=1: they clear the BMC job queue and create+delete a
+    // config job (real BMC writes, but nothing destructive -- no disk, no boot
+    // order, no reboot). This is the path that wedged live on iDRAC8's HTTP 405
+    // for DellJobService.DeleteJobQueue.
+    if std::env::var("PROBE_ALLOW_WRITES").as_deref() == Ok("1") {
+        // 2a -- delete_job_queue must complete via the legacy fallback. Pre-fix
+        // it returned the 405 error; post-fix it falls back to Managers/{id}/Jobs.
+        match pool.dell_delete_job_queue(mk_ep()).await {
+            Ok(()) => check!("2a delete_job_queue", true, "Ok (legacy fallback cleared queue)"),
+            Err(e) => check!("2a delete_job_queue", false, format!("{e:?}")),
+        }
+
+        // 2b -- create_bios_config_job must reach the legacy Jobs collection. A
+        // 404/405 propagating means the fallback did NOT fire (FAIL); an Ok job
+        // id means it created one (clean it up); any other iDRAC-level rejection
+        // (e.g. no staged settings) still proves the fallback fired (PASS).
+        match pool.dell_create_bios_config_job(mk_ep()).await {
+            Ok(jid) => {
+                check!(
+                    "2b create_bios_config_job",
+                    true,
+                    format!("Ok(job={jid}); cleaning up")
+                );
+                if let Err(e) = pool.dell_delete_job_queue(mk_ep()).await {
+                    println!("[WARN] 2b cleanup delete_job_queue -- {e:?}");
+                }
+            }
+            Err(e) if e.not_found() || e.method_not_allowed() => check!(
+                "2b create_bios_config_job",
+                false,
+                format!("OEM path not handled (fallback did not fire): {e:?}")
+            ),
+            Err(e) => check!(
+                "2b create_bios_config_job",
+                true,
+                format!("legacy fallback fired; iDRAC rejected w/o staged settings: {e:?}")
+            ),
+        }
+    } else {
+        println!("[SKIP] 2 write-probe (set PROBE_ALLOW_WRITES=1 to run delete/create job paths)");
+    }
 
     println!("\n{failed} check(s) failed");
     if failed > 0 {

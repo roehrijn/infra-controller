@@ -1805,7 +1805,7 @@ impl Bmc {
     }
 
     // No changes can be applied if there are pending jobs
-    async fn delete_job_queue(&self) -> Result<(), RedfishError> {
+    pub(crate) async fn delete_job_queue(&self) -> Result<(), RedfishError> {
         // The queue can't be cleared if system lockdown is enabled
         if self.is_lockdown().await? {
             return Err(RedfishError::Lockdown);
@@ -1819,8 +1819,11 @@ impl Bmc {
         body.insert("JobID", "JID_CLEARALL".to_string());
         match self.s.client.post(&url, body).await {
             Ok(_resp) => Ok(()),
-            // Legacy iDRAC8 has no DellJobService; clear the legacy job queue instead.
-            Err(e) if e.not_found() => self.delete_job_queue_legacy().await,
+            // Legacy iDRAC8 has no DellJobService; it answers the action POST with
+            // 405 (Method Not Allowed), not 404. Clear the legacy job queue instead.
+            Err(e) if e.not_found() || e.method_not_allowed() => {
+                self.delete_job_queue_legacy().await
+            }
             Err(e) => Err(e),
         }
     }
@@ -2416,8 +2419,9 @@ impl Bmc {
         match self.s.client.post(url, &arg).await {
             Ok((_, Some(headers))) => self.parse_job_id_from_response_headers(url, headers).await,
             Ok((_, None)) => Err(RedfishError::NoHeader),
-            // Legacy iDRAC8 creates config jobs on the legacy Jobs collection.
-            Err(e) if e.not_found() => {
+            // Legacy iDRAC8 creates config jobs on the legacy Jobs collection;
+            // the OEM collection is absent (404) or rejects the POST (405).
+            Err(e) if e.not_found() || e.method_not_allowed() => {
                 let legacy_url = "Managers/iDRAC.Embedded.1/Jobs";
                 match self.s.client.post(legacy_url, &arg).await? {
                     (_, Some(headers)) => {
