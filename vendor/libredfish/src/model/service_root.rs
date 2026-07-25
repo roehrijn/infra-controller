@@ -117,6 +117,12 @@ impl ServiceRoot {
             "supermicro" => RedfishVendor::Supermicro,
             "lite-on technology corp." => RedfishVendor::LiteOnPowerShelf,
             "delta" => RedfishVendor::DeltaPowerShelf,
+            // Some Dell iDRACs report "Dell Inc." in the ServiceRoot Vendor field
+            // (seen on iDRAC8 / PowerEdge T330 under authenticated access) rather
+            // than the bare "Dell" Oem key. Without this, auto-detect returns
+            // Unknown and callers get the standard client instead of the Dell one
+            // (the machine-controller creates its client via auto-detect).
+            s if s.starts_with("dell") => RedfishVendor::Dell,
             _ => RedfishVendor::Unknown,
         })
     }
@@ -144,6 +150,31 @@ mod test {
         let data = include_str!("testdata/supermicro_service_root.json");
         let result: super::ServiceRoot = serde_json::from_str(data).unwrap();
         assert_eq!(result.vendor().unwrap(), RedfishVendor::Supermicro);
+    }
+
+    #[test]
+    fn test_dell_inc_vendor_string_detected_as_dell() {
+        // iDRAC8 (PowerEdge T330) reports "Dell Inc." in the Vendor field; the
+        // exact "dell" arm misses it, so auto-detect must fall through to the
+        // dell-family guard and still select the Dell client.
+        let result = ServiceRoot {
+            vendor: Some("Dell Inc.".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(result.vendor().unwrap(), RedfishVendor::Dell);
+    }
+
+    #[test]
+    fn test_dell_oem_key_detected_as_dell() {
+        // No Vendor field, only an Oem "Dell" key (iDRAC9-style ServiceRoot).
+        let result = ServiceRoot {
+            oem: Some(std::collections::HashMap::from([(
+                "Dell".to_string(),
+                serde_json::Value::Null,
+            )])),
+            ..Default::default()
+        };
+        assert_eq!(result.vendor().unwrap(), RedfishVendor::Dell);
     }
 
     #[test]
