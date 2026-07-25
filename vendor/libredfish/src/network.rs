@@ -184,6 +184,52 @@ impl RedfishClientPool {
             .await
     }
 
+    // Builds a concrete Dell (iDRAC) client for direct OEM calls that the
+    // generic `Redfish` trait object does not expose. Mirrors the resource
+    // setup in `create_client_impl` (service root, manager id, system id) but
+    // returns the concrete type instead of a boxed trait object. Private: the
+    // narrow `dell_*` entry points below are the supported surface.
+    async fn build_dell_bmc(&self, endpoint: Endpoint) -> Result<crate::dell::Bmc, RedfishError> {
+        let client = RedfishHttpClient::new(self.http_client.clone(), endpoint, Vec::default());
+        let mut s = RedfishStandard::new(client);
+        let service_root = s.get_service_root().await?;
+        let managers = s.get_managers().await?;
+        let manager_id = managers.first().ok_or_else(|| RedfishError::GenericError {
+            error: "No managers found in service root".to_string(),
+        })?;
+        let systems = s.get_systems().await?;
+        let system_id = systems
+            .iter()
+            .find(|id| *id == "System_0")
+            .or_else(|| systems.first())
+            .ok_or_else(|| RedfishError::GenericError {
+                error: "No systems found in service root".to_string(),
+            })?;
+        s.set_system_id(system_id)?;
+        s.set_manager_id(manager_id)?;
+        s.set_service_root(service_root)?;
+        crate::dell::Bmc::new(s)
+    }
+
+    /// Clear the Dell BMC job queue on a live iDRAC. The `Redfish` trait only
+    /// reaches this via `machine_setup`; exposed directly for the iDRAC8
+    /// write-probe, which validates the legacy (405/404) fallback in isolation.
+    pub async fn dell_delete_job_queue(&self, endpoint: Endpoint) -> Result<(), RedfishError> {
+        self.build_dell_bmc(endpoint).await?.delete_job_queue().await
+    }
+
+    /// Create a Dell BIOS config job (applies staged `Bios/Settings` on the next
+    /// reboot), returning its job id. Exposed for the iDRAC8 write-probe.
+    pub async fn dell_create_bios_config_job(
+        &self,
+        endpoint: Endpoint,
+    ) -> Result<String, RedfishError> {
+        self.build_dell_bmc(endpoint)
+            .await?
+            .create_bios_config_job()
+            .await
+    }
+
     // Creates a complete "client" that takes the endpoint, an optional
     // vendor (which falls back to self-detection using the service root),
     // and an optional set of custom headers.
