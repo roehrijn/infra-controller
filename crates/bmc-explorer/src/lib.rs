@@ -428,6 +428,22 @@ pub(crate) fn hw_type<B: Bmc>(
                 .is_delta_powershelf()
                 .then_some(hw::HwType::DeltaPowerShelf)
         })
+        // iDRAC8 leaves ServiceRoot `Vendor` unset, so the ServiceRoot-vendor match
+        // above yields None and a PowerEdge host reports "platform type: cannot
+        // detect". The Dell identity is still present on the ComputerSystem, so fall
+        // back to the System manufacturer/model to classify it as Dell.
+        .or_else(|| {
+            let hw_id = system.hardware_id();
+            let is_dell = hw_id
+                .manufacturer
+                .map(|v| v.into_inner())
+                .is_some_and(|m| m.to_ascii_lowercase().contains("dell"));
+            let is_poweredge = hw_id
+                .model
+                .map(|v| v.into_inner())
+                .is_some_and(|m| m.to_ascii_lowercase().contains("poweredge"));
+            (is_dell || is_poweredge).then_some(hw::HwType::Dell)
+        })
 }
 
 fn lockdown_status<B: Bmc>(
@@ -509,22 +525,21 @@ fn lockdown_status<B: Bmc>(
         }
 
         hw::HwType::Dell => {
-            let attributes = explored_manager
-                .oem_dell_attributes
-                .as_ref()
-                .ok_or_else(Error::bmc_not_provided("Dell OEM Attributes"))?;
+            // iDRAC8 (e.g. PowerEdge T330) does not expose the Dell OEM lockdown
+            // attributes that iDRAC9+ provides. Treat their absence as "lockdown
+            // status unknown" (Ok(None)) rather than aborting exploration with a
+            // hard error, so the host still ingests.
+            let Some(attributes) = explored_manager.oem_dell_attributes.as_ref() else {
+                return Ok(None);
+            };
             let system_lockdown = attributes.attribute("Lockdown.1.SystemLockdown");
             let racadm = attributes.attribute("Racadm.1.Enable");
-            let system_lockdown = system_lockdown
-                .as_ref()
-                .and_then(|v| v.str_value())
-                .ok_or_else(Error::bmc_not_provided(
-                    "Dell OEM Attributes: SystemLockdown",
-                ))?;
-            let racadm = racadm
-                .as_ref()
-                .and_then(|v| v.str_value())
-                .ok_or_else(Error::bmc_not_provided("Dell OEM Attributes: Racadm"))?;
+            let (Some(system_lockdown), Some(racadm)) = (
+                system_lockdown.as_ref().and_then(|v| v.str_value()),
+                racadm.as_ref().and_then(|v| v.str_value()),
+            ) else {
+                return Ok(None);
+            };
             let message = format!("BMC: system_lockdown={system_lockdown}, racadm={racadm}.");
             match (system_lockdown, racadm) {
                 ("Enabled", "Disabled") => Ok(InternalLockdownStatus::Enabled),
