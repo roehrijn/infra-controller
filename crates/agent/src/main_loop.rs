@@ -57,8 +57,8 @@ use crate::fmds_client::FmdsUpdater;
 use crate::health::HealthCheckParams;
 use crate::host_machine_id::get_host_machine_id_retry;
 use crate::instrumentation::{
-    NetworkStatusConnectionFailed, NetworkStatusRpcFailed, NetworkStatusSucceeded, create_metrics,
-    get_dpu_agent_meter, get_prometheus_registry,
+    NetworkStatusConnectionFailed, NetworkStatusRpcFailed, NetworkStatusSucceeded,
+    OvsRestartRetrying, create_metrics, get_dpu_agent_meter, get_prometheus_registry,
 };
 use crate::machine_inventory_updater::MachineInventoryUpdaterConfig;
 use crate::network_monitor::{self, NetworkPingerType};
@@ -735,10 +735,10 @@ impl MainLoop {
                 .await
                 .wrap_err("restarting OVS after admin network change")
             {
-                tracing::error!(
-                    error = format!("{err:#}"),
-                    "Restarting OVS after admin network change"
-                );
+                emit(OvsRestartRetrying::new(
+                    format!("{err:#}"),
+                    conf.managed_host_config_version.clone(),
+                ));
                 status_out.network_config_error = Some(err.to_string());
                 self.ovs_restart_retry_backoff = Some(OvsRestartRetryBackoff {
                     managed_host_config_version: conf.managed_host_config_version.clone(),
