@@ -124,7 +124,15 @@ fn trim_legacy_bios_attrs(
     live_bios: &serde_json::Value,
     nic_slot: &str,
 ) {
-    for k in ["HttpDev1EnDis", "HttpDev1Interface", "HttpDev1TlsMode"] {
+    // SetBootOrderDis is dropped unconditionally: machine_setup_attrs sets it to
+    // "" and legacy iDRAC8 rejects an empty value with SYS409 (400). We only ever
+    // pin the netboot device via SetBootOrderEn; the BMC keeps its own disable list.
+    for k in [
+        "HttpDev1EnDis",
+        "HttpDev1Interface",
+        "HttpDev1TlsMode",
+        "SetBootOrderDis",
+    ] {
         attrs.remove(k);
     }
     attrs.insert(
@@ -2051,17 +2059,29 @@ impl Bmc {
         // Try the regular Attributes path first (iDRAC 9 and earlier)
         match self.setup_bmc_remote_access_standard().await {
             Ok(()) => return Ok(()),
-            Err(RedfishError::HTTPErrorCode {
-                status_code: StatusCode::NOT_FOUND,
-                ..
-            }) => {
-                // Regular path doesn't exist, fall back to OEM path (iDRAC 10+)
-                tracing::info!("Managers/Attributes not found, using OEM DellAttributes path");
+            // iDRAC8 answers a PATCH to the absent Managers/{id}/Attributes with
+            // 405, iDRAC10 with 404; either way fall back to the OEM path.
+            Err(e) if e.not_found() || e.method_not_allowed() => {
+                tracing::info!("Managers/Attributes unavailable (404/405), using OEM DellAttributes path");
             }
             Err(e) => return Err(e),
         }
 
-        self.setup_bmc_remote_access_oem().await
+        // Legacy iDRAC8: neither the standard Managers/Attributes nor the OEM
+        // DellAttributes path exists (both 404). The remote-access defaults are
+        // fine and IPMI-over-LAN is enabled via NetworkProtocol, so skip.
+        match self.setup_bmc_remote_access_oem().await {
+            Ok(()) => Ok(()),
+            // iDRAC8 has neither path: the OEM DellAttributes PATCH answers 405
+            // (the GET of the same resource answers 404). Either means "not here".
+            Err(e) if e.not_found() || e.method_not_allowed() => {
+                tracing::info!(
+                    "legacy iDRAC: no Managers/Attributes or Dell OEM path; skipping setup_bmc_remote_access"
+                );
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
     }
 
     /// Setup BMC remote access via standard Attributes path (iDRAC 9 and earlier).
@@ -2324,7 +2344,19 @@ impl Bmc {
         let manager_id = self.s.manager_id();
         let url = format!("Managers/{manager_id}/Oem/Dell/DellAttributes/{manager_id}");
 
-        let current_attrs = self.manager_dell_oem_attributes().await?;
+        let current_attrs = match self.manager_dell_oem_attributes().await {
+            Ok(a) => a,
+            // Legacy iDRAC8: no Dell OEM manager attribute store (404 SYS403).
+            // These OEM knobs (WebServer HostHeaderCheck, IPMILan) don't exist
+            // here; IPMI-over-LAN is enabled via NetworkProtocol (EnableIpmiOverLan).
+            Err(e) if e.not_found() => {
+                tracing::info!(
+                    "legacy iDRAC: no Dell OEM DellAttributes; skipping machine_setup_oem"
+                );
+                return Ok(());
+            }
+            Err(e) => return Err(e),
+        };
 
         let mut attributes: HashMap<String, serde_json::Value> = HashMap::new();
         // racadm set idrac.webserver.HostHeaderCheck 0
