@@ -180,6 +180,24 @@ async fn main() {
                 format!("legacy fallback fired; iDRAC rejected w/o staged settings: {e:?}")
             ),
         }
+
+        // 2c -- the FULL machine_setup BIOS PATCH (the exact path the state machine
+        // runs at ConfigureBios). Ok means every attribute in the PATCH was
+        // accepted; a 400/SYS409 names the rejected attribute (this is how the
+        // empty SetBootOrderDis surfaced live). Any config job it stages is cleared
+        // inside the probe. This is the check the earlier probe was missing.
+        match pool.dell_machine_setup_probe(mk_ep(), BOOT_NIC_ID).await {
+            Ok(job) => check!(
+                "2c machine_setup BIOS PATCH",
+                true,
+                format!("all attributes accepted (job={job:?})")
+            ),
+            Err(e) => check!(
+                "2c machine_setup BIOS PATCH",
+                false,
+                format!("BIOS PATCH rejected: {e:?}")
+            ),
+        }
     } else {
         println!("[SKIP] 2 write-probe (set PROBE_ALLOW_WRITES=1 to run delete/create job paths)");
     }

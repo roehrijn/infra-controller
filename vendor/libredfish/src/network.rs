@@ -230,6 +230,34 @@ impl RedfishClientPool {
             .await
     }
 
+    /// Drive the full Dell `machine_setup` BIOS PATCH against a live iDRAC for the
+    /// write-probe: exercises `machine_setup_attrs` + the legacy trim + the
+    /// `Bios/Settings` PATCH (+ config job) with empty profiles, then clears any
+    /// job it created. Returns the job id. This surfaces any BIOS attribute the
+    /// box rejects (e.g. iDRAC8's SYS409 on an empty `SetBootOrderDis`), which the
+    /// isolated job-queue probes cannot see.
+    pub async fn dell_machine_setup_probe(
+        &self,
+        endpoint: Endpoint,
+        boot_nic_id: &str,
+    ) -> Result<Option<String>, RedfishError> {
+        use crate::Redfish;
+        let bmc = self.build_dell_bmc(endpoint).await?;
+        let empty: crate::BiosProfileVendor = std::collections::HashMap::new();
+        let result = bmc
+            .machine_setup(
+                Some(crate::BootInterfaceRef::InterfaceId(boot_nic_id)),
+                &empty,
+                crate::BiosProfileType::default(),
+                &empty,
+            )
+            .await;
+        // Clear any config job the PATCH staged, regardless of outcome, so the
+        // probe leaves nothing that would apply on a host reboot.
+        let _ = bmc.delete_job_queue().await;
+        result
+    }
+
     // Creates a complete "client" that takes the endpoint, an optional
     // vendor (which falls back to self-detection using the service root),
     // and an optional set of custom headers.
