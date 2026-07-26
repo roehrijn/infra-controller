@@ -1248,20 +1248,24 @@ impl Redfish for Bmc {
                     self.delete_job_queue().await?;
 
                     if legacy {
-                        // iDRAC8 rejects a Boot.BootOrder PATCH to
-                        // Systems/{id}/Settings; enable only the netboot device
-                        // via the SetBootOrderEn BIOS attribute instead, then
-                        // schedule the config job (staged with no auto-job).
-                        let url = format!("Systems/{}/Bios/Settings", self.s.system_id());
-                        let body = serde_json::json!({
-                            "@Redfish.SettingsApplyTime": {"ApplyTime": "OnReset"},
-                            "Attributes": {"SetBootOrderEn": LEGACY_PXE_BOOT_DEVICE},
-                        });
-                        let job = self.patch_settings_for_job_id(&url, body).await?;
-                        return Ok(match job {
-                            Some(j) => Some(j),
-                            None => Some(self.create_bios_config_job().await?),
-                        });
+                        // iDRAC8 runs UEFI, where SetBootOrderEn is a legacy/BIOS-mode
+                        // attribute the box silently ignores (the PATCH + config job
+                        // both succeed but the boot order never changes). Reorder via
+                        // the standard Redfish Boot.BootOrder instead, PATCHed on the
+                        // System resource itself: Systems/{id}/Settings is absent (400)
+                        // on iDRAC8, whereas a PATCH to Systems/{id} is accepted and
+                        // auto-schedules the config job. Send the full boot-order list
+                        // with the netboot device moved to the front.
+                        let mut refs: Vec<String> = boot_order
+                            .iter()
+                            .map(|b| b.boot_option_reference.clone())
+                            .collect();
+                        let pxe_ref = refs.remove(idx);
+                        refs.insert(0, pxe_ref);
+                        let url = format!("Systems/{}", self.s.system_id());
+                        let body =
+                            HashMap::from([("Boot", HashMap::from([("BootOrder", refs)]))]);
+                        return self.patch_settings_for_job_id(&url, body).await;
                     }
 
                     let url = format!("Systems/{}/Settings", self.s.system_id());
