@@ -64,6 +64,7 @@ fn check_memory_overwrite_efi_var() -> Result<(), CarbideClientError> {
 static NVME_CLI_PROG: &str = "/usr/sbin/nvme";
 static HDPARM_CLI_PROG: &str = "/usr/sbin/hdparm";
 static SG_SANITIZE_CLI_PROG: &str = "/usr/bin/sg_sanitize";
+static BLKDISCARD_CLI_PROG: &str = "/usr/sbin/blkdiscard";
 static DD_CLI_PROG: &str = "/usr/bin/dd";
 static LENOVO_NVMI_CLI_PROG_CANDIDATES: [&str; 4] = [
     "/opt/forge/bin/mnv_cli",
@@ -573,6 +574,140 @@ async fn try_scsi_sanitize(devpath: &str) -> Result<(), CarbideClientError> {
     Ok(())
 }
 
+/// `/sys/block/*/size` is always reported in 512-byte units, independent of the
+/// device's logical block size.
+const SECTOR_BYTES: u64 = 512;
+const WIPE_BLOCK_BYTES: u64 = 1024 * 1024;
+/// Covers the MBR, the primary GPT, and the bootloader, plus the LVM PV and
+/// mdraid 1.1/1.2 superblocks that live in the first few MiB.
+const WIPE_HEAD_BYTES: u64 = 64 * 1024 * 1024;
+/// Covers the backup GPT in the last sector and the mdraid 0.90/1.0 superblocks
+/// anchored to the end of the device.
+const WIPE_TAIL_BYTES: u64 = 8 * 1024 * 1024;
+
+/// Distinguishes "this device does not implement the erase command" from an
+/// erase that was accepted and then failed. A RAID controller (e.g. a Dell PERC)
+/// exposes a virtual disk that passes neither ATA SECURITY ERASE nor SCSI
+/// SANITIZE through to the member drives, and answers Illegal Request instead.
+/// A frozen ATA security state is deliberately not in this set: it is a
+/// power-cycle condition on a drive that does support erase.
+fn is_unsupported_erase_error(err: &CarbideClientError) -> bool {
+    let msg = err.to_string().to_ascii_lowercase();
+    msg.contains("invalid opcode")
+        || msg.contains("illegal request")
+        || msg.contains("invalid command")
+        || msg.contains("has no ata security section")
+        || msg.contains("does not support ata enhanced erase")
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct WipeRegion {
+    seek_blocks: u64,
+    block_bytes: u64,
+    count_blocks: u64,
+}
+
+fn device_size_bytes(devname: &str) -> Option<u64> {
+    read_block_sysfs_attr(devname, "size")?
+        .parse::<u64>()
+        .ok()
+        .map(|sectors| sectors * SECTOR_BYTES)
+}
+
+fn head_wipe_region(size_bytes: u64) -> Option<WipeRegion> {
+    if size_bytes >= WIPE_HEAD_BYTES {
+        return Some(WipeRegion {
+            seek_blocks: 0,
+            block_bytes: WIPE_BLOCK_BYTES,
+            count_blocks: WIPE_HEAD_BYTES / WIPE_BLOCK_BYTES,
+        });
+    }
+    // Smaller than one head region: overwrite the whole device, in sectors so
+    // the last write cannot run past the end.
+    let sectors = size_bytes / SECTOR_BYTES;
+    (sectors > 0).then_some(WipeRegion {
+        seek_blocks: 0,
+        block_bytes: SECTOR_BYTES,
+        count_blocks: sectors,
+    })
+}
+
+fn tail_wipe_region(size_bytes: u64) -> Option<WipeRegion> {
+    let sectors = size_bytes / SECTOR_BYTES;
+    let tail_sectors = (WIPE_TAIL_BYTES / SECTOR_BYTES).min(sectors);
+    let seek_blocks = sectors.checked_sub(tail_sectors)?;
+    // seek 0 means the tail spans the whole device, which only happens on
+    // devices the head region already overwrote end to end.
+    (seek_blocks > 0).then_some(WipeRegion {
+        seek_blocks,
+        block_bytes: SECTOR_BYTES,
+        count_blocks: tail_sectors,
+    })
+}
+
+async fn zero_wipe_region(devpath: &str, region: &WipeRegion) -> Result<(), CarbideClientError> {
+    let of_arg = format!("of={devpath}");
+    let bs_arg = format!("bs={}", region.block_bytes);
+    let count_arg = format!("count={}", region.count_blocks);
+    let seek_arg = format!("seek={}", region.seek_blocks);
+    cmdrun::run_prog(
+        DD_CLI_PROG,
+        [
+            "if=/dev/zero",
+            &of_arg,
+            &bs_arg,
+            &count_arg,
+            &seek_arg,
+            "conv=notrunc",
+            "oflag=direct",
+        ],
+    )
+    .await?;
+    Ok(())
+}
+
+/// Wipe a device that rejects hardware secure erase. This is a block-level
+/// overwrite, not a cryptographic erase: it makes the device unbootable and
+/// blank to the partition scanner, but data outside the overwritten regions
+/// stays on the platters unless the discard below reaches the drives.
+async fn try_block_wipe(devpath: &str) -> Result<(), CarbideClientError> {
+    // On volumes that honour UNMAP this erases the whole device in seconds.
+    // RAID volumes backed by spinning disks reject it; the overwrite below is
+    // what actually makes the device blank, so a rejection is not fatal.
+    match cmdrun::run_prog(BLKDISCARD_CLI_PROG, ["-f", devpath]).await {
+        Ok(_) => tracing::info!(device = devpath, "Discarded whole device"),
+        Err(error) => {
+            tracing::warn!(device = devpath, %error, "Device does not support discard")
+        }
+    }
+
+    let devname = devpath.trim_start_matches("/dev/");
+    let size_bytes = device_size_bytes(devname).ok_or_else(|| {
+        CarbideClientError::GenericError(format!("Cannot read size of device {devpath}"))
+    })?;
+
+    let regions = [head_wipe_region(size_bytes), tail_wipe_region(size_bytes)];
+    let mut zeroed_bytes = 0u64;
+    for region in regions.iter().flatten() {
+        zero_wipe_region(devpath, region).await?;
+        zeroed_bytes += region.block_bytes * region.count_blocks;
+    }
+
+    if zeroed_bytes == 0 {
+        return Err(CarbideClientError::GenericError(format!(
+            "Device {devpath} is too small to wipe (size={size_bytes} bytes)"
+        )));
+    }
+
+    tracing::warn!(
+        device = devpath,
+        size_bytes,
+        zeroed_bytes,
+        "Wiped device without a hardware secure erase; residual data is not cryptographically erased",
+    );
+    Ok(())
+}
+
 fn sysfs_path_is_sata(path: &std::path::Path) -> bool {
     // SATA devices resolve through an ATA host in the sysfs device tree (path contains "/ata").
     // SAS/SCSI devices do not.
@@ -681,7 +816,7 @@ fn block_device_cleanup_skip_reason(devname: &str) -> Option<BlockDeviceCleanupS
 
 async fn clean_this_block_device(devpath: &str) -> Result<(), CarbideClientError> {
     let devname = devpath.trim_start_matches("/dev/");
-    if is_sata_device(devname) {
+    let erased = if is_sata_device(devname) {
         tracing::info!(
             device = devpath,
             "Detected SATA device; using ATA Secure Erase",
@@ -693,6 +828,18 @@ async fn clean_this_block_device(devpath: &str) -> Result<(), CarbideClientError
             "Detected SAS/SCSI device; using SCSI Sanitize",
         );
         try_scsi_sanitize(devpath).await
+    };
+
+    match erased {
+        Err(error) if is_unsupported_erase_error(&error) => {
+            tracing::warn!(
+                device = devpath,
+                %error,
+                "Device implements no hardware secure erase; falling back to a block-level wipe",
+            );
+            try_block_wipe(devpath).await
+        }
+        result => result,
     }
 }
 
@@ -1428,6 +1575,113 @@ mod tests {
     fn test_sata_dev_re_does_not_match_nvme() {
         assert!(!SD_DEV_RE.is_match("/dev/nvme0"));
         assert!(!SD_DEV_RE.is_match("/dev/nvme0n1"));
+    }
+
+    #[test]
+    fn test_is_unsupported_erase_error() {
+        // The exact message a Dell PERC virtual disk produces.
+        let perc = CarbideClientError::GenericError(
+            "subprocess /usr/bin/sg_sanitize with arguments [\"-Q\", \"-w\", \"-C\", \"/dev/sda\"] \
+             failed with output: Sanitize failed: Illegal request, Invalid opcode"
+                .to_string(),
+        );
+        assert!(is_unsupported_erase_error(&perc));
+
+        assert!(is_unsupported_erase_error(
+            &CarbideClientError::GenericError(
+                "Device /dev/sda has no ATA Security section; may be SAS/SCSI".to_string()
+            )
+        ));
+        assert!(is_unsupported_erase_error(
+            &CarbideClientError::GenericError(
+                "Device /dev/sda does not support ATA enhanced erase; non-SED SATA drives are not \
+             supported"
+                    .to_string()
+            )
+        ));
+
+        // A frozen drive does support erase, so it must stay a hard error.
+        assert!(!is_unsupported_erase_error(
+            &CarbideClientError::GenericError(
+                "Device /dev/sda ATA security is frozen; cannot erase without power cycle"
+                    .to_string()
+            )
+        ));
+        // A sanitize that started and then failed must stay a hard error.
+        assert!(!is_unsupported_erase_error(
+            &CarbideClientError::GenericError("Sanitize failed: Medium error".to_string())
+        ));
+    }
+
+    #[test]
+    fn test_head_wipe_region_large_device() {
+        // 1 TB: one full head region in 1 MiB blocks.
+        let region = head_wipe_region(1_000_000_000_000).unwrap();
+        assert_eq!(
+            region,
+            WipeRegion {
+                seek_blocks: 0,
+                block_bytes: WIPE_BLOCK_BYTES,
+                count_blocks: 64,
+            }
+        );
+    }
+
+    #[test]
+    fn test_head_wipe_region_small_device_covers_whole_device() {
+        // 1 MiB: smaller than a head region, so overwrite it all in sectors.
+        let region = head_wipe_region(1024 * 1024).unwrap();
+        assert_eq!(
+            region,
+            WipeRegion {
+                seek_blocks: 0,
+                block_bytes: SECTOR_BYTES,
+                count_blocks: 2048,
+            }
+        );
+        assert_eq!(region.block_bytes * region.count_blocks, 1024 * 1024);
+    }
+
+    #[test]
+    fn test_head_wipe_region_rejects_sub_sector_device() {
+        assert!(head_wipe_region(0).is_none());
+        assert!(head_wipe_region(511).is_none());
+    }
+
+    #[test]
+    fn test_tail_wipe_region_reaches_last_sector() {
+        // Deliberately not a whole number of MiB: the tail must still land on
+        // the final sector, where the backup GPT header lives.
+        let size = 1_000_000_000_000u64;
+        let region = tail_wipe_region(size).unwrap();
+        assert_eq!(region.block_bytes, SECTOR_BYTES);
+        assert_eq!(region.count_blocks, WIPE_TAIL_BYTES / SECTOR_BYTES);
+        assert_eq!(
+            region.seek_blocks + region.count_blocks,
+            size / SECTOR_BYTES,
+            "tail wipe must end on the device's last sector"
+        );
+    }
+
+    #[test]
+    fn test_tail_wipe_region_skipped_when_head_covers_device() {
+        // 4 MiB is below the tail region, so the head already wiped it all.
+        assert!(tail_wipe_region(4 * 1024 * 1024).is_none());
+        assert!(tail_wipe_region(0).is_none());
+    }
+
+    #[test]
+    fn test_wipe_regions_do_not_overlap_on_smallest_two_region_device() {
+        // Just above the head region, where head and tail are closest together.
+        let size = WIPE_HEAD_BYTES + WIPE_TAIL_BYTES;
+        let head = head_wipe_region(size).unwrap();
+        let tail = tail_wipe_region(size).unwrap();
+        let head_end = head.seek_blocks * head.block_bytes + head.count_blocks * head.block_bytes;
+        let tail_start = tail.seek_blocks * tail.block_bytes;
+        assert!(
+            head_end <= tail_start,
+            "head ends at {head_end}, tail starts at {tail_start}"
+        );
     }
 
     #[test]
