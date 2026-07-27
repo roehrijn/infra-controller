@@ -1948,11 +1948,25 @@ impl Bmc {
         let mut attributes = HashMap::new();
         attributes.insert("Attributes", lockdown);
 
-        self.s
-            .client
-            .patch(&url, attributes)
-            .await
-            .map(|_status_code| ())
+        match self.s.client.patch(&url, attributes).await {
+            Ok(_status_code) => Ok(()),
+            // Legacy iDRAC8 has no Dell OEM manager attribute store, so system
+            // lockdown does not exist to set: the PATCH answers 405 (a GET of
+            // the same resource answers 404). Such a box can never be locked --
+            // is_lockdown reports false for legacy -- so it is already in the
+            // requested state and this is a no-op success, not a failure.
+            // Without this, the unlock step of HostPlatformConfiguration wedges:
+            // unlike LockHost it does not consult the expected machine's
+            // disable_lockdown, so it retries the unsupported PATCH forever.
+            Err(e) if e.not_found() || e.method_not_allowed() => {
+                tracing::info!(
+                    %enabled,
+                    "legacy iDRAC: no Dell OEM lockdown attribute; skipping set_idrac_lockdown"
+                );
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
     }
 
     async fn enable_bmc_lockdown(&self, entry: dell::BootDevices) -> Result<(), RedfishError> {
