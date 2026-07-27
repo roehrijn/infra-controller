@@ -1991,11 +1991,18 @@ impl Bmc {
         };
         let manager_id = self.s.manager_id();
         let url = format!("Managers/{manager_id}/Oem/Dell/DellAttributes/{manager_id}");
-        self.s
-            .client
-            .patch(&url, set_bmc_lockdown)
-            .await
-            .map(|_status_code| ())?;
+        match self.s.client.patch(&url, set_bmc_lockdown).await {
+            Ok(_status_code) => {}
+            // Legacy iDRAC8 has no Dell OEM manager attribute store to PATCH
+            // (405 here, 404 on GET), so there is no lockdown to enable and no
+            // OEM ServerBoot to set. Boot order is handled by the legacy
+            // set_boot_order path instead. See disable_bmc_lockdown.
+            Err(e) if e.not_found() || e.method_not_allowed() => {
+                tracing::info!("legacy iDRAC: no Dell OEM attributes; skipping enable_bmc_lockdown");
+                return Ok(());
+            }
+            Err(e) => return Err(e),
+        }
 
         // Now lockdown
         let lockdown = dell::BmcLockdown {
@@ -2066,11 +2073,27 @@ impl Bmc {
         };
         let manager_id = self.s.manager_id();
         let url = format!("Managers/{manager_id}/Oem/Dell/DellAttributes/{manager_id}");
-        self.s
-            .client
-            .patch(&url, set_bmc_lockdown)
-            .await
-            .map(|_status_code| ())
+        match self.s.client.patch(&url, set_bmc_lockdown).await {
+            Ok(_status_code) => Ok(()),
+            // Legacy iDRAC8 has no Dell OEM manager attribute store, so this
+            // PATCH answers 405 (a GET of the same resource answers 404).
+            // There is no lockdown to disable -- is_lockdown reports false for
+            // legacy -- and the OEM ServerBoot this call piggybacks is covered
+            // by the legacy set_boot_order path, so treat it as a no-op.
+            //
+            // This is load-bearing for the release path: UnlockHost calls
+            // lockdown_bmc(Disabled) unconditionally, unlike LockHost it does
+            // not consult the expected machine's disable_lockdown, so without
+            // this the machine retries the unsupported PATCH forever and never
+            // returns to Ready.
+            Err(e) if e.not_found() || e.method_not_allowed() => {
+                tracing::info!(
+                    "legacy iDRAC: no Dell OEM attributes; skipping disable_bmc_lockdown"
+                );
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
     }
 
     async fn setup_bmc_remote_access(&self) -> Result<(), RedfishError> {
