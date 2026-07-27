@@ -486,13 +486,17 @@ void set_vendor_options(Pkt4Ptr response4_ptr) {
       new Option(Option::V4, DHO_VENDOR_ENCAPSULATED_OPTIONS));
   LOG_INFO(logger, isc::log::LOG_CARBIDE_GENERIC).arg(option_vendor->toText());
 
-  // Option 6 set to 0x8 tells iPXE not to wait for Proxy PXE since we don't
-  // care about that.
+  // PXE_DISCOVERY_CONTROL (sub-option 6) = 0x0: leave all discovery methods
+  // enabled so the client waits for a proxyDHCP boot-server offer. A separate
+  // proxyDHCP (dnsmasq) supplies the legacy-PXE TFTP next-server + bootfile
+  // (ipxe.efi) while this server's siaddr stays the Carbide PXE VIP for the
+  // stage-2 iPXE HTTP chain. Setting bit 3 (0x8) would tell the client to skip
+  // proxyDHCP and boot straight from siaddr, which breaks the two-stage boot.
   OptionPtr vendor_option_6 = option_vendor->getOption(6);
   if (vendor_option_6) {
     option_vendor->delOption(6);
   }
-  vendor_option_6.reset(new OptionInt<uint32_t>(Option::V4, 6, 0x8));
+  vendor_option_6.reset(new OptionInt<uint32_t>(Option::V4, 6, 0x0));
   option_vendor->addOption(vendor_option_6);
 
   response4_ptr->addOption(option_vendor);
