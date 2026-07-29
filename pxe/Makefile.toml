@@ -1101,6 +1101,20 @@ script = '''
       curl -sSL "$url" -o "$path"
       printf '%s  %s\n' "$sha" "$path" | sha256sum -c --status || exit 1
     done
+  # NGC only publishes this resource for current DOCA releases: a BlueField-2
+  # build pinned to the last BF2-capable train (DOCA 2.9.x / HBN 2.4.x) gets a
+  # 404 and downloads nothing, and the two `mv` tasks below then fail on a
+  # missing directory. HBN_CONFIGS_OPTIONAL lets such a build continue with no
+  # HBN configs staged -- the DPU boots, HBN does not come up -- instead of
+  # failing outright. Unset (the default) keeps the download mandatory.
+  if [ -n "${HBN_CONFIGS_OPTIONAL:-}" ]; then
+    for d in "scripts/$DOCA_HBN_VERSION" "configs/$DOCA_VERSION"; do
+      if [ ! -d "$d" ]; then
+        echo "WARNING: no HBN configs at $DOCA_HBN_CONFIG_URL; staging an empty $d" >&2
+        mkdir -p "$d"
+      fi
+    done
+  fi
 '''
 cwd = "${BUILD_LOCATION}/doca_container_configs"
 
