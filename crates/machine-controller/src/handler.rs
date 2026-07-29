@@ -2805,6 +2805,22 @@ fn map_host_init_measuring_outcome_to_state_handler_outcome(
     }
 }
 
+/// Builds the `ImageURI` the DPU BMC is asked to fetch the DPU OS from.
+///
+/// The BMC wants `<host>//<path>` and supplies the scheme itself from
+/// `TransferProtocol`: hand it a URI that carries `http://` and it strips the
+/// scheme, reads the remainder as a local path and fails the task instantly with
+/// `Invalid FW Package` (0% complete, zero elapsed). Hence the double slash,
+/// which reads like a typo and is not one.
+fn bfb_image_uri(pxe_public_base_url: &str) -> String {
+    let host = pxe_public_base_url
+        .trim()
+        .trim_start_matches("https://")
+        .trim_start_matches("http://")
+        .trim_end_matches('/');
+    format!("{host}//public/blobs/internal/aarch64/forge.bfb")
+}
+
 async fn handle_bfb_install_state(
     state: &ManagedHostStateSnapshot,
     substate: InstallDpuOsState,
@@ -2841,16 +2857,8 @@ async fn handle_bfb_install_state(
             // The DPU BMC fetches this itself, so the URI has to resolve from the
             // BMC rather than from here. Built from the configured PXE base URL --
             // the same source `scout_firmware_scripts` uses -- because a hardcoded
-            // `carbide-pxe.forge` only resolves on a site running NICo's own
-            // `.forge` DNS. `transfer_protocol` is ignored once the URI carries a
-            // scheme, which the configured base URL does.
-            let image_uri = format!(
-                "{}/public/blobs/internal/aarch64/forge.bfb",
-                ctx.services
-                    .site_config
-                    .pxe_public_base_url
-                    .trim_end_matches('/')
-            );
+            // hostname only resolves on a site running NICo's own `.forge` DNS.
+            let image_uri = bfb_image_uri(&ctx.services.site_config.pxe_public_base_url);
             let task = dpu_redfish_client
                 .update_firmware_simple_update(
                     &image_uri,

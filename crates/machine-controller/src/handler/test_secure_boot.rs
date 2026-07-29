@@ -149,3 +149,21 @@ async fn reported_secure_boot_state_is_unchanged_by_the_flag() {
 
     assert!(disabled, "the simulator defaults to secure boot disabled");
 }
+
+/// The DPU BMC supplies the scheme from `TransferProtocol` and reads the URI as
+/// `<host>//<path>`; a scheme in the URI makes it fail the task instantly with
+/// `Invalid FW Package`, so the double slash has to survive every input shape.
+#[test]
+fn bfb_image_uri_strips_the_scheme_and_keeps_the_double_slash() {
+    use super::bfb_image_uri;
+
+    let expected = "192.168.0.241//public/blobs/internal/aarch64/forge.bfb";
+    assert_eq!(bfb_image_uri("http://192.168.0.241"), expected);
+    assert_eq!(bfb_image_uri("http://192.168.0.241/"), expected);
+    assert_eq!(bfb_image_uri("https://192.168.0.241"), expected);
+    assert_eq!(bfb_image_uri(" 192.168.0.241 "), expected);
+    assert_eq!(
+        bfb_image_uri("http://carbide-pxe.forge:8080"),
+        "carbide-pxe.forge:8080//public/blobs/internal/aarch64/forge.bfb"
+    );
+}
