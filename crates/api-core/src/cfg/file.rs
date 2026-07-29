@@ -2945,6 +2945,16 @@ pub struct DpuConfig {
     #[serde(default)]
     pub dpu_enable_secure_boot: bool,
 
+    /// Whether a DPU BMC that reports no secure boot state at all may be
+    /// treated as having secure boot disabled. Some BMC firmware never
+    /// populates `SecureBootEnable`/`SecureBootCurrentBoot` because its UEFI
+    /// redfish client does not answer (BlueField-2 on a BF-24.10 BMC), and the
+    /// reboot work-around for the post-POST race then never converges.
+    /// Only consulted while `dpu_enable_secure_boot` is false.
+    /// Default is false.
+    #[serde(default)]
+    pub dpu_secure_boot_reporting_optional: bool,
+
     /// Number of virtual functions configured per DPU PF during BlueField provisioning.
     /// Defaults to 16 and must not exceed 126.
     #[serde(default)]
@@ -2995,6 +3005,8 @@ impl<'de> Deserialize<'de> for DpuConfig {
             #[serde(default)]
             dpu_enable_secure_boot: Option<bool>,
             #[serde(default)]
+            dpu_secure_boot_reporting_optional: Option<bool>,
+            #[serde(default)]
             num_of_vfs: Option<u32>,
             #[serde(default)]
             restart_ovs_on_use_admin_network_change: Option<bool>,
@@ -3026,6 +3038,9 @@ impl<'de> Deserialize<'de> for DpuConfig {
             dpu_enable_secure_boot: partial
                 .dpu_enable_secure_boot
                 .unwrap_or(default.dpu_enable_secure_boot),
+            dpu_secure_boot_reporting_optional: partial
+                .dpu_secure_boot_reporting_optional
+                .unwrap_or(default.dpu_secure_boot_reporting_optional),
             num_of_vfs,
             restart_ovs_on_use_admin_network_change: partial
                 .restart_ovs_on_use_admin_network_change
@@ -3156,6 +3171,7 @@ impl Default for DpuConfig {
                 BF3_NIC_VERSION.to_string(),
             ],
             dpu_enable_secure_boot: false,
+            dpu_secure_boot_reporting_optional: false,
             num_of_vfs: DEFAULT_DPU_NUM_OF_VFS,
             restart_ovs_on_use_admin_network_change: false,
         }
@@ -5693,6 +5709,26 @@ num_of_vfs = 64
         );
         assert!(config.dpu_config.dpu_enable_secure_boot);
         assert_eq!(config.dpu_config.num_of_vfs, 64);
+        assert!(!config.dpu_config.dpu_models.is_empty());
+        assert!(
+            !config.dpu_config.dpu_secure_boot_reporting_optional,
+            "a site must opt in to accepting an unreported DPU secure boot state"
+        );
+    }
+
+    #[test]
+    fn deserialize_dpu_config_secure_boot_reporting_optional() {
+        let config: CarbideConfig = Figment::new()
+            .merge(Toml::file(format!("{TEST_DATA_DIR}/full_config.toml")))
+            .merge(Toml::string(
+                "[dpu_config]\ndpu_secure_boot_reporting_optional = true\n",
+            ))
+            .extract()
+            .unwrap();
+
+        assert!(config.dpu_config.dpu_secure_boot_reporting_optional);
+        // The rest of the section keeps its defaults rather than being reset.
+        assert!(!config.dpu_config.dpu_enable_secure_boot);
         assert!(!config.dpu_config.dpu_models.is_empty());
     }
 

@@ -53,6 +53,10 @@ struct RedfishSimState {
     users: HashMap<String, String>,
     fw_version: Arc<String>,
     secure_boot: AtomicBool,
+    /// When set, `get_secure_boot` answers with neither `SecureBootEnable` nor
+    /// `SecureBootCurrentBoot`, modelling a DPU BMC whose UEFI redfish client
+    /// never populates the resource (BlueField-2 behind a BF-24.10 BMC).
+    secure_boot_unreported: bool,
     no_component_integrities: bool,
     firmware_for_component_error: bool,
     get_task_trigger_evidence_returns_interrupted: bool,
@@ -323,6 +327,12 @@ impl RedfishSim {
         for host_state in state.hosts.values_mut() {
             host_state.http_dev1_enabled = false;
         }
+    }
+
+    /// Model a DPU BMC that answers `SecureBoot` without any state fields, so
+    /// neither the enable flag nor the current-boot value can be read.
+    pub fn set_secure_boot_unreported(&self) {
+        self.state.lock().unwrap().secure_boot_unreported = true;
     }
 
     /// Configure simulated BMC lockdown state for existing and future clients.
@@ -1238,13 +1248,13 @@ impl Redfish for RedfishSimClient {
         Result<libredfish::model::secure_boot::SecureBoot, RedfishError>,
     > {
         Box::pin(async move {
-            let secure_boot_enabled = self
-                .state
-                .clone()
-                .lock()
-                .unwrap()
-                .secure_boot
-                .load(Ordering::Relaxed);
+            let (secure_boot_enabled, unreported) = {
+                let state = self.state.lock().unwrap();
+                (
+                    state.secure_boot.load(Ordering::Relaxed),
+                    state.secure_boot_unreported,
+                )
+            };
             Ok(libredfish::model::secure_boot::SecureBoot {
                 odata: ODataLinks {
                     odata_context: None,
@@ -1255,13 +1265,15 @@ impl Redfish for RedfishSimClient {
                 },
                 id: "SecureBoot".to_string(),
                 name: "UEFI Secure Boot".to_string(),
-                secure_boot_current_boot: if secure_boot_enabled {
+                secure_boot_current_boot: if unreported {
+                    None
+                } else if secure_boot_enabled {
                     Some(EnabledDisabled::Enabled)
                 } else {
                     Some(EnabledDisabled::Disabled)
                 },
-                secure_boot_enable: Some(secure_boot_enabled),
-                secure_boot_mode: Some(SecureBootMode::UserMode),
+                secure_boot_enable: (!unreported).then_some(secure_boot_enabled),
+                secure_boot_mode: (!unreported).then_some(SecureBootMode::UserMode),
             })
         })
     }

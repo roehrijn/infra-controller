@@ -1361,6 +1361,9 @@ async fn initialize_and_start_controllers<'a>(
                         .dpu_nic_firmware_reprovision_update_enabled,
                 )
                 .dpu_enable_secure_boot(carbide_config.dpu_config.dpu_enable_secure_boot)
+                .dpu_secure_boot_reporting_optional(
+                    carbide_config.dpu_config.dpu_secure_boot_reporting_optional,
+                )
                 .dpu_wait_time(carbide_config.machine_state_controller.dpu_wait_time)
                 .power_down_wait(carbide_config.machine_state_controller.power_down_wait)
                 .failure_retry_time(carbide_config.machine_state_controller.failure_retry_time)
