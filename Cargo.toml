@@ -17,6 +17,10 @@
 [workspace]
 resolver = "2"
 members = ["crates/*", "crates/libnmxc/tests"]
+# The vendored crates below [patch] are their own packages; excluding them lets
+# `cargo test` run inside vendor/<crate> instead of erroring on workspace
+# membership.
+exclude = ["vendor/libredfish", "vendor/nv-redfish-core", "vendor/nv-redfish-csdl-compiler"]
 
 [workspace.package]
 edition = "2024"
