@@ -7751,8 +7751,6 @@ dependencies = [
 [[package]]
 name = "nv-redfish-csdl-compiler"
 version = "0.12.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "40e98d0fb2cfe55eef14406dc37abe45d8423eeff76e4f24bac222a30e9fd6b0"
 dependencies = [
  "clap",
  "clap_derive",

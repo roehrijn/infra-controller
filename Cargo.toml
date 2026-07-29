@@ -279,7 +279,13 @@ unused_async = "warn"
 [patch.crates-io]
 # no_links() must emit `$expand=.($levels=1)`; iDRAC8 rejects the bare `$expand=.`
 # (HTTP 400 IDRAC.1.6.SYS457) that Site Explorer's Dell path otherwise sends.
+# Also carries de_required_collection(), the null-tolerant array deserializer the
+# patched code generator below emits for a collection's `Members`.
 nv-redfish-core = { path = "vendor/nv-redfish-core" }
+# Required, non-nullable arrays deserialize through de_required_collection() so a
+# service that sends `"Members": null` instead of `[]` (BlueField-2 BMC 24.10
+# `Systems/Bluefield/BootOptions`) does not fail the whole resource.
+nv-redfish-csdl-compiler = { path = "vendor/nv-redfish-csdl-compiler" }
 
 [patch."https://github.com/NVIDIA/libredfish.git"]
 # Legacy iDRAC8 lockdown/job/BIOS-profile/boot fallbacks off the absent Dell OEM
