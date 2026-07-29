@@ -125,6 +125,8 @@ mod power;
 mod sku;
 #[cfg(test)]
 mod test_machine_setup;
+#[cfg(test)]
+mod test_secure_boot;
 
 use bios_config::handle_bios_setup_failed_recovery;
 use helpers::{
@@ -255,6 +257,7 @@ pub struct MachineStateHandlerBuilder {
     credential_reader: Option<Arc<dyn CredentialReader>>,
     power_options_config: PowerOptionConfig,
     enable_secure_boot: bool,
+    secure_boot_reporting_optional: bool,
     hgx_bmc_gpu_reboot_delay: chrono::Duration,
     dpf_sdk: Option<Arc<dyn DpfOperations>>,
 }
@@ -292,6 +295,7 @@ impl MachineStateHandlerBuilder {
                 wait_duration_until_host_reboot: chrono::Duration::minutes(0),
             },
             enable_secure_boot: false,
+            secure_boot_reporting_optional: false,
             hgx_bmc_gpu_reboot_delay: chrono::Duration::seconds(30),
             dpf_sdk: None,
         }
@@ -342,6 +346,14 @@ impl MachineStateHandlerBuilder {
 
     pub fn dpu_enable_secure_boot(mut self, dpu_enable_secure_boot: bool) -> Self {
         self.enable_secure_boot = dpu_enable_secure_boot;
+        self
+    }
+
+    pub fn dpu_secure_boot_reporting_optional(
+        mut self,
+        dpu_secure_boot_reporting_optional: bool,
+    ) -> Self {
+        self.secure_boot_reporting_optional = dpu_secure_boot_reporting_optional;
         self
     }
 
@@ -457,6 +469,7 @@ impl MachineStateHandler {
                 builder.hardware_models.clone().unwrap_or_default(),
                 builder.reachability_params,
                 builder.enable_secure_boot,
+                builder.secure_boot_reporting_optional,
                 builder.dpf_sdk.clone(),
             ),
             instance_handler: InstanceStateHandler::new(
@@ -3732,6 +3745,7 @@ pub struct DpuMachineStateHandler {
     hardware_models: FirmwareConfig,
     reachability_params: ReachabilityParams,
     enable_secure_boot: bool,
+    secure_boot_reporting_optional: bool,
     pub dpf_sdk: Option<Arc<dyn DpfOperations>>,
 }
 
@@ -3741,6 +3755,7 @@ impl DpuMachineStateHandler {
         hardware_models: FirmwareConfig,
         reachability_params: ReachabilityParams,
         enable_secure_boot: bool,
+        secure_boot_reporting_optional: bool,
         dpf_sdk: Option<Arc<dyn DpfOperations>>,
     ) -> Self {
         DpuMachineStateHandler {
@@ -3748,6 +3763,7 @@ impl DpuMachineStateHandler {
             hardware_models,
             reachability_params,
             enable_secure_boot,
+            secure_boot_reporting_optional,
             dpf_sdk,
         }
     }
@@ -3762,6 +3778,21 @@ impl DpuMachineStateHandler {
             .get_secure_boot()
             .await
             .map_err(|e| redfish_error("disable_secure_boot", e))?;
+
+        // A BMC whose UEFI redfish client never answers reports the resource
+        // with neither field, so the reboot work-around below cannot converge.
+        // Both must be absent: a half-populated response is still a race.
+        if self.secure_boot_reporting_optional
+            && !self.enable_secure_boot
+            && secure_boot_status.secure_boot_enable.is_none()
+            && secure_boot_status.secure_boot_current_boot.is_none()
+        {
+            tracing::warn!(
+                machine_id = %dpu_machine_id,
+                "DPU BMC reports no secure boot state; treating secure boot as disabled per dpu_secure_boot_reporting_optional"
+            );
+            return Ok(true);
+        }
 
         let secure_boot_enable =
             secure_boot_status
