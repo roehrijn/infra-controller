@@ -103,6 +103,8 @@ pub use bmc::Bmc;
 #[doc(inline)]
 pub use deserialize::de_optional_nullable;
 #[doc(inline)]
+pub use deserialize::de_required_collection;
+#[doc(inline)]
 pub use deserialize::de_required_nullable;
 #[doc(inline)]
 pub use dynamic_properties::DynamicProperties;

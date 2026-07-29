@@ -44,3 +44,72 @@ where
 {
     Deserialize::deserialize(de)
 }
+
+/// Deserialize a required, non-nullable array — nv-redfish models these
+/// fields with `Vec<T>`. An empty array is spelled `[]` in Redfish, but some
+/// service implementations send `null` instead (the BlueField-2 BMC 24.10
+/// `BootOptions` collection sends `"Members": null` alongside
+/// `"Members@odata.count": 0`); treat `null` as an empty array rather than
+/// failing the whole resource.
+///
+/// # Errors
+///
+/// Returns an error if deserialization of the underlying type fails.
+pub fn de_required_collection<'de, D, T>(de: D) -> Result<Vec<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<Vec<T>>::deserialize(de).map(Option::unwrap_or_default)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::de_required_collection;
+    use serde::Deserialize;
+
+    #[derive(Debug, Deserialize)]
+    struct Collection {
+        #[serde(rename = "Members", deserialize_with = "de_required_collection")]
+        members: Vec<String>,
+        #[serde(rename = "Members@odata.count")]
+        count: u32,
+    }
+
+    #[test]
+    fn test_required_collection_null_is_empty() {
+        let json = r#"{"Members": null, "Members@odata.count": 0}"#;
+        let collection: Collection =
+            serde_json::from_str(json).expect("null Members must deserialize as an empty array");
+        assert!(collection.members.is_empty());
+        assert_eq!(collection.count, 0);
+    }
+
+    #[test]
+    fn test_required_collection_empty_array() {
+        let json = r#"{"Members": [], "Members@odata.count": 0}"#;
+        let collection: Collection = serde_json::from_str(json).expect("empty Members");
+        assert!(collection.members.is_empty());
+    }
+
+    #[test]
+    fn test_required_collection_populated() {
+        let json = r#"{"Members": ["a", "b"], "Members@odata.count": 2}"#;
+        let collection: Collection = serde_json::from_str(json).expect("populated Members");
+        assert_eq!(collection.members, vec!["a".to_owned(), "b".to_owned()]);
+        assert_eq!(collection.count, 2);
+    }
+
+    #[test]
+    fn test_required_collection_still_required() {
+        let json = r#"{"Members@odata.count": 0}"#;
+        serde_json::from_str::<Collection>(json)
+            .expect_err("a missing Members field stays an error");
+    }
+
+    #[test]
+    fn test_required_collection_rejects_wrong_type() {
+        let json = r#"{"Members": 42, "Members@odata.count": 0}"#;
+        serde_json::from_str::<Collection>(json).expect_err("a non-array Members stays an error");
+    }
+}

@@ -13259,3 +13259,7 @@ dependencies = [
 [[patch.unused]]
 name = "nv-redfish-core"
 version = "0.12.0"
+
+[[patch.unused]]
+name = "nv-redfish-csdl-compiler"
+version = "0.12.0"

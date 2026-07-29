@@ -96,6 +96,39 @@ async fn explore_bluefield3_recovers_oob_interface_from_boot_options() {
 }
 
 #[test]
+async fn explore_bluefield3_tolerates_null_boot_option_members() {
+    // BlueField BMC 24.10 answers the BootOptions collection with
+    // `"Members": null` instead of `[]`.
+    let h = test_support::dell_poweredge_r750_bluefield3_bmc(DpuSettings::default()).await;
+    h.state.injection.put(vec![bmc_mock::injection::Rule {
+        id: "null_boot_option_members".into(),
+        selector: bmc_mock::injection::Selector::Path {
+            method: Some("GET".into()),
+            glob: "/redfish/v1/Systems/Bluefield/BootOptions".into(),
+        },
+        action: bmc_mock::injection::Action::JsonMerge(serde_json::json!({
+            "Members": null,
+            "Members@odata.count": 0,
+        })),
+        remaining: None,
+    }]);
+
+    let report = nv_generate_exploration_report(h.service_root, &common::explorer_config())
+        .await
+        .unwrap();
+
+    assert_eq!(report.endpoint_type, EndpointType::Bmc);
+    let system = report.systems.first().expect("systems must be present");
+    assert!(
+        system
+            .boot_order
+            .as_ref()
+            .is_none_or(|order| order.boot_order.is_empty()),
+        "null Members must explore as an empty boot option collection"
+    );
+}
+
+#[test]
 async fn explore_bluefield3_retries_transient_404_on_system_eth_interfaces() {
     let settings = DpuSettings::default();
 
