@@ -2945,12 +2945,15 @@ pub struct DpuConfig {
     #[serde(default)]
     pub dpu_enable_secure_boot: bool,
 
-    /// Whether a DPU BMC that reports no secure boot state at all may be
-    /// treated as having secure boot disabled. Some BMC firmware never
+    /// Whether a DPU BMC that reports no secure boot state at all may be taken
+    /// at the configured intent instead of failing. Some BMC firmware never
     /// populates `SecureBootEnable`/`SecureBootCurrentBoot` because its UEFI
     /// redfish client does not answer (BlueField-2 on a BF-24.10 BMC), and the
-    /// reboot work-around for the post-POST race then never converges.
-    /// Only consulted while `dpu_enable_secure_boot` is false.
+    /// reboot work-around for the post-POST race then never converges. With
+    /// this set, such a resource reads as secure boot disabled while
+    /// `dpu_enable_secure_boot` is false, and as not-disabled while it is true.
+    /// It asserts nothing about the DPU's actual secure boot state, which is
+    /// exactly what this BMC cannot report.
     /// Default is false.
     #[serde(default)]
     pub dpu_secure_boot_reporting_optional: bool,
