@@ -97,18 +97,37 @@ async fn unreported_secure_boot_is_missing_data_by_default() {
     );
 }
 
-/// The flag must not weaken the enable path: enabling secure boot cannot be
-/// verified on a BMC that reports nothing, so that stays an error.
+/// On the enable path the same unreadable state answers "not disabled", which
+/// is what routes the DPU to the signed-BFB install instead of UEFI HTTP boot.
 #[tokio::test]
-async fn unreported_secure_boot_still_errors_on_the_enable_path() {
+async fn unreported_secure_boot_reads_as_enabled_on_the_enable_path() {
     let sim = RedfishSim::default();
     sim.set_secure_boot_unreported();
     let client = secure_boot_client(&sim).await;
 
-    let error = handler(true, true)
+    let disabled = handler(true, true)
         .is_secure_boot_disabled(&dpu_machine_id(), client.as_ref())
         .await
-        .expect_err("the enable path must not accept an unreported secure boot state");
+        .expect("an unreported secure boot state must not error with the flag set");
+
+    assert!(
+        !disabled,
+        "the enable path must read an unreported state as not-disabled"
+    );
+}
+
+/// Without the flag the enable path keeps erroring too, so the reboot
+/// work-around for the post-POST race is unchanged in both directions.
+#[tokio::test]
+async fn unreported_secure_boot_is_missing_data_on_the_enable_path_by_default() {
+    let sim = RedfishSim::default();
+    sim.set_secure_boot_unreported();
+    let client = secure_boot_client(&sim).await;
+
+    let error = handler(true, false)
+        .is_secure_boot_disabled(&dpu_machine_id(), client.as_ref())
+        .await
+        .expect_err("an unreported secure boot state must stay an error by default");
 
     assert!(
         matches!(error, StateHandlerError::MissingData { .. }),
