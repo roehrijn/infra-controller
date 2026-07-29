@@ -2508,9 +2508,22 @@ async fn handle_bfb_install_state(
         InstallDpuOsState::InstallationError { .. } => Ok(StateHandlerOutcome::do_nothing()),
 
         InstallDpuOsState::InstallingBFB => {
+            // The DPU BMC fetches this itself, so the URI has to resolve from the
+            // BMC rather than from here. Built from the configured PXE base URL --
+            // the same source `scout_firmware_scripts` uses -- because a hardcoded
+            // `carbide-pxe.forge` only resolves on a site running NICo's own
+            // `.forge` DNS. `transfer_protocol` is ignored once the URI carries a
+            // scheme, which the configured base URL does.
+            let image_uri = format!(
+                "{}/public/blobs/internal/aarch64/forge.bfb",
+                ctx.services
+                    .site_config
+                    .pxe_public_base_url
+                    .trim_end_matches('/')
+            );
             let task = dpu_redfish_client
                 .update_firmware_simple_update(
-                    "carbide-pxe.forge//public/blobs/internal/aarch64/forge.bfb",
+                    &image_uri,
                     vec!["redfish/v1/UpdateService/FirmwareInventory/DPU_OS".to_string()],
                     TransferProtocolType::HTTP,
                 )
@@ -3782,16 +3795,24 @@ impl DpuMachineStateHandler {
         // A BMC whose UEFI redfish client never answers reports the resource
         // with neither field, so the reboot work-around below cannot converge.
         // Both must be absent: a half-populated response is still a race.
+        //
+        // The answer follows the configured intent, because the state that
+        // cannot be read is the state we would have driven towards: on the
+        // disable path report "disabled" and carry on to UEFI HTTP boot; on the
+        // enable path report "not disabled", which routes to the signed-BFB
+        // install. Assuming secure boot is on is the conservative direction --
+        // a signed BFB installs on a system whose secure boot is off too.
         if self.secure_boot_reporting_optional
-            && !self.enable_secure_boot
             && secure_boot_status.secure_boot_enable.is_none()
             && secure_boot_status.secure_boot_current_boot.is_none()
         {
+            let disabled = !self.enable_secure_boot;
             tracing::warn!(
                 machine_id = %dpu_machine_id,
-                "DPU BMC reports no secure boot state; treating secure boot as disabled per dpu_secure_boot_reporting_optional"
+                secure_boot_disabled = disabled,
+                "DPU BMC reports no secure boot state; assuming the configured intent per dpu_secure_boot_reporting_optional"
             );
-            return Ok(true);
+            return Ok(disabled);
         }
 
         let secure_boot_enable =
