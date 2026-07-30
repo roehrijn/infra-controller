@@ -66,6 +66,7 @@ pub fn build_server_config(
     nameservers: Vec<Ipv4Addr>,
     nameservers_v6: Vec<Ipv6Addr>,
     loopback_ip: Ipv4Addr,
+    tftp_ip: Option<Ipv4Addr>,
 ) -> Result<String, eyre::Report> {
     let dhcp_config = carbide_rpc_utils::dhcp::DhcpConfig::from_forge_dhcp_config(
         pxe_ip,
@@ -73,6 +74,7 @@ pub fn build_server_config(
         nameservers,
         nameservers_v6,
         loopback_ip,
+        tftp_ip,
     )?;
 
     Ok(serde_yaml::to_string(&dhcp_config)?)

@@ -35,6 +35,12 @@ use crate::{Config, DhcpMode, util};
 
 const PKT_TYPE_OP_REQUEST: u8 = 1;
 
+/// Stage-1 TFTP bootstrap filename offered to a legacy (non-iPXE) UEFI PXE
+/// ROM. Mirrors the proven data-VLAN dnsmasq `dhcp-boot=ipxe.efi` file; the
+/// value is fixed rather than a config knob because it is the only correct
+/// one for chaining into stage-2 iPXE.
+const LEGACY_PXE_BOOTFILE: &[u8] = b"ipxe.efi";
+
 pub struct DecodedPacket {
     packet: Message,
 }
@@ -142,6 +148,15 @@ impl DecodedPacket {
 
     fn get_vendor_string(&self) -> Option<String> {
         self.get_option_val(OptionCode::ClassIdentifier, None).ok()
+    }
+
+    /// True when the client sent DHCP option 175 (the iPXE-specific
+    /// encapsulated options block). Only iPXE populates this option, so its
+    /// presence -- not the vendor-class string, which iPXE echoes verbatim
+    /// from the ROM that chainloaded it -- is what actually distinguishes
+    /// iPXE's own re-DHCP from the original legacy PXE ROM request.
+    fn is_ipxe(&self) -> bool {
+        self.packet.opts().get(OptionCode::Unknown(175)).is_some()
     }
 
     fn get_link_select(&self) -> Option<String> {
@@ -357,6 +372,34 @@ fn create_dhcp_reply_packet(
         None
     };
 
+    // Three DHCP-boot paths share this reply:
+    //  - iPXE's own re-DHCP (option 175 present) chains to nico-pxe over
+    //    HTTP, so it gets no BootfileName; siaddr is the provisioning server.
+    //  - HTTPClient (modern UEFI HTTP boot) is unchanged: the synthesized
+    //    HTTP boot URL, siaddr the provisioning server.
+    //  - a legacy PXE ROM (vendor class PXEClient, no option 175) gets a
+    //    stage-1 TFTP bootstrap: the fixed ipxe.efi filename, siaddr the TFTP
+    //    server, so the embedded iPXE script can then chain to nico-pxe.
+    let is_ipxe = src.is_ipxe();
+    let (siaddr, bootfile_name) = match vendor_class.as_ref() {
+        _ if is_ipxe => (config.dhcp_config.carbide_provisioning_server_ipv4, None),
+        Some(vc) if vc.is_netboot() => (
+            config.dhcp_config.carbide_provisioning_server_ipv4,
+            Some(util::machine_get_filename(&forge_response, vc, config)),
+        ),
+        // The filename is a constant mirroring the proven data-VLAN dnsmasq
+        // boot file; the only correct value is known, so it is deliberately
+        // not a config knob.
+        Some(vc) if vc.id == "PXEClient" => (
+            config
+                .dhcp_config
+                .tftp_server_ipv4
+                .unwrap_or(config.dhcp_config.carbide_provisioning_server_ipv4),
+            Some(LEGACY_PXE_BOOTFILE.to_vec()),
+        ),
+        _ => (config.dhcp_config.carbide_provisioning_server_ipv4, None),
+    };
+
     // https://www.ietf.org/rfc/rfc2131.txt
     let mut msg = Message::default();
     msg.set_opcode(dhcproto::v4::Opcode::BootReply)
@@ -367,7 +410,7 @@ fn create_dhcp_reply_packet(
         .set_flags(src.packet.flags())
         .set_ciaddr(src.packet.ciaddr())
         .set_yiaddr(allocated_address)
-        .set_siaddr(config.dhcp_config.carbide_provisioning_server_ipv4)
+        .set_siaddr(siaddr)
         .set_giaddr(src.packet.giaddr())
         .set_chaddr(src.packet.chaddr());
 
@@ -432,15 +475,11 @@ fn create_dhcp_reply_packet(
         msg.opts_mut().insert(DhcpOption::ClassIdentifier(
             vendor_class.id.as_bytes().to_vec(),
         ));
+    }
 
-        if vendor_class.is_netboot() {
-            msg.opts_mut()
-                .insert(DhcpOption::BootfileName(util::machine_get_filename(
-                    &forge_response,
-                    &vendor_class,
-                    config,
-                )));
-        }
+    if let Some(bootfile_name) = bootfile_name {
+        msg.opts_mut()
+            .insert(DhcpOption::BootfileName(bootfile_name));
     }
 
     let mut relay_agent = RelayAgentInformation::default();
@@ -467,7 +506,9 @@ fn create_dhcp_reply_packet(
         msg.opts_mut().insert(agent_options);
     }
 
-    let mut vendor_option: Vec<u8> = vec![6, 4, 0, 0, 0, 8, 70];
+    // PXE_DISCOVERY_CONTROL (sub-option 6) cleared to 0x0 to match Core's
+    // kea; near-moot in a single-authority setup, but the correct value.
+    let mut vendor_option: Vec<u8> = vec![6, 4, 0, 0, 0, 0, 70];
     let mut machine_id = forge_response
         .machine_interface_id
         .map(|x| x.to_string())
@@ -531,6 +572,7 @@ fn get_mtu(circuit_id: &str, host_config: Option<&HostConfig>) -> u16 {
         .try_into()
         .unwrap_or(1500)
 }
+#[cfg(test)]
 mod test {
     #[test]
     fn test_get_mtu() {
@@ -602,5 +644,213 @@ mod test {
             1500,
             crate::packet_handler::get_mtu("host_config_none", None)
         );
+    }
+
+    fn test_config(dhcp_config: carbide_rpc_utils::dhcp::DhcpConfig) -> crate::Config {
+        crate::Config {
+            dhcp_config,
+            host_config: None,
+            relay_response_port: 67,
+            forge_client_config: rpc::forge_tls_client::ForgeClientConfig::default(),
+        }
+    }
+
+    /// A DHCP Discover carrying vendor class `vendor_class_str` (option 60),
+    /// with option 175 (the iPXE marker) present or absent.
+    fn boot_request(
+        vendor_class_str: &str,
+        with_ipxe_option: bool,
+    ) -> crate::packet_handler::DecodedPacket {
+        let mut msg = dhcproto::v4::Message::new(
+            std::net::Ipv4Addr::UNSPECIFIED,
+            std::net::Ipv4Addr::UNSPECIFIED,
+            std::net::Ipv4Addr::UNSPECIFIED,
+            std::net::Ipv4Addr::UNSPECIFIED,
+            &[0x00, 0x1b, 0x63, 0x84, 0x45, 0xe6],
+        );
+        msg.opts_mut().insert(dhcproto::v4::DhcpOption::MessageType(
+            dhcproto::v4::MessageType::Discover,
+        ));
+        msg.opts_mut()
+            .insert(dhcproto::v4::DhcpOption::ClassIdentifier(
+                vendor_class_str.as_bytes().to_vec(),
+            ));
+        if with_ipxe_option {
+            msg.opts_mut()
+                .insert(dhcproto::v4::DhcpOption::Unknown(
+                    dhcproto::v4::UnknownOption::new(dhcproto::v4::OptionCode::Unknown(175), vec![]),
+                ));
+        }
+        crate::packet_handler::DecodedPacket { packet: msg }
+    }
+
+    fn test_dhcp_record(booturl: Option<&str>) -> rpc::forge::DhcpRecord {
+        rpc::forge::DhcpRecord {
+            address: "10.10.10.20".to_string(),
+            prefix: "10.10.10.0/24".to_string(),
+            fqdn: "host.example.com".to_string(),
+            booturl: booturl.map(str::to_string),
+            ..Default::default()
+        }
+    }
+
+    /// A legacy UEFI PXE ROM (vendor class `PXEClient`, no option 175) is
+    /// offered the fixed `ipxe.efi` stage-1 TFTP bootfile, siaddr the
+    /// configured TFTP server.
+    #[test]
+    fn legacy_pxe_client_gets_tftp_bootfile() {
+        let provisioning_server = std::net::Ipv4Addr::new(10, 0, 0, 5);
+        let tftp_server = std::net::Ipv4Addr::new(10, 0, 0, 9);
+        let config = test_config(carbide_rpc_utils::dhcp::DhcpConfig {
+            carbide_provisioning_server_ipv4: provisioning_server,
+            tftp_server_ipv4: Some(tftp_server),
+            ..Default::default()
+        });
+        let src = boot_request("PXEClient:Arch:00007:UNDI:003000", false);
+
+        let reply = crate::packet_handler::create_dhcp_reply_packet(
+            &src,
+            "eth0",
+            test_dhcp_record(None),
+            &config,
+            dhcproto::v4::MessageType::Discover,
+        )
+        .unwrap();
+
+        assert_eq!(reply.siaddr(), tftp_server);
+        assert_eq!(
+            reply
+                .opts()
+                .get(dhcproto::v4::OptionCode::BootfileName),
+            Some(&dhcproto::v4::DhcpOption::BootfileName(b"ipxe.efi".to_vec()))
+        );
+    }
+
+    /// With no `tftp_server_ipv4` configured, the legacy PXE ROM path falls
+    /// back to the provisioning server -- today's behaviour is preserved.
+    #[test]
+    fn legacy_pxe_client_falls_back_to_provisioning_server_when_tftp_unset() {
+        let provisioning_server = std::net::Ipv4Addr::new(10, 0, 0, 5);
+        let config = test_config(carbide_rpc_utils::dhcp::DhcpConfig {
+            carbide_provisioning_server_ipv4: provisioning_server,
+            tftp_server_ipv4: None,
+            ..Default::default()
+        });
+        let src = boot_request("PXEClient:Arch:00007:UNDI:003000", false);
+
+        let reply = crate::packet_handler::create_dhcp_reply_packet(
+            &src,
+            "eth0",
+            test_dhcp_record(None),
+            &config,
+            dhcproto::v4::MessageType::Discover,
+        )
+        .unwrap();
+
+        assert_eq!(reply.siaddr(), provisioning_server);
+        assert_eq!(
+            reply
+                .opts()
+                .get(dhcproto::v4::OptionCode::BootfileName),
+            Some(&dhcproto::v4::DhcpOption::BootfileName(b"ipxe.efi".to_vec()))
+        );
+    }
+
+    /// iPXE re-requests under the same `PXEClient` vendor class as the ROM
+    /// that chainloaded it; option 175 -- not the vendor class -- is what
+    /// distinguishes it, and it gets no BootfileName so it can run its own
+    /// embedded script.
+    #[test]
+    fn ipxe_redhcp_with_option_175_gets_no_bootfile() {
+        let provisioning_server = std::net::Ipv4Addr::new(10, 0, 0, 5);
+        let tftp_server = std::net::Ipv4Addr::new(10, 0, 0, 9);
+        let config = test_config(carbide_rpc_utils::dhcp::DhcpConfig {
+            carbide_provisioning_server_ipv4: provisioning_server,
+            tftp_server_ipv4: Some(tftp_server),
+            ..Default::default()
+        });
+        let src = boot_request("PXEClient:Arch:00007:UNDI:003000", true);
+
+        let reply = crate::packet_handler::create_dhcp_reply_packet(
+            &src,
+            "eth0",
+            test_dhcp_record(None),
+            &config,
+            dhcproto::v4::MessageType::Discover,
+        )
+        .unwrap();
+
+        assert_eq!(reply.siaddr(), provisioning_server);
+        assert_eq!(
+            reply.opts().get(dhcproto::v4::OptionCode::BootfileName),
+            None
+        );
+    }
+
+    /// The existing HTTPClient (modern UEFI HTTP boot) path is untouched by
+    /// the legacy-PXE / iPXE discrimination.
+    #[test]
+    fn http_client_netboot_is_unchanged() {
+        let provisioning_server = std::net::Ipv4Addr::new(10, 0, 0, 5);
+        let tftp_server = std::net::Ipv4Addr::new(10, 0, 0, 9);
+        let config = test_config(carbide_rpc_utils::dhcp::DhcpConfig {
+            carbide_provisioning_server_ipv4: provisioning_server,
+            tftp_server_ipv4: Some(tftp_server),
+            ..Default::default()
+        });
+        let src = boot_request("HTTPClient:Arch:00011:UNDI:003000", false);
+
+        let reply = crate::packet_handler::create_dhcp_reply_packet(
+            &src,
+            "eth0",
+            test_dhcp_record(Some("http://custom.example/ipxe")),
+            &config,
+            dhcproto::v4::MessageType::Discover,
+        )
+        .unwrap();
+
+        assert_eq!(reply.siaddr(), provisioning_server);
+        assert_eq!(
+            reply.opts().get(dhcproto::v4::OptionCode::BootfileName),
+            Some(&dhcproto::v4::DhcpOption::BootfileName(
+                b"http://custom.example/ipxe".to_vec()
+            ))
+        );
+        assert_eq!(
+            reply
+                .opts()
+                .get(dhcproto::v4::OptionCode::ClassIdentifier),
+            Some(&dhcproto::v4::DhcpOption::ClassIdentifier(
+                b"HTTPClient".to_vec()
+            ))
+        );
+    }
+
+    /// PXE_DISCOVERY_CONTROL (VendorExtensions sub-option 6) is cleared to
+    /// 0x0, matching Core's kea.
+    #[test]
+    fn vendor_extensions_clears_pxe_discovery_control() {
+        let config = test_config(carbide_rpc_utils::dhcp::DhcpConfig {
+            carbide_provisioning_server_ipv4: std::net::Ipv4Addr::new(10, 0, 0, 5),
+            ..Default::default()
+        });
+        let src = boot_request("PXEClient:Arch:00007:UNDI:003000", false);
+
+        let reply = crate::packet_handler::create_dhcp_reply_packet(
+            &src,
+            "eth0",
+            test_dhcp_record(None),
+            &config,
+            dhcproto::v4::MessageType::Discover,
+        )
+        .unwrap();
+
+        let Some(dhcproto::v4::DhcpOption::VendorExtensions(bytes)) = reply
+            .opts()
+            .get(dhcproto::v4::OptionCode::VendorExtensions)
+        else {
+            panic!("expected a VendorExtensions option in the reply");
+        };
+        assert_eq!(bytes[0..6], [6, 4, 0, 0, 0, 0]);
     }
 }

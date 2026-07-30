@@ -192,6 +192,20 @@ impl ServiceAddresses {
             }
         };
 
+        // Optional, unlike carbide-pxe: a legacy PXE ROM's stage-1 TFTP hop
+        // falls back to the provisioning server when this is unresolved, so
+        // a missing record here is not fatal.
+        let tftp_ips = match url_resolver.resolve("carbide-tftp.forge").await {
+            Ok(x) => {
+                tracing::info!(tftp_ip_addresses = ?x, "TFTP server resolved.");
+                x
+            }
+            Err(e) => {
+                tracing::info!(error = %e, "TFTP server couldn't be resolved. dhcp-server will fall back to the provisioning server for legacy PXE boot.");
+                vec![]
+            }
+        };
+
         let nameservers = if agent_platform_type.is_dpu_os() {
             url_resolver.nameservers()
         } else {
@@ -202,6 +216,7 @@ impl ServiceAddresses {
             pxe_ips,
             ntpservers,
             nameservers,
+            tftp_ips,
         })
     }
 
@@ -210,6 +225,7 @@ impl ServiceAddresses {
             pxe_ips: vec![IpAddr::from([127, 0, 0, 1])],
             ntpservers: vec![],
             nameservers: vec![IpAddr::from([127, 0, 0, 1])],
+            tftp_ips: vec![],
         }
     }
 }
