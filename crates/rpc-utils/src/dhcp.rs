@@ -40,6 +40,11 @@ pub struct DhcpConfig {
     pub carbide_ntpservers: Vec<Ipv4Addr>,
     pub carbide_provisioning_server_ipv4: Ipv4Addr,
     pub carbide_dhcp_server: Ipv4Addr,
+    // siaddr offered to a legacy (non-iPXE) UEFI PXE ROM for its stage-1 TFTP
+    // fetch of ipxe.efi. Falls back to `carbide_provisioning_server_ipv4`
+    // when unset, so omitting it preserves today's behaviour.
+    #[serde(default)]
+    pub tftp_server_ipv4: Option<Ipv4Addr>,
     #[serde(default)]
     pub carbide_nameservers_v6: Vec<Ipv6Addr>,
     #[serde(default)]
@@ -82,6 +87,7 @@ impl Default for DhcpConfig {
             // These two must be updated with valid values.
             carbide_provisioning_server_ipv4: Ipv4Addr::from([127, 0, 0, 1]),
             carbide_dhcp_server: Ipv4Addr::from([127, 0, 0, 1]),
+            tftp_server_ipv4: None,
             carbide_nameservers_v6: vec![],
             carbide_ntpservers_v6: vec![],
             carbide_dhcp_server_v6: None,
@@ -98,6 +104,7 @@ impl DhcpConfig {
         carbide_nameservers: Vec<Ipv4Addr>,
         carbide_nameservers_v6: Vec<Ipv6Addr>,
         loopback_ip: Ipv4Addr,
+        tftp_server_ipv4: Option<Ipv4Addr>,
     ) -> Result<Self, DhcpDataError> {
         Ok(DhcpConfig {
             carbide_nameservers,
@@ -105,6 +112,7 @@ impl DhcpConfig {
             carbide_ntpservers,
             carbide_provisioning_server_ipv4,
             carbide_dhcp_server: loopback_ip,
+            tftp_server_ipv4,
             ..Default::default()
         })
     }
@@ -344,6 +352,7 @@ mod tests {
     struct DhcpConfigSummary {
         provisioning_server: Ipv4Addr,
         dhcp_server: Ipv4Addr,
+        tftp_server: Option<Ipv4Addr>,
         ntpservers: Vec<Ipv4Addr>,
         nameservers: Vec<Ipv4Addr>,
         nameservers_v6: Vec<Ipv6Addr>,
@@ -437,12 +446,13 @@ mod tests {
     }
 
     fn summarize_dhcp_config(
-        (provisioning_server, ntpservers, nameservers, nameservers_v6, dhcp_server): (
+        (provisioning_server, ntpservers, nameservers, nameservers_v6, dhcp_server, tftp_server): (
             Ipv4Addr,
             Vec<Ipv4Addr>,
             Vec<Ipv4Addr>,
             Vec<Ipv6Addr>,
             Ipv4Addr,
+            Option<Ipv4Addr>,
         ),
     ) -> Result<DhcpConfigSummary, &'static str> {
         DhcpConfig::from_forge_dhcp_config(
@@ -451,10 +461,12 @@ mod tests {
             nameservers,
             nameservers_v6,
             dhcp_server,
+            tftp_server,
         )
         .map(|config| DhcpConfigSummary {
             provisioning_server: config.carbide_provisioning_server_ipv4,
             dhcp_server: config.carbide_dhcp_server,
+            tftp_server: config.tftp_server_ipv4,
             ntpservers: config.carbide_ntpservers,
             nameservers: config.carbide_nameservers,
             nameservers_v6: config.carbide_nameservers_v6,
@@ -485,19 +497,40 @@ mod tests {
     #[test]
     fn builds_dhcp_config_from_forge_values() {
         scenarios!(summarize_dhcp_config:
-            "configured addresses" {
+            "configured addresses, tftp server set" {
                 (
                     Ipv4Addr::new(192, 0, 2, 10),
                     vec![Ipv4Addr::new(192, 0, 2, 20)],
                     vec![Ipv4Addr::new(192, 0, 2, 53)],
                     vec!["2001:db8::53".parse::<Ipv6Addr>().unwrap()],
                     Ipv4Addr::new(127, 0, 0, 2),
+                    Some(Ipv4Addr::new(192, 0, 2, 30)),
                 ) => Yields(DhcpConfigSummary {
                     provisioning_server: Ipv4Addr::new(192, 0, 2, 10),
                     dhcp_server: Ipv4Addr::new(127, 0, 0, 2),
+                    tftp_server: Some(Ipv4Addr::new(192, 0, 2, 30)),
                     ntpservers: vec![Ipv4Addr::new(192, 0, 2, 20)],
                     nameservers: vec![Ipv4Addr::new(192, 0, 2, 53)],
                     nameservers_v6: vec!["2001:db8::53".parse::<Ipv6Addr>().unwrap()],
+                    lease_time_secs: DEFAULT_LEASE_TIME_SECS,
+                }),
+            }
+
+            "tftp server unset" {
+                (
+                    Ipv4Addr::new(192, 0, 2, 10),
+                    vec![],
+                    vec![],
+                    vec![],
+                    Ipv4Addr::new(127, 0, 0, 2),
+                    None,
+                ) => Yields(DhcpConfigSummary {
+                    provisioning_server: Ipv4Addr::new(192, 0, 2, 10),
+                    dhcp_server: Ipv4Addr::new(127, 0, 0, 2),
+                    tftp_server: None,
+                    ntpservers: vec![],
+                    nameservers: vec![],
+                    nameservers_v6: vec![],
                     lease_time_secs: DEFAULT_LEASE_TIME_SECS,
                 }),
             }
@@ -728,6 +761,36 @@ mod tests {
         assert_eq!(old_config.carbide_dhcp_server_v6, None);
         assert_eq!(old_config.dhcpv6_preferred_lifetime_secs, 0);
         assert_eq!(old_config.dhcpv6_valid_lifetime_secs, 0);
+        assert_eq!(old_config.tftp_server_ipv4, None);
+    }
+
+    /// `tftp_server_ipv4` round-trips when set and defaults to `None` (the
+    /// fallback-to-provisioning-server behaviour) for old configs that
+    /// predate the field.
+    #[test]
+    fn tftp_server_ipv4_round_trips_and_defaults_when_absent() {
+        let config = DhcpConfig {
+            tftp_server_ipv4: Some(Ipv4Addr::new(192, 0, 2, 40)),
+            ..Default::default()
+        };
+
+        let wire = serde_json::to_string(&config).expect("dhcp config serializes");
+        let recovered: DhcpConfig = serde_json::from_str(&wire).expect("dhcp config deserializes");
+        assert_eq!(recovered.tftp_server_ipv4, Some(Ipv4Addr::new(192, 0, 2, 40)));
+
+        let old_wire = r#"{
+            "lease_time_secs": 604800,
+            "renewal_time_secs": 3600,
+            "rebinding_time_secs": 432000,
+            "carbide_nameservers": [],
+            "carbide_api_url": null,
+            "carbide_ntpservers": [],
+            "carbide_provisioning_server_ipv4": "127.0.0.1",
+            "carbide_dhcp_server": "127.0.0.1"
+        }"#;
+        let old_config: DhcpConfig =
+            serde_json::from_str(old_wire).expect("old dhcp config deserializes");
+        assert_eq!(old_config.tftp_server_ipv4, None);
     }
 
     /// Verifies per-interface IPv6 details round-trip and old host configs default them.

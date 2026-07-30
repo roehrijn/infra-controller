@@ -136,6 +136,10 @@ pub struct ServiceAddresses {
     pub pxe_ips: Vec<IpAddr>,
     pub ntpservers: Vec<IpAddr>,
     pub nameservers: Vec<IpAddr>,
+    // Optional: resolves the same way as pxe_ips, but a legacy PXE ROM's
+    // stage-1 TFTP fetch is not on the critical netboot path the way
+    // pxe_ips (UEFI HTTP boot) is, so an unresolved name here is not fatal.
+    pub tftp_ips: Vec<IpAddr>,
 }
 
 /// Split a dual-stack nameserver list into its IPv4 and IPv6 members, so the
@@ -1125,12 +1129,21 @@ async fn update_dhcp_via_grpc(
             )
         })?;
 
+    // Optional: a legacy PXE ROM's stage-1 TFTP siaddr. Unlike pxe_ip_v4,
+    // an unresolved/absent address is not fatal -- dhcp-server falls back to
+    // the provisioning server.
+    let tftp_ip_v4 = service_addrs.tftp_ips.iter().find_map(|x| match x {
+        IpAddr::V4(x) => Some(*x),
+        _ => None,
+    });
+
     let dhcp_config = carbide_rpc_utils::dhcp::DhcpConfig::from_forge_dhcp_config(
         pxe_ip_v4,
         ntpservers_v4,
         nameservers_v4,
         nameservers_v6,
         loopback_ip,
+        tftp_ip_v4,
     )?;
     let mut host_config = carbide_rpc_utils::dhcp::HostConfig::try_from(
         network_config.clone(),
@@ -1532,6 +1545,14 @@ fn write_dhcp_v4_server_config(
             eyre::eyre!("DHCPv4 server config requires an IPv4 PXE/UEFI HTTP boot address, but none found in {:?}", service_addrs.pxe_ips)
         })?;
 
+    // Optional: a legacy PXE ROM's stage-1 TFTP siaddr. Unlike pxe_ip_v4,
+    // an unresolved/absent address is not fatal -- dhcp-server falls back to
+    // the provisioning server.
+    let tftp_ip_v4 = service_addrs.tftp_ips.iter().find_map(|x| match x {
+        IpAddr::V4(x) => Some(*x),
+        _ => None,
+    });
+
     let mut has_changes = false;
 
     let next_contents = dhcp::build_server_supervisord_config(dhcp::DhcpServerSupervisordConfig {
@@ -1562,6 +1583,7 @@ fn write_dhcp_v4_server_config(
         nameservers_v4,
         nameservers_v6,
         loopback_ip,
+        tftp_ip_v4,
     )?;
     match write(
         next_contents,
@@ -2057,6 +2079,7 @@ mod tests {
             pxe_ips: vec![],
             ntpservers: vec![IpAddr::from([192, 0, 2, 20])],
             nameservers: vec![],
+            tftp_ips: vec![],
         };
         let nc = rpc::ManagedHostNetworkConfigResponse {
             ntp_servers: vec!["198.51.100.1".to_string(), "198.51.100.2".to_string()],
@@ -2079,6 +2102,7 @@ mod tests {
             pxe_ips: vec![],
             ntpservers: vec![IpAddr::from([192, 0, 2, 20])],
             nameservers: vec![],
+            tftp_ips: vec![],
         };
 
         let empty_nc = rpc::ManagedHostNetworkConfigResponse::default();
@@ -3421,6 +3445,7 @@ mod tests {
             expected.carbide_provisioning_server_ipv4
         );
         assert_eq!(received.carbide_dhcp_server, expected.carbide_dhcp_server);
+        assert_eq!(received.tftp_server_ipv4, expected.tftp_server_ipv4);
     }
 
     fn validate_host_config(received: HostConfig, expected: HostConfig) {
@@ -3563,6 +3588,7 @@ mod tests {
                 Ipv4Addr::from([127, 0, 0, 3]),
             ],
             carbide_provisioning_server_ipv4: Ipv4Addr::from([10, 0, 0, 1]),
+            tftp_server_ipv4: Some(Ipv4Addr::from([10, 0, 0, 9])),
             lease_time_secs: 604800,
             renewal_time_secs: 3600,
             rebinding_time_secs: 432000,
@@ -3669,6 +3695,7 @@ mod tests {
                 IpAddr::from([127, 0, 0, 3]),
             ],
             nameservers: vec![IpAddr::from([10, 1, 1, 1])],
+            tftp_ips: vec![IpAddr::from([10, 0, 0, 9])],
         };
 
         let mut host_config_str =
@@ -3733,6 +3760,7 @@ mod tests {
             pxe_ips: vec![IpAddr::from([10, 0, 0, 1])],
             ntpservers: vec![],
             nameservers: vec![IpAddr::from([10, 1, 1, 1])],
+            tftp_ips: vec![],
         };
         match super::write_dhcp_v4_server_config(
             &fp,
@@ -3855,6 +3883,7 @@ mod tests {
             pxe_ips: vec!["fd00::1".parse().unwrap()],
             ntpservers: vec![],
             nameservers: vec![IpAddr::from([10, 1, 1, 1])],
+            tftp_ips: vec![],
         };
 
         let result = super::write_dhcp_v4_server_config(
