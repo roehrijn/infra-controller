@@ -355,7 +355,10 @@ write_files:
           )
 
       expected_markers = {
-          "fix1 (journalctl -b)": 'journalctl -u sfc.service --no-pager -b' in content,
+          # Satisfied either because the fix is applied, or because this
+          # manifest has no unbounded journalctl call to fix (HBN 2.4.x).
+          "fix1 (journalctl -b)": 'journalctl -u sfc.service --no-pager -b' in content
+          or 'journalctl -u sfc.service --no-pager' not in content,
           "fix4 (eth0 IP read)": 'ip -4 addr show eth0' in content,
           "fix6 (nvue rm)": 'rm -f /host/var/lib/hbn/var/support/nvue_startup' in content,
       }
