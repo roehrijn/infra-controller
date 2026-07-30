@@ -806,7 +806,8 @@ dependencies = [
   "bfb-add-nvinit-setup-to-bfb",
   "bfb-add-prod-forge-root-ca-to-bfb",
   "mkdir-hbn-folder-in-bfb",
-  "download-hbn-installer-to-bfb",
+  "download-hbn-installer-to-bfb-sa",
+  "unzip-hbn-folder-in-bfb",
   "mv-hbn-configs-to-bfb",
   "mv-hbn-scripts-to-bfb",
   "cleanup-hbn-scripts",
@@ -1111,7 +1112,7 @@ cwd = "${BUILD_LOCATION}/doca_container_configs"
 category = "iPXE Kernel"
 description = "Add the HBN scripts to the BFB"
 command = "mv"
-args = ["temp/configs/${DOCA_VERSION}/", "configs"]
+args = ["temp/configs/${DOCA_HBN_VERSION}/", "configs"]
 cwd = "${BUILD_LOCATION}/doca_container_configs"
 
 [tasks.cleanup-hbn-scripts]
