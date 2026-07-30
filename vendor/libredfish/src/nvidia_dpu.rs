@@ -1115,6 +1115,21 @@ impl Bmc {
         &self,
         data: HashMap<&str, HashMap<&str, String>>,
     ) -> Result<(), RedfishError> {
+        // Capability gate: a DPU BMC that exposes no settable BIOS attributes --
+        // an empty Attributes map, e.g. BF-24.10 answers Systems/{}/Bios with
+        // "Attributes": {} -- cannot accept any BIOS attribute write and rejects
+        // the PATCH with HTTP 400 (PropertyValueNotInList). Skip the write as an
+        // unsupported no-op there. A BMC that DOES expose attributes still PATCHes
+        // exactly as before, so a genuine bad-value 400 fails loudly; and a failure
+        // to READ the attributes propagates -- "cannot read capabilities" must not
+        // be conflated with "has none".
+        if bios_attributes_are_empty(&self.s.bios_attributes().await?) {
+            tracing::warn!(
+                "DPU BMC exposes no settable BIOS attributes (empty Attributes map); \
+                 skipping BIOS attribute write as an unsupported no-op"
+            );
+            return Ok(());
+        }
         let url = format!("Systems/{}/Bios/Settings", self.s.system_id());
         self.s
             .client
@@ -1417,5 +1432,44 @@ impl Bmc {
         let url = format!("Systems/{}/Oem/Nvidia/Actions/Mode.Set", self.s.system_id());
 
         self.s.client.post(&url, data).await.map(|_resp| Ok(()))?
+    }
+}
+
+/// True when a DPU BMC's `Systems/{}/Bios` `Attributes` value is an empty object,
+/// i.e. the BMC exposes no settable BIOS attributes. `patch_bios_setting` uses
+/// this to skip BIOS attribute writes as an unsupported no-op rather than let the
+/// BMC reject them with an unrecoverable HTTP 400. Only an empty object counts as
+/// "no attributes"; a populated object -- or any non-object shape -- returns false
+/// so the write proceeds and a real failure still surfaces.
+fn bios_attributes_are_empty(attributes: &serde_json::Value) -> bool {
+    attributes.as_object().is_some_and(|map| map.is_empty())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::bios_attributes_are_empty;
+    use serde_json::json;
+
+    #[test]
+    fn empty_attributes_object_is_unsupported() {
+        // BF-24.10 answers Bios with "Attributes": {} -- writes must be skipped.
+        assert!(bios_attributes_are_empty(&json!({})));
+    }
+
+    #[test]
+    fn populated_attributes_are_supported() {
+        // A DPU BMC that exposes attributes (BF-3, or BF-2 on other firmware)
+        // must still PATCH, so a genuine bad-value 400 fails loudly.
+        assert!(!bios_attributes_are_empty(
+            &json!({"HostPrivilegeLevel": "Restricted"})
+        ));
+    }
+
+    #[test]
+    fn non_object_attributes_are_supported() {
+        // Anything that is not an empty object is treated as "has capabilities":
+        // do not swallow a write on an unexpected shape.
+        assert!(!bios_attributes_are_empty(&json!(null)));
+        assert!(!bios_attributes_are_empty(&json!("Attributes")));
     }
 }
