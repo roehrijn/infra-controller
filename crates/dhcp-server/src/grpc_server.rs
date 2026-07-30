@@ -90,6 +90,7 @@ impl TryFrom<proto::DhcpConfig> for ModelDhcpConfig {
             carbide_dhcp_server_v6: c.carbide_dhcp_server_v6.map(|s| s.parse()).transpose()?,
             dhcpv6_preferred_lifetime_secs: c.dhcpv6_preferred_lifetime_secs,
             dhcpv6_valid_lifetime_secs: c.dhcpv6_valid_lifetime_secs,
+            tftp_server_ipv4: c.tftp_server_ipv4.map(|s| s.parse()).transpose()?,
         })
     }
 }
