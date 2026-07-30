@@ -421,14 +421,22 @@ fn create_dhcp_reply_packet(
         ),
         // The filename is a constant mirroring the proven data-VLAN dnsmasq
         // boot file; the only correct value is known, so it is deliberately
-        // not a config knob.
-        Some(vc) if vc.id == "PXEClient" => (
-            config
-                .dhcp_config
-                .tftp_server_ipv4
-                .unwrap_or(config.dhcp_config.carbide_provisioning_server_ipv4),
-            Some(LEGACY_PXE_BOOTFILE.to_vec()),
-        ),
+        // not a config knob. Guarded on arch: `id == "PXEClient"` also matches
+        // aarch64 clients (bare `PXEClient` and `PXEClient:Arch:00011`), and
+        // handing those the x86 ipxe.efi would be a confidently wrong answer --
+        // exclude Arm64 so they fall through to the no-bootfile default instead.
+        Some(vc)
+            if vc.id == "PXEClient"
+                && vc.arch != carbide_dhcp_common::MachineArchitecture::Arm64 =>
+        {
+            (
+                config
+                    .dhcp_config
+                    .tftp_server_ipv4
+                    .unwrap_or(config.dhcp_config.carbide_provisioning_server_ipv4),
+                Some(LEGACY_PXE_BOOTFILE.to_vec()),
+            )
+        }
         _ => (config.dhcp_config.carbide_provisioning_server_ipv4, None),
     };
 
@@ -724,6 +732,35 @@ mod test {
             booturl: booturl.map(str::to_string),
             ..Default::default()
         }
+    }
+
+    /// An aarch64 PXEClient (arch Arm64 -- bare `PXEClient`) must NOT be handed
+    /// the x86 ipxe.efi; it falls through to the no-bootfile default with siaddr
+    /// the provisioning server, rather than a confidently-wrong x86 answer.
+    #[test]
+    fn aarch64_pxe_client_gets_no_legacy_bootfile() {
+        let provisioning_server = std::net::Ipv4Addr::new(10, 0, 0, 5);
+        let config = test_config(carbide_rpc_utils::dhcp::DhcpConfig {
+            carbide_provisioning_server_ipv4: provisioning_server,
+            tftp_server_ipv4: Some(std::net::Ipv4Addr::new(10, 0, 0, 9)),
+            ..Default::default()
+        });
+        let src = boot_request("PXEClient", false);
+
+        let reply = crate::packet_handler::create_dhcp_reply_packet(
+            &src,
+            "eth0",
+            test_dhcp_record(None),
+            &config,
+            dhcproto::v4::MessageType::Discover,
+        )
+        .unwrap();
+
+        assert_eq!(reply.siaddr(), provisioning_server);
+        assert_eq!(
+            reply.opts().get(dhcproto::v4::OptionCode::BootfileName),
+            None
+        );
     }
 
     /// A legacy UEFI PXE ROM (vendor class `PXEClient`, no option 175) is
