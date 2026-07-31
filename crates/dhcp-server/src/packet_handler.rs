@@ -381,11 +381,16 @@ fn create_dhcp_reply_packet(
     //    stage-1 TFTP bootstrap: the fixed ipxe.efi filename, siaddr the TFTP
     //    server, so the embedded iPXE script can then chain to nico-pxe.
     let is_ipxe = src.is_ipxe();
-    let (siaddr, bootfile_name) = match vendor_class.as_ref() {
-        _ if is_ipxe => (config.dhcp_config.carbide_provisioning_server_ipv4, None),
+    let (siaddr, bootfile_name, is_legacy_pxe) = match vendor_class.as_ref() {
+        _ if is_ipxe => (
+            config.dhcp_config.carbide_provisioning_server_ipv4,
+            None,
+            false,
+        ),
         Some(vc) if vc.is_netboot() => (
             config.dhcp_config.carbide_provisioning_server_ipv4,
             Some(util::machine_get_filename(&forge_response, vc, config)),
+            false,
         ),
         // The filename is a constant mirroring the proven data-VLAN dnsmasq
         // boot file; the only correct value is known, so it is deliberately
@@ -403,9 +408,14 @@ fn create_dhcp_reply_packet(
                     .tftp_server_ipv4
                     .unwrap_or(config.dhcp_config.carbide_provisioning_server_ipv4),
                 Some(LEGACY_PXE_BOOTFILE.to_vec()),
+                true,
             )
         }
-        _ => (config.dhcp_config.carbide_provisioning_server_ipv4, None),
+        _ => (
+            config.dhcp_config.carbide_provisioning_server_ipv4,
+            None,
+            false,
+        ),
     };
 
     // https://www.ietf.org/rfc/rfc2131.txt
@@ -514,9 +524,23 @@ fn create_dhcp_reply_packet(
         msg.opts_mut().insert(agent_options);
     }
 
-    // PXE_DISCOVERY_CONTROL (sub-option 6) cleared to 0x0 to match Core's
-    // kea; near-moot in a single-authority setup, but the correct value.
-    let mut vendor_option: Vec<u8> = vec![6, 4, 0, 0, 0, 0, 70];
+    // PXE_DISCOVERY_CONTROL (sub-option 6) is a SINGLE octet: the UEFI PXE base
+    // code reads exactly one byte at the value offset and skips the rest of the
+    // sub-option by its length (edk2 PxeBcParseVendorOptions), so the 4-octet
+    // form presents as 0x00 whatever the trailing octets hold.
+    //
+    // A legacy PXE ROM we hand a bootfile to needs bit 3 SET -- "boot the file
+    // named in this reply, skip Boot Server Discovery". Left clear, the ROM
+    // calls Discover() instead; if that fails there is no fallback to
+    // siaddr + bootfile and the boot aborts (EFI_ABORTED, "PXE-E21") before a
+    // single packet leaves the host. The other paths keep the historical
+    // encoding: they are what upstream exercises, and both forms read as 0x00
+    // anyway, so there is nothing to gain by perturbing them.
+    let mut vendor_option: Vec<u8> = if is_legacy_pxe {
+        vec![6, 1, 0x08, 70]
+    } else {
+        vec![6, 4, 0, 0, 0, 0, 70]
+    };
     let mut machine_id = forge_response
         .machine_interface_id
         .map(|x| x.to_string())
@@ -526,6 +550,10 @@ fn create_dhcp_reply_packet(
 
     vendor_option.push(machine_id.len() as u8);
     vendor_option.append(&mut machine_id);
+
+    if is_legacy_pxe {
+        vendor_option.push(0xff);
+    }
 
     msg.opts_mut()
         .insert(DhcpOption::VendorExtensions(vendor_option));
@@ -860,15 +888,12 @@ mod test {
         );
     }
 
-    /// PXE_DISCOVERY_CONTROL (VendorExtensions sub-option 6) is cleared to
-    /// 0x0, matching Core's kea.
-    #[test]
-    fn vendor_extensions_clears_pxe_discovery_control() {
+    fn vendor_extensions_of(vendor_class_str: &str, with_ipxe_option: bool) -> Vec<u8> {
         let config = test_config(carbide_rpc_utils::dhcp::DhcpConfig {
             carbide_provisioning_server_ipv4: std::net::Ipv4Addr::new(10, 0, 0, 5),
             ..Default::default()
         });
-        let src = boot_request("PXEClient:Arch:00007:UNDI:003000", false);
+        let src = boot_request(vendor_class_str, with_ipxe_option);
 
         let reply = crate::packet_handler::create_dhcp_reply_packet(
             &src,
@@ -884,6 +909,29 @@ mod test {
         else {
             panic!("expected a VendorExtensions option in the reply");
         };
-        assert_eq!(bytes[0..6], [6, 4, 0, 0, 0, 0]);
+        bytes.clone()
+    }
+
+    /// A legacy PXE ROM is handed a bootfile, so PXE_DISCOVERY_CONTROL must be a
+    /// single octet with bit 3 set: the UEFI PXE base code reads exactly one
+    /// byte, and with the bit clear it calls Discover() and aborts the boot
+    /// instead of fetching the file from siaddr.
+    #[test]
+    fn legacy_pxe_sets_discovery_control_bit3_in_one_octet() {
+        let bytes = vendor_extensions_of("PXEClient:Arch:00007:UNDI:003000", false);
+
+        assert_eq!(bytes[0..3], [6, 1, 0x08]);
+        assert_eq!(bytes[3], 70, "the machine-id sub-option must still follow");
+        assert_eq!(bytes.last(), Some(&0xff), "sub-options must be terminated");
+    }
+
+    /// The HTTPClient path is left on the historical encoding: it is what
+    /// upstream exercises, and a 4-octet value reads as 0x00 either way.
+    #[test]
+    fn http_client_keeps_the_historical_discovery_control_encoding() {
+        let bytes = vendor_extensions_of("HTTPClient:Arch:00011:UNDI:003000", false);
+
+        assert_eq!(bytes[0..7], [6, 4, 0, 0, 0, 0, 70]);
+        assert_ne!(bytes.last(), Some(&0xff));
     }
 }
