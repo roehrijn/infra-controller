@@ -257,13 +257,30 @@ impl FromStr for VpcVirtualizationType {
     }
 }
 
+/// linknet_prefix_len returns the point-to-point linknet length used for a
+/// tenant instance interface: IPv4 /30, IPv6 /127 (RFC 6164).
+///
+/// IPv4 uses a /30 rather than a /31 (RFC 3021) because the UEFI network stack
+/// in edk2 rejects a station address equal to its subnet's network or broadcast
+/// address, and on a /31 both addresses are exactly that. This is the single
+/// source of truth for the width; `get_host_ip` below defines which address
+/// within the linknet is the host, and the two must change together.
+///
+/// Mirrored, unavoidably, by `validateInterfaceRequestedIpAddressIsLinknetHost`
+/// in `rest-api/api/pkg/api/model/interface.go`, which cannot call into Rust.
+/// Nothing tests that the two agree, so a change here needs a change there.
+pub fn linknet_prefix_len(is_ipv4: bool) -> u8 {
+    if is_ipv4 { 30 } else { 127 }
+}
+
 #[cfg(feature = "ipnetwork")]
-/// get_host_ip returns the host IP for a tenant instance
-/// for a given IpNetwork. This is being initially introduced
-/// for the purpose of FNN /30 allocations (where the host IP
-/// ends up being the 4th IP -- aka the second IP of the second
-/// /31 allocation in the /30), and will probably change with
-/// a wider refactor + intro of NICo IP Prefix Management.
+/// get_host_ip returns the host IP for a tenant instance for a given IpNetwork.
+///
+/// For an IPv4 /30 the host takes the second address and the gateway the third;
+/// the network and broadcast addresses are unused. The second address is
+/// deliberate: it is the offset the requested-IP validators in `api-core` and
+/// the REST API enforce, and it is neither the network nor the broadcast
+/// address, which is what UEFI PXE clients require of a station address.
 pub fn get_host_ip(network: &IpNetwork) -> eyre::Result<std::net::IpAddr> {
     match network.prefix() {
         // Single-host allocation: IPv4 /32 or IPv6 /128
@@ -277,8 +294,10 @@ pub fn get_host_ip(network: &IpNetwork) -> eyre::Result<std::net::IpAddr> {
                 network
             )),
         },
-        // Legacy /30 allocation: host IP is the 4th address
-        30 => match network.iter().nth(3) {
+        // IPv4 /30 linknet: the host takes the second address, the gateway the
+        // third. The fourth is the broadcast address, which UEFI PXE clients
+        // reject as a station address.
+        30 => match network.iter().nth(1) {
             Some(ip_addr) => Ok(ip_addr),
             None => Err(eyre::eyre!(
                 "no viable host IP found in network: {}",
@@ -597,8 +616,8 @@ mod tests {
                     net("2001:db8::0", 127) => Yields("2001:db8::1".parse::<IpAddr>().unwrap()),
                 }
 
-                "ipv4 /30 legacy uses the fourth address" {
-                    net("10.0.0.0", 30) => Yields("10.0.0.3".parse::<IpAddr>().unwrap()),
+                "ipv4 /30 uses the second address" {
+                    net("10.0.0.0", 30) => Yields("10.0.0.1".parse::<IpAddr>().unwrap()),
                 }
 
                 "ipv4 /29 is too large to be supported" {
@@ -636,6 +655,35 @@ mod tests {
                     (net("10.0.0.0", 29), &["unsupported"][..]) => Yields(true),
                 }
             );
+        }
+
+        /// The invariant edk2 actually enforces: a station address equal to the
+        /// network or broadcast address is rejected, which is why the IPv4
+        /// linknet is a /30 and not a /31. Asserting the property rather than
+        /// the literal catches a revert to the old fourth-address rule for the
+        /// reason it was wrong, not just because the value changed.
+        #[test]
+        fn get_host_ip_is_never_the_network_or_broadcast_address() {
+            for base in ["10.0.0.0", "10.100.20.128", "192.168.1.4"] {
+                let network = net(base, linknet_prefix_len(true));
+                let host = get_host_ip(&network).expect("a /30 linknet has a host address");
+                assert_ne!(
+                    host,
+                    network.network(),
+                    "host must not be the network address"
+                );
+                assert_ne!(
+                    host,
+                    network.broadcast(),
+                    "host must not be the broadcast address"
+                );
+            }
+        }
+
+        #[test]
+        fn linknet_prefix_len_is_30_for_ipv4_and_127_for_ipv6() {
+            assert_eq!(linknet_prefix_len(true), 30);
+            assert_eq!(linknet_prefix_len(false), 127);
         }
 
         #[test]

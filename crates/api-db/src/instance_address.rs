@@ -611,9 +611,10 @@ impl AssignIpsFrom<IpAllocator> for InstanceInterfaceConfig {
 
             // This is used to populate the database (and the InstanceInterfaceConfig
             // ip_addrs) with the host IP, meaning, if the instance-allocated prefix
-            // is a /32 IpNetwork, it will be the IP. If it's a /30 (say, for FNN), it
-            // will grab the 4th IP (the 2nd IP of the 2nd /31) to be handed back
-            // as the visibly-assigned IP address for the instance.
+            // is a /32 IpNetwork, it will be the IP. If it's a /30 (the FNN IPv4
+            // linknet), it takes the second address -- the gateway is the third,
+            // and the network and broadcast ends are not assignable -- to be
+            // handed back as the visibly-assigned IP address for the instance.
             let host_ip = get_host_ip(&allocated_prefix)?;
             self.ip_addrs.insert(prefix_id, host_ip);
             self.interface_prefixes.insert(prefix_id, allocated_prefix);

@@ -228,9 +228,21 @@ impl PrefixAllocator {
             self.next_free_prefix(txn).await?
         };
 
-        // IPv6 gateways are None (uses Router Advertisements).
+        // IPv6 gateways are None (uses Router Advertisements). For IPv4 the
+        // gateway is offset 2 of the /30 and the host takes offset 1 (see
+        // carbide_network::virtualization::get_host_ip). `network()` is only
+        // usable as a gateway on a /31, where RFC 3021 makes both addresses
+        // host-usable.
+        //
+        // This must error rather than fall back to None: the persisted gateway
+        // is what keeps the DPU endpoint at offset 2 out of the tenant pool, so
+        // a gateway-less IPv4 linknet would leave that offset allocatable to a
+        // tenant and would silently fall back to the site DHCP server for the
+        // Router option.
         let gateway = if prefix.is_ipv4() {
-            Some(prefix.network())
+            Some(prefix.iter().nth(2).ok_or_else(|| {
+                CarbideError::internal(format!("no gateway address available in linknet {prefix}"))
+            })?)
         } else {
             None
         };

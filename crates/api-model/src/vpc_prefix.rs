@@ -101,6 +101,10 @@ pub struct VpcPrefixStatus {
     pub controller_state: Versioned<VpcPrefixControllerState>,
     pub controller_state_outcome: Option<PersistentStateHandlerOutcome>,
     pub last_used_prefix: Option<IpNetwork>,
+    /// Counts IPv4 linknets, which are /30 rather than /31 -- the names predate
+    /// that change and are kept because they feed a protobuf and a metric.
+    /// `carbide_network::virtualization::linknet_prefix_len` is the width's
+    /// source of truth.
     pub total_31_segments: u32,
     pub available_31_segments: u32,
     pub total_linknet_segments: u64,
