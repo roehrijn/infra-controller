@@ -57,8 +57,11 @@ async fn update_stats(
                 )
             })?;
 
-            let total_31_segments = ip_net
-                .subnets(31)
+            // NOTE: the `*_31_segments` field names predate the move from /31 to
+            // /30 IPv4 linknets and now count /30s. See the comment on the
+            // status struct; renaming them is a protobuf and metric change.
+            let total_linknets = ip_net
+                .subnets(carbide_network::virtualization::linknet_prefix_len(true))
                 .map_err(|err| {
                     DatabaseError::new(
                         "vpc_prefix_update_stats_subnet_count",
@@ -66,20 +69,24 @@ async fn update_stats(
                     )
                 })?
                 .collect::<Vec<carbide_network::ip::prefix::Ipv4Net>>();
-            vpc_prefix.status.total_31_segments = total_31_segments.len() as u32;
-            vpc_prefix.status.available_31_segments =
-                vpc_prefix.status.total_31_segments - used_prefixes.len() as u32;
+            vpc_prefix.status.total_31_segments = total_linknets.len() as u32;
+            // Saturating: `total` counts linknets while `used_prefixes` counts
+            // persisted rows, and a prefix carrying legacy /31 rows can hold
+            // more rows than there are /30 linknets. `overflow-checks` is on in
+            // release, so a plain subtraction would panic rather than wrap.
+            vpc_prefix.status.available_31_segments = vpc_prefix
+                .status
+                .total_31_segments
+                .saturating_sub(used_prefixes.len() as u32);
         }
 
-        // Family-aware linknet stats: /31 for IPv4 (RFC 3021), /127 for IPv6 (RFC 6164).
-        let linknet_prefix: u8 = if vpc_prefix.config.prefix.is_ipv4() {
-            31
-        } else {
-            127
-        };
+        // Family-aware linknet stats, sharing one source of truth with the
+        // allocator and get_host_ip: /30 for IPv4, /127 for IPv6 (RFC 6164).
+        let linknet_prefix: u8 =
+            carbide_network::virtualization::linknet_prefix_len(vpc_prefix.config.prefix.is_ipv4());
         // Compute total and available linknet segments using math rather than
         // enumeration. A VPC prefix of length L can hold 2^(linknet_prefix - L)
-        // linknets. For example, a /24 VPC holds 2^(31-24) = 128 possible /31
+        // linknets. For example, a /24 VPC holds 2^(30-24) = 64 possible /30
         // subnets, and a /120 IPv6 VPC holds 2^(127-120) = 128 possible /127
         // subnets. For very large IPv6 prefixes (e.g. /48 → 2^79 linknets),
         // the result exceeds u64, so we cap at u64::MAX -- this is purely
@@ -168,16 +175,24 @@ pub async fn find_allocation_candidates(
         WHERE vpc_id = ANY($1)
           -- Soft-deleted prefixes are not eligible automatic candidates.
           AND deleted IS NULL
-          -- A parent must be wider than the generated /31 or /127 linknet.
+          -- A parent must be wider than the generated linknet. The widths are
+          -- bound from carbide_network::virtualization::linknet_prefix_len
+          -- rather than written here, so they cannot drift from the allocator.
           AND (
-            (family(prefix) = 4 AND masklen(prefix) < 31)
-            OR (family(prefix) = 6 AND masklen(prefix) < 127)
+            (family(prefix) = 4 AND masklen(prefix) < $2)
+            OR (family(prefix) = 6 AND masklen(prefix) < $3)
           )
         -- Preserve ascending candidate IDs within each VPC/family lock group.
         ORDER BY vpc_id, id
     "#;
     sqlx::query_as(query)
         .bind(vpc_ids)
+        .bind(i32::from(
+            carbide_network::virtualization::linknet_prefix_len(true),
+        ))
+        .bind(i32::from(
+            carbide_network::virtualization::linknet_prefix_len(false),
+        ))
         .fetch_all(&mut *txn)
         .await
         .map_err(|e| DatabaseError::query(query, e))

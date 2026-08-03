@@ -65,26 +65,62 @@ use crate::cfg::file::ComputeAllocationEnforcement;
 use crate::ethernet_virtualization::validate_instance_interface_routing_profiles;
 use crate::network_segment::allocate::PrefixAllocator;
 
-/// Validate a requested IP address for a linknet allocation and wrap it as
-/// an IpNetwork with the given prefix length. Returns an error if the host
-/// bit is 0 (the DPU end of the linknet -- the host must use the ::1 end).
+/// Validate a requested IP address for a linknet allocation and wrap it as an
+/// IpNetwork with the given prefix length.
+///
+/// The address must sit at offset 1 within its linknet -- the host end. On a
+/// /31 that was equivalent to "odd", because every odd address is the `.1` of
+/// its own /31. On a /30 it is not: `.3` is odd and is the broadcast address,
+/// which is not assignable. The mask is therefore derived from the linknet
+/// width rather than restated as a parity check.
 fn build_requested_linknet_prefix(
     ip: std::net::IpAddr,
     linknet_prefix_len: u8,
 ) -> CarbideResult<IpNetwork> {
-    let host_bit_is_zero = match ip {
-        std::net::IpAddr::V4(v4) => v4.to_bits() & 1 == 0,
-        std::net::IpAddr::V6(v6) => v6.to_bits() & 1 == 0,
-    };
-    if host_bit_is_zero {
+    // Keep the value as received for error messages: a caller who sent
+    // `::ffff:10.0.0.1` should not be told that `10.0.0.1` is wrong.
+    let as_received = ip;
+    // Canonicalise for the logic so an IPv4-mapped IPv6 address takes the IPv4
+    // arm below and reaches the family check rather than being masked as if it
+    // were IPv6.
+    let ip = ip.to_canonical();
+
+    // The caller's linknet length must be the one this address family uses.
+    // Compared against the shared source of truth rather than as a bound, so
+    // both directions of mismatch are caught here and this guard's sufficiency
+    // does not depend on the family check in the caller. That matters: the IPv6
+    // secondary path has no family guard at all, and the primary one reads an
+    // IPv4-mapped address as IPv6, so both can pair a canonical-V4 address with
+    // the /127 length.
+    if linknet_prefix_len != carbide_network::virtualization::linknet_prefix_len(ip.is_ipv4()) {
+        return Err(CarbideError::InvalidArgument(format!(
+            "requested IP address `{as_received}` does not match the /{linknet_prefix_len} linknet's address family",
+        )));
+    }
+
+    // Past the check above `host_bits` is exactly 2 (IPv4) or 1 (IPv6), so the
+    // saturating and checked arithmetic cannot trigger. Both are retained as
+    // defence for a future width rather than as load-bearing guards.
+    let width: u8 = if ip.is_ipv4() { 32 } else { 128 };
+    let host_bits = u32::from(width.saturating_sub(linknet_prefix_len));
+    let mask = 1u128
+        .checked_shl(host_bits)
+        .map(|m| m - 1)
+        .unwrap_or(u128::MAX);
+    let offset = match ip {
+        std::net::IpAddr::V4(v4) => u128::from(v4.to_bits()),
+        std::net::IpAddr::V6(v6) => v6.to_bits(),
+    } & mask;
+
+    if offset != 1 {
         return Err(CarbideError::InvalidConfiguration(
             ConfigValidationError::InvalidValue(format!(
-                "requested IP address must not have final host bit of 0: {ip}",
+                "requested IP address must be the host address of its linknet; the network and broadcast ends are not assignable: {as_received}",
             )),
         ));
     }
-    IpNetwork::new(ip.to_canonical(), linknet_prefix_len).map_err(|e| CarbideError::Internal {
-        message: format!("unable to create IP network for {ip}: {e}"),
+    IpNetwork::new(ip, linknet_prefix_len).map_err(|e| CarbideError::Internal {
+        message: format!("unable to create IP network for {as_received}: {e}"),
     })
 }
 use crate::{CarbideError, CarbideResult};
@@ -267,10 +303,7 @@ impl AllocationAddressFamily {
 
     /// Returns the point-to-point linknet length used for this family.
     fn linknet_prefix(self) -> u8 {
-        match self {
-            Self::Ipv4 => 31,
-            Self::Ipv6 => 127,
-        }
+        carbide_network::virtualization::linknet_prefix_len(matches!(self, Self::Ipv4))
     }
 
     /// Returns the family name used in operator-facing errors.

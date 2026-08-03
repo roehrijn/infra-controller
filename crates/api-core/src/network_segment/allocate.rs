@@ -199,9 +199,21 @@ impl PrefixAllocator {
         segment_id: NetworkSegmentId,
         prefix: IpNetwork,
     ) -> CarbideResult<IpNetwork> {
-        // IPv6 gateways are None (uses Router Advertisements).
+        // IPv6 gateways are None (uses Router Advertisements). For IPv4 the
+        // gateway is offset 2 of the /30 and the host takes offset 1 (see
+        // carbide_network::virtualization::get_host_ip). `network()` is only
+        // usable as a gateway on a /31, where RFC 3021 makes both addresses
+        // host-usable.
+        //
+        // This must error rather than fall back to None: IPv4 reserves its DPU
+        // endpoint through the explicit gateway (see
+        // `generated_linknet_num_reserved`), so a gateway-less IPv4 linknet
+        // would leave offset 2 allocatable to a tenant and would silently fall
+        // back to the site DHCP server for the Router option.
         let gateway = if prefix.is_ipv4() {
-            Some(prefix.network())
+            Some(prefix.iter().nth(2).ok_or_else(|| {
+                CarbideError::internal(format!("no gateway address available in linknet {prefix}"))
+            })?)
         } else {
             None
         };

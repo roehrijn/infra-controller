@@ -100,7 +100,18 @@ func (ifcr APIInterfaceCreateOrUpdateRequest) IsMultiEthernetInterface() bool {
 	return ifcr.Device != nil && ifcr.DeviceInstance != nil
 }
 
-func validateInterfaceRequestedIpAddressHostBit(value any) error {
+// Offset within its point-to-point linknet that a requested instance address
+// must occupy -- the host end. The linknet widths these masks correspond to
+// (IPv4 /30, IPv6 /127) are owned by
+// carbide_network::virtualization::linknet_prefix_len on the Rust side; this is
+// an unavoidable restatement because Go cannot call into it, and nothing tests
+// that the two agree. A width change there needs a change here.
+const (
+	ipv4LinknetHostOffsetMask = 0x03
+	ipv6LinknetHostOffsetMask = 0x01
+)
+
+func validateInterfaceRequestedIpAddressIsLinknetHost(value any) error {
 	ipStr, ok := value.(*string)
 	if !ok || ipStr == nil {
 		return nil
@@ -112,8 +123,20 @@ func validateInterfaceRequestedIpAddressHostBit(value any) error {
 	}
 
 	ipBytes := addr.AsSlice()
-	if len(ipBytes) == 0 || ipBytes[len(ipBytes)-1]&0x01 == 0 {
-		return errors.New("ipAddress must have a final host bit of 1")
+	if len(ipBytes) == 0 {
+		return errors.New("ipAddress must be a valid IPv4 or IPv6 address")
+	}
+
+	// An IPv4 /30 has two odd addresses: offset 1 (the host) and offset 3 (the
+	// broadcast address, which is not assignable). Parity alone was sufficient
+	// only while the linknet was a /31.
+	mask := byte(ipv6LinknetHostOffsetMask)
+	if addr.Is4() || addr.Is4In6() {
+		mask = ipv4LinknetHostOffsetMask
+	}
+	if ipBytes[len(ipBytes)-1]&mask != 0x01 {
+		return errors.New("ipAddress must be the host address of its linknet; " +
+			"the network and broadcast ends of the linknet are not assignable")
 	}
 
 	return nil
@@ -127,7 +150,7 @@ func (ifcr APIInterfaceCreateOrUpdateRequest) Validate() error {
 		validation.Field(&ifcr.VpcPrefixID,
 			validationis.UUID.Error(validationErrorInvalidUUID)),
 		validation.Field(&ifcr.IPAddress,
-			validation.When(ifcr.IPAddress != nil, validation.By(validateInterfaceRequestedIpAddressHostBit)),
+			validation.When(ifcr.IPAddress != nil, validation.By(validateInterfaceRequestedIpAddressIsLinknetHost)),
 		),
 		validation.Field(&ifcr.InlineRoutingProfile),
 		validation.Field(&ifcr.DeviceInstance,
