@@ -716,10 +716,9 @@ mod test {
                 vendor_class_str.as_bytes().to_vec(),
             ));
         if with_ipxe_option {
-            msg.opts_mut()
-                .insert(dhcproto::v4::DhcpOption::Unknown(
-                    dhcproto::v4::UnknownOption::new(dhcproto::v4::OptionCode::Unknown(175), vec![]),
-                ));
+            msg.opts_mut().insert(dhcproto::v4::DhcpOption::Unknown(
+                dhcproto::v4::UnknownOption::new(dhcproto::v4::OptionCode::Unknown(175), vec![]),
+            ));
         }
         crate::packet_handler::DecodedPacket { packet: msg }
     }
@@ -788,10 +787,10 @@ mod test {
 
         assert_eq!(reply.siaddr(), tftp_server);
         assert_eq!(
-            reply
-                .opts()
-                .get(dhcproto::v4::OptionCode::BootfileName),
-            Some(&dhcproto::v4::DhcpOption::BootfileName(b"ipxe.efi".to_vec()))
+            reply.opts().get(dhcproto::v4::OptionCode::BootfileName),
+            Some(&dhcproto::v4::DhcpOption::BootfileName(
+                b"ipxe.efi".to_vec()
+            ))
         );
     }
 
@@ -818,10 +817,10 @@ mod test {
 
         assert_eq!(reply.siaddr(), provisioning_server);
         assert_eq!(
-            reply
-                .opts()
-                .get(dhcproto::v4::OptionCode::BootfileName),
-            Some(&dhcproto::v4::DhcpOption::BootfileName(b"ipxe.efi".to_vec()))
+            reply.opts().get(dhcproto::v4::OptionCode::BootfileName),
+            Some(&dhcproto::v4::DhcpOption::BootfileName(
+                b"ipxe.efi".to_vec()
+            ))
         );
     }
 
@@ -886,9 +885,7 @@ mod test {
             ))
         );
         assert_eq!(
-            reply
-                .opts()
-                .get(dhcproto::v4::OptionCode::ClassIdentifier),
+            reply.opts().get(dhcproto::v4::OptionCode::ClassIdentifier),
             Some(&dhcproto::v4::DhcpOption::ClassIdentifier(
                 b"HTTPClient".to_vec()
             ))
@@ -914,9 +911,8 @@ mod test {
         )
         .unwrap();
 
-        let Some(dhcproto::v4::DhcpOption::VendorExtensions(bytes)) = reply
-            .opts()
-            .get(dhcproto::v4::OptionCode::VendorExtensions)
+        let Some(dhcproto::v4::DhcpOption::VendorExtensions(bytes)) =
+            reply.opts().get(dhcproto::v4::OptionCode::VendorExtensions)
         else {
             panic!("expected a VendorExtensions option in the reply");
         };
