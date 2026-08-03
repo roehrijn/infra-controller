@@ -776,7 +776,10 @@ mod tests {
 
         let wire = serde_json::to_string(&config).expect("dhcp config serializes");
         let recovered: DhcpConfig = serde_json::from_str(&wire).expect("dhcp config deserializes");
-        assert_eq!(recovered.tftp_server_ipv4, Some(Ipv4Addr::new(192, 0, 2, 40)));
+        assert_eq!(
+            recovered.tftp_server_ipv4,
+            Some(Ipv4Addr::new(192, 0, 2, 40))
+        );
 
         let old_wire = r#"{
             "lease_time_secs": 604800,
