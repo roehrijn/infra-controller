@@ -1005,7 +1005,7 @@ func TestAPIBatchInstanceCreateRequest_Validate(t *testing.T) {
 				Interfaces: []APIInterfaceCreateOrUpdateRequest{
 					{
 						VpcPrefixID: cutil.GetPtr(uuid.NewString()),
-						IPAddress:   cutil.GetPtr("10.0.0.11"),
+						IPAddress:   cutil.GetPtr("10.0.0.9"),
 					},
 				},
 			},

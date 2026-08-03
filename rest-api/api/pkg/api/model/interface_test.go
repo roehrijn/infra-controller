@@ -288,7 +288,7 @@ func TestAPIInterfaceCreateRequest_Validate(t *testing.T) {
 			name: "test valid Interface VpcPrefix request",
 			fields: fields{
 				VpcPrefixID: cutil.GetPtr(uuid.New().String()),
-				IPAddress:   cutil.GetPtr("192.0.2.11"),
+				IPAddress:   cutil.GetPtr("192.0.2.9"),
 				IsPhysical:  true,
 			},
 			wantErr: false,
@@ -457,7 +457,7 @@ func TestAPIInterfaceCreateRequest_Validate(t *testing.T) {
 			name: "test invalid Interface virtual function ID above range",
 			fields: fields{
 				VpcPrefixID:       cutil.GetPtr(uuid.New().String()),
-				IPAddress:         cutil.GetPtr("192.0.2.11"),
+				IPAddress:         cutil.GetPtr("192.0.2.9"),
 				IsPhysical:        false,
 				Device:            cutil.GetPtr("test-device"),
 				DeviceInstance:    cutil.GetPtr(1),
@@ -529,7 +529,7 @@ func TestAPIInterfaceCreateRequest_Validate(t *testing.T) {
 			name: "test invalid Interface ipAddress with subnet request",
 			fields: fields{
 				SubnetID:  cutil.GetPtr(uuid.New().String()),
-				IPAddress: cutil.GetPtr("192.0.2.11"),
+				IPAddress: cutil.GetPtr("192.0.2.9"),
 			},
 			wantErr:          true,
 			wantErrorMessage: "cannot be specified for Subnet based Interfaces",
@@ -537,7 +537,7 @@ func TestAPIInterfaceCreateRequest_Validate(t *testing.T) {
 		{
 			name: "test invalid Interface ipAddress without subnet or vpc prefix request",
 			fields: fields{
-				IPAddress: cutil.GetPtr("192.0.2.11"),
+				IPAddress: cutil.GetPtr("192.0.2.9"),
 			},
 			wantErr:          true,
 			wantErrorMessage: "exactly one of `subnetId`, `vpcPrefixId`, or `vpcId` must be specified",
@@ -553,7 +553,7 @@ func TestAPIInterfaceCreateRequest_Validate(t *testing.T) {
 			wantErrorMessage: "cannot be specified when `vpcId` is specified",
 		},
 		{
-			name: "test invalid Interface ipAddress with final host bit 0",
+			name: "test invalid Interface ipAddress at the gateway offset",
 			fields: fields{
 				VpcPrefixID: cutil.GetPtr(uuid.New().String()),
 				IPAddress:   cutil.GetPtr("192.0.2.10"),
@@ -610,6 +610,40 @@ func TestAPIInterfaceCreateRequest_Validate(t *testing.T) {
 
 			if tt.wantIPFamilies != nil {
 				assert.Equal(t, tt.wantIPFamilies, iscr.IPFamilies)
+			}
+		})
+	}
+}
+
+// A requested instance address must sit at the host offset of its linknet. On
+// the previous /31 that was equivalent to "odd"; on a /30 it is not, because
+// offset 3 is odd and is the broadcast address. These cases pin that
+// distinction -- the .3/.7 rejections are the regression the parity check
+// silently admitted.
+func TestValidateInterfaceRequestedIpAddressIsLinknetHost(t *testing.T) {
+	tests := []struct {
+		name    string
+		address *string
+		wantErr bool
+	}{
+		{name: "nil address is not validated", address: nil, wantErr: false},
+		{name: "ipv4 linknet host offset 1", address: cutil.GetPtr("10.0.0.1"), wantErr: false},
+		{name: "ipv4 linknet host offset 1, second linknet", address: cutil.GetPtr("10.0.0.5"), wantErr: false},
+		{name: "ipv4 offset 0 is the network address", address: cutil.GetPtr("10.0.0.0"), wantErr: true},
+		{name: "ipv4 offset 2 is the gateway", address: cutil.GetPtr("10.0.0.2"), wantErr: true},
+		{name: "ipv4 offset 3 is the broadcast address", address: cutil.GetPtr("10.0.0.3"), wantErr: true},
+		{name: "ipv4 offset 3, second linknet", address: cutil.GetPtr("10.0.0.7"), wantErr: true},
+		{name: "ipv6 linknet host offset 1", address: cutil.GetPtr("2001:db8::1"), wantErr: false},
+		{name: "ipv6 offset 0", address: cutil.GetPtr("2001:db8::"), wantErr: true},
+		{name: "not an address", address: cutil.GetPtr("not-an-ip"), wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validateInterfaceRequestedIpAddressIsLinknetHost(tt.address)
+			if tt.wantErr {
+				require.Error(t, err)
+			} else {
+				require.NoError(t, err)
 			}
 		})
 	}

@@ -75,6 +75,27 @@ fn generated_linknet_num_reserved(prefix: IpNetwork) -> i32 {
     if prefix.is_ipv6() { 1 } else { 0 }
 }
 
+/// Gateway of a generated linknet.
+///
+/// IPv6 gateways are None: the database constraint `no_gateway_on_ipv6`
+/// requires it and IPv6 uses Router Advertisements. For IPv4 the gateway is
+/// offset 2 of the /30 and the host takes offset 1 (see
+/// `carbide_network::virtualization::get_host_ip`). `network()` is only usable
+/// as a gateway on a /31, where RFC 3021 makes both addresses host-usable.
+///
+/// This must error rather than fall back to None: the persisted gateway is what
+/// keeps the DPU endpoint at offset 2 out of the tenant pool, so a gateway-less
+/// IPv4 linknet would leave that offset allocatable to a tenant and would
+/// silently fall back to the site DHCP server for the Router option.
+fn generated_linknet_gateway(prefix: IpNetwork) -> CarbideResult<Option<std::net::IpAddr>> {
+    if !prefix.is_ipv4() {
+        return Ok(None);
+    }
+    prefix.iter().nth(2).map(Some).ok_or_else(|| {
+        CarbideError::internal(format!("no gateway address available in linknet {prefix}"))
+    })
+}
+
 /// Finds the first unoccupied linknet index in an inclusive search range.
 ///
 /// `occupied` must be sorted by its inclusive start index. Overlapping ranges
@@ -144,14 +165,7 @@ impl PrefixAllocator {
         let name = format!("vpc_prefix_{}", prefix.network());
         let segment_id = NetworkSegmentId::new();
 
-        // Note: There is a database constraint `no_gateway_on_ipv6` ensuring
-        // IPv6 prefixes must have gateway IS NULL. IPv6 uses RAs (Router
-        // Advertisements) instead of explicit gateways.
-        let gateway = if prefix.is_ipv4() {
-            Some(prefix.network())
-        } else {
-            None
-        };
+        let gateway = generated_linknet_gateway(prefix)?;
 
         let ns = NewNetworkSegment {
             id: segment_id,
@@ -199,12 +213,7 @@ impl PrefixAllocator {
         segment_id: NetworkSegmentId,
         prefix: IpNetwork,
     ) -> CarbideResult<IpNetwork> {
-        // IPv6 gateways are None (uses Router Advertisements).
-        let gateway = if prefix.is_ipv4() {
-            Some(prefix.network())
-        } else {
-            None
-        };
+        let gateway = generated_linknet_gateway(prefix)?;
 
         let mut new_prefixes = db::network_prefix::create_for(
             txn,
