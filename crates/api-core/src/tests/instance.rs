@@ -2805,12 +2805,12 @@ async fn test_vpc_prefix_handling(pool: PgPool) {
     let vpc_prefix_id = create_tenant_overlay_prefix(&env, vpc_id).await;
 
     let mut txn = env.db_txn().await;
+    // Use a /27 to provide eight /30 linknets for the allocator checks.
     let allocator = PrefixAllocator::new(
-        // 15 IPs
         vpc_prefix_id,
         IpNetwork::V4(Ipv4Network::new(Ipv4Addr::new(10, 217, 5, 224), 27).unwrap()),
         None,
-        31,
+        30,
     )
     .unwrap();
 
@@ -2837,7 +2837,7 @@ async fn test_vpc_prefix_handling(pool: PgPool) {
         vpc_prefix_id,
         IpNetwork::V4(Ipv4Network::new(Ipv4Addr::new(10, 217, 5, 224), 27).unwrap()),
         None,
-        31,
+        30,
     )
     .unwrap();
 
@@ -2863,7 +2863,7 @@ async fn test_vpc_prefix_handling(pool: PgPool) {
         vpc_prefix_id,
         IpNetwork::V4(Ipv4Network::new(Ipv4Addr::new(10, 217, 5, 224), 27).unwrap()),
         None,
-        31,
+        30,
     )
     .unwrap();
 
@@ -2885,20 +2885,36 @@ async fn test_vpc_prefix_handling(pool: PgPool) {
     txn.commit().await.unwrap();
     // The allocation should take care of already assigned prefixes and should not allocate twice.
     assert_eq!(IpAddr::from(Ipv4Addr::new(10, 217, 5, 224)), address1);
-    assert_eq!(IpAddr::from(Ipv4Addr::new(10, 217, 5, 226)), address2);
-    assert_eq!(IpAddr::from(Ipv4Addr::new(10, 217, 5, 228)), address3);
+    assert_eq!(IpAddr::from(Ipv4Addr::new(10, 217, 5, 228)), address2);
+    assert_eq!(IpAddr::from(Ipv4Addr::new(10, 217, 5, 232)), address3);
     assert_ne!(address1, address2);
     assert_ne!(address1, address3);
     assert_ne!(address2, address3);
 
     let mut txn = env.db_txn().await;
+
+    // A cursor at the final linknet wraps to the first free prefix before it.
+    let wrapping_allocator = PrefixAllocator::new(
+        vpc_prefix_id,
+        IpNetwork::V4(Ipv4Network::new(Ipv4Addr::new(10, 217, 5, 224), 27).unwrap()),
+        Some(IpNetwork::V4(
+            Ipv4Network::new(Ipv4Addr::new(10, 217, 5, 252), 30).unwrap(),
+        )),
+        30,
+    )
+    .unwrap();
+    assert_eq!(
+        wrapping_allocator.next_free_prefix(&mut txn).await.unwrap(),
+        IpNetwork::V4(Ipv4Network::new(Ipv4Addr::new(10, 217, 5, 236), 30).unwrap()),
+    );
+
     let allocator = PrefixAllocator::new(
         vpc_prefix_id,
         IpNetwork::V4(Ipv4Network::new(Ipv4Addr::new(10, 217, 5, 224), 27).unwrap()),
         Some(IpNetwork::V4(
-            Ipv4Network::new(Ipv4Addr::new(10, 217, 5, 234), 31).unwrap(),
+            Ipv4Network::new(Ipv4Addr::new(10, 217, 5, 232), 30).unwrap(),
         )),
-        31,
+        30,
     )
     .unwrap();
 
@@ -2924,7 +2940,7 @@ async fn test_vpc_prefix_handling(pool: PgPool) {
         .allocate_network_segment(
             &mut txn,
             vpc_id,
-            Some(IpNetwork::new("10.217.5.251".parse().unwrap(), 31).unwrap()),
+            Some(IpNetwork::new("10.217.5.251".parse().unwrap(), 30).unwrap()),
         )
         .await
         .unwrap();
@@ -2938,7 +2954,7 @@ async fn test_vpc_prefix_handling(pool: PgPool) {
     .unwrap();
 
     let address4 = ns4[0].prefixes[0].prefix.network();
-    assert_eq!(IpAddr::from(Ipv4Addr::new(10, 217, 5, 250)), address4);
+    assert_eq!(IpAddr::from(Ipv4Addr::new(10, 217, 5, 248)), address4);
 
     txn.commit().await.unwrap();
 
@@ -2949,7 +2965,7 @@ async fn test_vpc_prefix_handling(pool: PgPool) {
         .allocate_network_segment(
             &mut txn,
             vpc_id,
-            Some(IpNetwork::new("100.217.5.250".parse().unwrap(), 31).unwrap()),
+            Some(IpNetwork::new("100.217.5.250".parse().unwrap(), 30).unwrap()),
         )
         .await
         .unwrap_err();
