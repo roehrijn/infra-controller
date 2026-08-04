@@ -75,6 +75,30 @@ fn generated_linknet_num_reserved(prefix: IpNetwork) -> i32 {
     if prefix.is_ipv6() { 1 } else { 0 }
 }
 
+/// Returns the gateway to persist for a generated linknet.
+///
+/// IPv6 gateways are `None` (uses Router Advertisements; a database constraint
+/// `no_gateway_on_ipv6` enforces this). For IPv4 the gateway is offset 2 of the
+/// /30 and the host takes offset 1 (see
+/// `carbide_network::virtualization::get_host_ip`). `network()` is only usable
+/// as a gateway on a /31, where RFC 3021 makes both addresses host-usable.
+///
+/// This must error rather than fall back to `None`: IPv4 reserves its DPU
+/// endpoint through the explicit gateway (see `generated_linknet_num_reserved`),
+/// so a gateway-less IPv4 linknet would leave offset 2 allocatable to a tenant
+/// and would silently fall back to the site DHCP server for the Router option.
+///
+/// Both allocation paths share this so they cannot drift apart.
+fn generated_linknet_gateway(prefix: IpNetwork) -> CarbideResult<Option<IpAddr>> {
+    if !prefix.is_ipv4() {
+        return Ok(None);
+    }
+
+    Ok(Some(prefix.iter().nth(2).ok_or_else(|| {
+        CarbideError::internal(format!("no gateway address available in linknet {prefix}"))
+    })?))
+}
+
 /// Finds the first unoccupied linknet index in an inclusive search range.
 ///
 /// `occupied` must be sorted by its inclusive start index. Overlapping ranges
@@ -144,14 +168,7 @@ impl PrefixAllocator {
         let name = format!("vpc_prefix_{}", prefix.network());
         let segment_id = NetworkSegmentId::new();
 
-        // Note: There is a database constraint `no_gateway_on_ipv6` ensuring
-        // IPv6 prefixes must have gateway IS NULL. IPv6 uses RAs (Router
-        // Advertisements) instead of explicit gateways.
-        let gateway = if prefix.is_ipv4() {
-            Some(prefix.network())
-        } else {
-            None
-        };
+        let gateway = generated_linknet_gateway(prefix)?;
 
         let ns = NewNetworkSegment {
             id: segment_id,
@@ -199,24 +216,7 @@ impl PrefixAllocator {
         segment_id: NetworkSegmentId,
         prefix: IpNetwork,
     ) -> CarbideResult<IpNetwork> {
-        // IPv6 gateways are None (uses Router Advertisements). For IPv4 the
-        // gateway is offset 2 of the /30 and the host takes offset 1 (see
-        // carbide_network::virtualization::get_host_ip). `network()` is only
-        // usable as a gateway on a /31, where RFC 3021 makes both addresses
-        // host-usable.
-        //
-        // This must error rather than fall back to None: IPv4 reserves its DPU
-        // endpoint through the explicit gateway (see
-        // `generated_linknet_num_reserved`), so a gateway-less IPv4 linknet
-        // would leave offset 2 allocatable to a tenant and would silently fall
-        // back to the site DHCP server for the Router option.
-        let gateway = if prefix.is_ipv4() {
-            Some(prefix.iter().nth(2).ok_or_else(|| {
-                CarbideError::internal(format!("no gateway address available in linknet {prefix}"))
-            })?)
-        } else {
-            None
-        };
+        let gateway = generated_linknet_gateway(prefix)?;
 
         let mut new_prefixes = db::network_prefix::create_for(
             txn,
@@ -373,7 +373,79 @@ impl PrefixAllocator {
 
 #[cfg(test)]
 mod test {
-    use crate::network_segment::allocate::first_unoccupied_index;
+    use std::str::FromStr;
+
+    use carbide_network::virtualization::{get_host_ip, linknet_prefix_len};
+    use ipnetwork::IpNetwork;
+
+    use crate::network_segment::allocate::{
+        first_unoccupied_index, generated_linknet_gateway, generated_linknet_num_reserved,
+    };
+
+    /// The gateway and the host address are chosen by different modules that
+    /// cannot see each other, so pin the property that couples them: on a
+    /// generated IPv4 linknet the gateway must be a usable address distinct from
+    /// the host's. Asserting the offsets alone would let both drift together.
+    #[test]
+    fn generated_linknet_gateway_does_not_collide_with_host() {
+        for parent in ["10.200.0.0/24", "192.168.4.0/22"] {
+            let parent = IpNetwork::from_str(parent).expect("parent prefix parses");
+            let linknet = IpNetwork::new(parent.network(), linknet_prefix_len(true))
+                .expect("linknet prefix is valid");
+
+            let gateway = generated_linknet_gateway(linknet)
+                .expect("gateway computation succeeds")
+                .expect("IPv4 linknet has a gateway");
+            let host = get_host_ip(&linknet).expect("host IP is derivable");
+
+            assert_ne!(
+                gateway, host,
+                "gateway and host must differ on linknet {linknet}"
+            );
+            assert!(
+                linknet.contains(gateway),
+                "gateway {gateway} must fall inside linknet {linknet}"
+            );
+            // A /30 has exactly two usable addresses; the network and broadcast
+            // addresses are rejected as station addresses by UEFI PXE clients
+            // and are not routable endpoints for the DPU either.
+            assert_ne!(
+                gateway,
+                linknet.network(),
+                "gateway must not be the network address of {linknet}"
+            );
+            assert_ne!(
+                gateway,
+                linknet.broadcast(),
+                "gateway must not be the broadcast address of {linknet}"
+            );
+        }
+    }
+
+    /// `generated_linknet_num_reserved` returns 0 for IPv4 on the assumption
+    /// that the explicit gateway keeps its address out of the tenant pool. If a
+    /// gateway were ever absent, that offset would become allocatable.
+    #[test]
+    fn ipv4_linknet_reserves_its_dpu_endpoint_via_the_gateway() {
+        let v4 = IpNetwork::from_str("10.200.0.0/30").expect("IPv4 linknet parses");
+        assert_eq!(generated_linknet_num_reserved(v4), 0);
+        assert!(
+            generated_linknet_gateway(v4)
+                .expect("gateway computation succeeds")
+                .is_some(),
+            "an IPv4 linknet reserving 0 addresses must carry a gateway",
+        );
+
+        // IPv6 cannot persist a gateway (`no_gateway_on_ipv6`), so it reserves
+        // the endpoint explicitly instead.
+        let v6 = IpNetwork::from_str("2001:db8::/127").expect("IPv6 linknet parses");
+        assert_eq!(generated_linknet_num_reserved(v6), 1);
+        assert_eq!(
+            generated_linknet_gateway(v6).expect("gateway computation succeeds"),
+            None,
+            "IPv6 linknets must not persist a gateway",
+        );
+    }
 
     /// Exercises interval lookup without enumerating every possible linknet.
     #[test]
