@@ -6678,6 +6678,22 @@ impl StateHandler for InstanceStateHandler {
                     }
                 }
                 InstanceState::BootingWithDiscoveryImage { retry } => {
+                    // On a DPU-mode release, `rebooted()` can never turn true: the host
+                    // PF is still in the tenant VRF, where the scout image is
+                    // unreachable and nico-api would reject the check-in that writes
+                    // `last_reboot_time` — the switch to the admin network is the very
+                    // next state. Skip the gate and let the post-reconfig discovery
+                    // pass verify the boot on the admin network instead. This trades
+                    // away the proof that the tenant OS is down before the PF flips to
+                    // admin (acceptable for this deployment, not upstreamable as-is).
+                    if instance.deleted.is_some() && mh_snapshot.has_managed_dpus() {
+                        return Ok(StateHandlerOutcome::transition(
+                            ManagedHostState::Assigned {
+                                instance_state: InstanceState::SwitchToAdminNetwork,
+                            },
+                        ));
+                    }
+
                     if !rebooted(&mh_snapshot.host_snapshot) {
                         let status = trigger_reboot_if_needed(
                             &mh_snapshot.host_snapshot,
