@@ -251,6 +251,13 @@ function modify_grub_cfg() {
 		if [ ! -z "$bootfs_uuid" ]; then
 			boot_part=$(blkid -U $bootfs_uuid)
 		fi
+		# Ubuntu >= 24.04 cloud images keep /boot on its own partition labeled
+		# BOOT (p16 on noble), so the first-partition guess below would land on
+		# the rootfs and grub.cfg would never be found. Prefer a partition on
+		# this disk carrying that filesystem label.
+		if [ -z "$boot_part" ]; then
+			boot_part=$(blkid -t LABEL=BOOT -o device | grep "^$image_disk" | head -n1)
+		fi
 		is_nvme=$(echo $image_disk | grep nvme)
 		if [ -z "$boot_part" ]; then
 			if [ ! -z "$is_nvme" ]; then
@@ -413,6 +420,14 @@ function modify_grub_template() {
 		echo "GRUB_TERMINAL=serial" >> $new_grub_template
 	fi
 	cat $new_grub_template > /mnt/etc/default/grub
+	# Ubuntu cloud images ship /etc/default/grub.d/50-cloudimg-settings.cfg with
+	# a baud-less serial console in GRUB_CMDLINE_LINUX_DEFAULT, which 10_linux
+	# places after GRUB_CMDLINE_LINUX on the kernel command line -- so its
+	# 9600-default ttyS0 would win over the 115200 console written above.
+	# Drop-ins are read in lexical order; 99- sorts last and overrides it.
+	if [ -d "/mnt/etc/default/grub.d" ]; then
+		echo "GRUB_CMDLINE_LINUX_DEFAULT=\"console=tty0 console=$serial_port,115200\"" > /mnt/etc/default/grub.d/99-forge-serial-console.cfg
+	fi
 }
 
 function main() {
