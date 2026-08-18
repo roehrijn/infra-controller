@@ -278,8 +278,10 @@ large_stack_arrays = "warn"
 unused_async = "warn"
 
 # Homelab iDRAC8 (PowerEdge T330) support. Vendored + patched crates rather than
-# forks: a version-mismatched git patch is silently ignored (nv-redfish-core is
-# 0.12.0 from crates.io), and a fork must stay reachable from the build host.
+# forks: a version-mismatched git patch is silently ignored (the vendored crates
+# must declare the 0.11.0 the workspace's nv-redfish pin resolves to;
+# scripts/check-vendored-patches.sh fails the build if they drift), and a fork
+# must stay reachable from the build host.
 [patch.crates-io]
 # no_links() must emit `$expand=.($levels=1)`; iDRAC8 rejects the bare `$expand=.`
 # (HTTP 400 IDRAC.1.6.SYS457) that Site Explorer's Dell path otherwise sends.

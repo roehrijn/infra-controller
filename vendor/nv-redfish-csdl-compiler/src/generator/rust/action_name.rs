@@ -17,12 +17,13 @@ use crate::compiler::Namespace;
 use crate::edmx::ActionName as EdmxActionName;
 use crate::edmx::ParameterName;
 use crate::generator::casemungler;
-use crate::generator::rust::ident;
 use crate::generator::rust::Config;
 use crate::generator::rust::ModName;
 use crate::generator::rust::TypeName;
+use proc_macro2::Ident;
 use proc_macro2::Punct;
 use proc_macro2::Spacing;
+use proc_macro2::Span;
 use proc_macro2::TokenStream;
 use quote::quote;
 use quote::ToTokens;
@@ -48,7 +49,10 @@ impl<'a> ActionName<'a> {
 
 impl ToTokens for ActionName<'_> {
     fn to_tokens(&self, tokens: &mut TokenStream) {
-        tokens.append(ident::escaped(&self.to_string()));
+        match self.to_string().as_str() {
+            "type" => tokens.append(Ident::new_raw("type", Span::call_site())),
+            _ => tokens.append(Ident::new(&self.to_string(), Span::call_site())),
+        }
     }
 }
 
@@ -70,7 +74,7 @@ impl Debug for ActionName<'_> {
 ///
 /// `redfish::computer_system::ComputerSystemResetAction`
 pub struct ActionFullTypeName<'a, 'config> {
-    defining_ns: Namespace<'a>,
+    binding_ns: Namespace<'a>,
     binding_name: &'a ParameterName,
     action_name: &'a EdmxActionName,
     config: &'config Config,
@@ -80,13 +84,13 @@ impl<'a, 'config> ActionFullTypeName<'a, 'config> {
     /// Create new fully qualified action name type.
     #[must_use]
     pub const fn new(
-        defining_ns: Namespace<'a>,
+        binding_ns: Namespace<'a>,
         binding_name: &'a ParameterName,
         action_name: &'a EdmxActionName,
         config: &'config Config,
     ) -> Self {
         Self {
-            defining_ns,
+            binding_ns,
             binding_name,
             action_name,
             config,
@@ -98,8 +102,8 @@ impl ToTokens for ActionFullTypeName<'_, '_> {
     fn to_tokens(&self, tokens: &mut TokenStream) {
         let top = &self.config.top_module_alias;
         tokens.extend(quote! { #top });
-        for depth in 0..self.defining_ns.len() {
-            if let Some(id) = self.defining_ns.get_id(depth) {
+        for depth in 0..self.binding_ns.len() {
+            if let Some(id) = self.binding_ns.get_id(depth) {
                 let name = ModName::new(id);
                 tokens.append(Punct::new(':', Spacing::Joint));
                 tokens.append(Punct::new(':', Spacing::Joint));

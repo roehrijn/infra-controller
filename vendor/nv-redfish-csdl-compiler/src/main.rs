@@ -35,14 +35,3 @@ fn main() -> Result<(), Error> {
         .map(|msg| println!("{msg}"));
     Ok(())
 }
-
-#[cfg(test)]
-mod tests {
-    use super::Cli;
-    use clap::CommandFactory as _;
-
-    #[test]
-    fn cli_definition_is_valid() {
-        Cli::command().debug_assert();
-    }
-}

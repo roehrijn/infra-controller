@@ -7597,8 +7597,6 @@ dependencies = [
 [[package]]
 name = "nv-redfish-core"
 version = "0.11.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e5ec054643796ede5865fff5f0e3913ddc2bf7f954975f6f512b40d78be07db7"
 dependencies = [
  "futures-core",
  "futures-io",
@@ -7612,8 +7610,6 @@ dependencies = [
 [[package]]
 name = "nv-redfish-csdl-compiler"
 version = "0.11.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "34c88dbe8742e28c0e733596661d9c4605ef6cab438cf2c54d1ceb9577053f9a"
 dependencies = [
  "clap",
  "clap_derive",
@@ -13255,11 +13251,3 @@ dependencies = [
  "log",
  "simd-adler32",
 ]
-
-[[patch.unused]]
-name = "nv-redfish-core"
-version = "0.12.0"
-
-[[patch.unused]]
-name = "nv-redfish-csdl-compiler"
-version = "0.12.0"
