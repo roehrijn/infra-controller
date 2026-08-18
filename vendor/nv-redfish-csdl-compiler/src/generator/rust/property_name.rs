@@ -16,7 +16,8 @@
 use crate::edmx::ParameterName as EdmxParameterName;
 use crate::edmx::PropertyName as EdmxPropertyName;
 use crate::generator::casemungler;
-use crate::generator::rust::ident;
+use proc_macro2::Ident;
+use proc_macro2::Span;
 use proc_macro2::TokenStream;
 use quote::ToTokens;
 use quote::TokenStreamExt as _;
@@ -49,7 +50,11 @@ impl<'a> StructFieldName<'a> {
 
 impl ToTokens for StructFieldName<'_> {
     fn to_tokens(&self, tokens: &mut TokenStream) {
-        tokens.append(ident::escaped(&self.to_string()));
+        match self.to_string().as_str() {
+            "type" => tokens.append(Ident::new_raw("type", Span::call_site())),
+            "crate" => tokens.append(Ident::new("crate_", Span::call_site())),
+            _ => tokens.append(Ident::new(&self.to_string(), Span::call_site())),
+        }
     }
 }
 

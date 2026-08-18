@@ -36,8 +36,6 @@ pub enum Error<'a> {
     EntityTypeNotFound(QualifiedName<'a>),
     /// Complex type was not found.
     ComplexTypeNotFound(QualifiedName<'a>),
-    /// A cycle was found in type inheritance.
-    CyclicType(Vec<QualifiedName<'a>>),
     /// Settings.Settings type was not found.
     SettingsTypeNotFound,
     /// Settings.PreferredApplyTime type was not found.
@@ -76,15 +74,6 @@ impl Display for Error<'_> {
             Self::Unimplemented => write!(f, "unimplemented"),
             Self::EntityTypeNotFound(v) => write!(f, "entity type not found: {v}"),
             Self::ComplexTypeNotFound(v) => write!(f, "complex type not found: {v}"),
-            Self::CyclicType(types) => {
-                write!(f, "cyclic type inheritance detected: ")?;
-                types.iter().enumerate().try_for_each(|(index, qtype)| {
-                    if index > 0 {
-                        write!(f, " -> ")?;
-                    }
-                    write!(f, "{qtype}")
-                })
-            }
             Self::SettingsTypeNotFound => write!(
                 f,
                 "cannot find type for Redfish settings (Settings.Settings)"

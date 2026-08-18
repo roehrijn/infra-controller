@@ -12,7 +12,7 @@
 [package]
 edition = "2018"
 name = "nv-redfish-csdl-compiler"
-version = "0.12.0"
+version = "0.11.0"
 build = false
 autolib = false
 autobins = false
