@@ -669,7 +669,16 @@ if [ -z "$RESULT1" ] || [ -z "$RESULT2" ]; then
 fi
 '''
 
+[tasks.check-vendored-patches]
+workspace = false
+category = "Build"
+description = "Fail when a Cargo [patch] is silently unused (version-mismatched vendored crate)."
+script = '''
+bash "${REPO_ROOT}/scripts/check-vendored-patches.sh"
+'''
+
 [tasks.build-release]
+dependencies = ["check-vendored-patches"]
 args = [
   "build",
   "--locked",
