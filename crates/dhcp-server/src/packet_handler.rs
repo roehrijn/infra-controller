@@ -686,8 +686,6 @@ mod test {
         crate::Config {
             dhcp_config,
             host_config: None,
-            relay_response_port: 67,
-            forge_client_config: rpc::forge_tls_client::ForgeClientConfig::default(),
         }
     }
 
