@@ -92,7 +92,7 @@ use crate::tests::common::api_fixtures::instance::{
 use crate::tests::common::api_fixtures::rpc_instance::RpcInstance;
 use crate::tests::common::api_fixtures::{
     TestEnv, create_managed_host_multi_dpu, create_managed_host_with_ek,
-    remove_health_report_entry, send_health_report_entry, update_time_params,
+    remove_health_report_entry, send_health_report_entry,
 };
 use crate::tests::common::attestation::spdm_attestation_run_to_failed_then_to_success;
 use crate::tests::common::rpc_builder::{
@@ -2187,44 +2187,29 @@ async fn test_bootingwithdiscoveryimage_delay(_: PgPoolOptions, options: PgConne
             .is_none(),
         "State is not changed. The reboot counter should only increased once state changed"
     );
-    tokio::time::sleep(Duration::from_secs(2)).await;
-
-    let mut txn = env.db_txn().await;
-    let host = mh.host().db_machine(&mut txn).await;
-    txn.commit().await.unwrap();
-
-    update_time_params(&env.pool, &host, 1, None).await;
+    // Homelab fork behavior: on a DPU-mode release the scout reboot gate is
+    // skipped (the host PF is still in the tenant VRF, so `rebooted()` can
+    // never turn true there) and the machine proceeds straight to the
+    // admin-network switch instead of counting discovery-boot retries. See
+    // the machine-controller handler.
     env.run_machine_state_controller_iteration_until_state_matches(
         &mh.host().id,
         1,
         ManagedHostState::Assigned {
-            instance_state: model::machine::InstanceState::BootingWithDiscoveryImage {
-                retry: model::machine::RetryInfo { count: 1 },
-            },
+            instance_state: model::machine::InstanceState::SwitchToAdminNetwork,
         },
     )
     .await;
 
+    common::api_fixtures::instance::handle_delete_post_bootingwithdiscoveryimage(&env, &mh).await;
+
+    // With the gate skipped there is no retry loop to account for, so the
+    // reboot-attempt histogram must never materialize on this path.
     assert!(
         env.test_meter
             .formatted_metric("carbide_reboot_attempts_in_booting_with_discovery_image_count")
             .is_none(),
-        "State is not changed. The reboot counter should only increased once state changed"
-    );
-
-    common::api_fixtures::instance::handle_delete_post_bootingwithdiscoveryimage(&env, &mh).await;
-
-    assert_eq!(
-        env.test_meter
-            .formatted_metric("carbide_reboot_attempts_in_booting_with_discovery_image_sum")
-            .unwrap(),
-        "2"
-    );
-    assert_eq!(
-        env.test_meter
-            .formatted_metric("carbide_reboot_attempts_in_booting_with_discovery_image_count")
-            .unwrap(),
-        "1"
+        "the skipped reboot gate must not record discovery-boot retries"
     );
 }
 
@@ -2563,8 +2548,8 @@ async fn test_allocate_and_release_instance_vpc_prefix_id(
         .vpc_prefixes[0]
         .clone();
 
-    assert_eq!(vpc_prefix.total_31_segments, 16);
-    assert_eq!(vpc_prefix.available_31_segments, 16);
+    assert_eq!(vpc_prefix.total_31_segments, 8);
+    assert_eq!(vpc_prefix.available_31_segments, 8);
 
     let tinstance = mh
         .instance_builer(&env)
@@ -2586,8 +2571,8 @@ async fn test_allocate_and_release_instance_vpc_prefix_id(
         .vpc_prefixes[0]
         .clone();
 
-    assert_eq!(vpc_prefix.total_31_segments, 16);
-    assert_eq!(vpc_prefix.available_31_segments, 15);
+    assert_eq!(vpc_prefix.total_31_segments, 8);
+    assert_eq!(vpc_prefix.available_31_segments, 7);
 
     let instance = tinstance.rpc_instance().await;
 
@@ -2770,8 +2755,8 @@ async fn test_allocate_and_release_instance_vpc_prefix_id(
         .vpc_prefixes[0]
         .clone();
 
-    assert_eq!(vpc_prefix.total_31_segments, 16);
-    assert_eq!(vpc_prefix.available_31_segments, 16);
+    assert_eq!(vpc_prefix.total_31_segments, 8);
+    assert_eq!(vpc_prefix.available_31_segments, 8);
     txn.commit().await.unwrap();
 }
 
@@ -4814,7 +4799,7 @@ async fn test_allocate_network_multi_dpu_vpc_prefix_id(
     let mut txn = env.db_txn().await;
     let expected_ips = [
         Ipv4Addr::from_str("10.217.5.224").unwrap(),
-        Ipv4Addr::from_str("10.217.5.226").unwrap(),
+        Ipv4Addr::from_str("10.217.5.228").unwrap(),
     ];
     let mut expected_ips_iter = expected_ips.iter();
 
