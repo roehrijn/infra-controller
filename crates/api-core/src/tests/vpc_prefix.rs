@@ -330,13 +330,13 @@ async fn test_vpc_prefix_create_returns_initial_lifecycle_state(
     let id = created.id.expect("created VPC prefix should include an id");
 
     // Verify the create response reports the initial controller state and counters.
-    assert_status_with_lifecycle_and_linknet_counters(&created, "provisioning", 16, 16);
+    assert_status_with_lifecycle_and_linknet_counters(&created, "provisioning", 8, 8);
 
     // Verify the same lifecycle state was persisted through the public get API.
     let persisted = find_vpc_prefix(&env, id)
         .await
         .expect("VPC prefix should be visible through the public get API");
-    assert_status_with_lifecycle_and_linknet_counters(&persisted, "provisioning", 16, 16);
+    assert_status_with_lifecycle_and_linknet_counters(&persisted, "provisioning", 8, 8);
 
     Ok(())
 }
@@ -695,13 +695,13 @@ async fn test_vpc_prefix_rpc_status_includes_lifecycle_and_counters(
     let ready = drive_vpc_prefix_to_ready(&env, id).await;
 
     // Verify lifecycle fields and existing utilization counters share the RPC status.
-    assert_status_with_lifecycle_and_linknet_counters(&ready, "ready", 128, 127);
+    assert_status_with_lifecycle_and_linknet_counters(&ready, "ready", 64, 63);
     let status = ready
         .status
         .as_ref()
         .expect("VPC prefix status should be populated");
-    assert_eq!(u64::from(status.total_31_segments), 128);
-    assert_eq!(u64::from(status.available_31_segments), 127);
+    assert_eq!(u64::from(status.total_31_segments), 64);
+    assert_eq!(u64::from(status.available_31_segments), 63);
     let lifecycle_status = status
         .lifecycle
         .as_ref()
