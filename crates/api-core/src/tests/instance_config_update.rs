@@ -1920,7 +1920,7 @@ async fn test_update_instance_config_vpc_prefix_network_update_different_prefix_
         .unwrap_err();
 
     // Create an instance with the first VPC prefix
-    // but request the DPU side of a /31
+    // but request the network address of its /30 linknet
     // This should fail.
     env.api
         .allocate_instance(
@@ -1963,7 +1963,7 @@ async fn test_update_instance_config_vpc_prefix_network_update_different_prefix_
 
     let expected_ip = "192.1.4.1";
     // Create an instance with the first VPC prefix
-    // and request the host side of a /31
+    // and request the host offset of its /30 linknet
     // This should pass.
     let instance = env
         .api
@@ -2144,7 +2144,7 @@ async fn test_update_instance_config_vpc_prefix_network_update_different_prefix_
         .unwrap_err();
     assert!(err.message().contains("is not contained within"));
 
-    let expected_ip = "192.0.5.11";
+    let expected_ip = "192.0.5.9";
     let expected_ip2 = "192.0.5.1";
 
     // Update the instance to add a new interface config for the second DPU
