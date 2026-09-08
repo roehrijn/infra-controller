@@ -839,6 +839,7 @@ dependencies = [
   "bfb-rebuild-rootfs",
   "bfb-copy-rootfs",
   "bfb-rebuild-bfb",
+  "bfb-assert-custom-action-tail",
 ]
 [tasks.internal-bfb-aarch64-ci]
 category = "iPXE Kernel"
@@ -872,6 +873,7 @@ dependencies = [
   "bfb-rebuild-rootfs",
   "bfb-copy-rootfs",
   "bfb-rebuild-bfb",
+  "bfb-assert-custom-action-tail",
 ]
 
 [tasks.internal-bfb-aarch64]
@@ -907,6 +909,7 @@ dependencies = [
   "bfb-rebuild-rootfs",
   "bfb-copy-rootfs",
   "bfb-rebuild-bfb",
+  "bfb-assert-custom-action-tail",
 ]
 
 [tasks.bfb-cleanup-tmp]
@@ -1314,9 +1317,15 @@ cwd = "static/blobs/internal/aarch64"
 
 [tasks.bfb-add-custom_action]
 category = "iPXE Kernel"
-description = "Rebuild BFB with modified FS"
+description = "Build the bf.cfg appended to the BFB, padded against rshim boot FIFO word loss"
 script = '''
-  cat ${REPO_ROOT}/pxe/templates/bmc_fw_update > bf.cfg
+  set -eu
+  # The unpadded cfg is a build intermediate; keep it out of this directory,
+  # which ships in the image and is served beside forge.bfb. bf.cfg (the padded
+  # tail that was actually appended) stays here on purpose, so an operator can
+  # curl exactly what the DPU was handed.
+  unpadded=/tmp/bfb-dump/bf.cfg.unpadded
+  cat ${REPO_ROOT}/pxe/templates/bmc_fw_update > "$unpadded"
   echo "
 
   ENABLE_BR_HBN=yes
@@ -1330,7 +1339,15 @@ script = '''
     sed -i '/ZOF/d' user_data.sh
     source user_data.sh
     carbide_modify_os
-  }" >> bf.cfg
+  }" >> "$unpadded"
+  # The appended cfg travels to the installer through the rshim boot FIFO, and
+  # that path was seen to drop 232 consecutive bytes (29 words) out of the middle
+  # of it between the BMC and the boot FIFO, silently removing the bfb_modify_os
+  # opener: the installer's bash -n then rejects the whole cfg and the DPU
+  # finishes as stock DOCA with no agent. Nothing downstream can recover lost
+  # words, so the cfg is wrapped in 8 KiB / 4 KiB of inert 8-byte comment lines
+  # (one line per FIFO word) that absorb the hole. See common_files/bfcfg-pad.sh.
+  sh ${REPO_ROOT}/pxe/common_files/bfcfg-pad.sh wrap "$unpadded" bf.cfg
 '''
 cwd = "static/blobs/internal/aarch64"
 
@@ -1339,8 +1356,25 @@ category = "iPXE Kernel"
 dependencies = ["bfb-create-bfb", "bfb-add-custom_action"]
 description = "Rebuild BFB with modified FS"
 script = '''
+set -eu
+# Sanity-check the mlx-mkbfb output carries the BFB magic while the real file
+# is still here; this is a magic check, not BFB validation (mlx-mkbfb did that).
+magic=$(head -c 4 forge_tmp.bfb | od -An -tx1 | tr -d ' \n')
+[ "$magic" = "42660213" ] || { echo "forge_tmp.bfb does not start with the BFB magic (got $magic)" >&2; exit 1; }
+expected=$(( $(wc -c < forge_tmp.bfb) + $(wc -c < bf.cfg) ))
 cat forge_tmp.bfb bf.cfg > forge.bfb
+actual=$(wc -c < forge.bfb)
+[ "$actual" -eq "$expected" ] || { echo "forge.bfb is $actual bytes, expected $expected" >&2; exit 1; }
 rm forge_tmp.bfb
+'''
+cwd = "static/blobs/internal/aarch64"
+
+[tasks.bfb-assert-custom-action-tail]
+category = "iPXE Kernel"
+description = "Assert forge.bfb ends in exactly the padded bf.cfg the build intended"
+dependencies = ["bfb-rebuild-bfb"]
+script = '''
+sh ${REPO_ROOT}/pxe/common_files/bfcfg-pad.sh assert forge.bfb bf.cfg /tmp/bfb-dump/bf.cfg.unpadded
 '''
 cwd = "static/blobs/internal/aarch64"
 
