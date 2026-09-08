@@ -199,7 +199,14 @@ func TestVpcPrefixHandler_Create(t *testing.T) {
 	wrun := &tmocks.WorkflowRun{}
 	wrun.On("GetID").Return(wid)
 
-	wrun.Mock.On("Get", mock.Anything, mock.Anything).Return(nil)
+	// cancelRequest, when set by a test case, simulates the HTTP caller hanging
+	// up while the handler is blocked on the Site workflow.
+	var cancelRequest context.CancelFunc
+	wrun.Mock.On("Get", mock.Anything, mock.Anything).Run(func(mock.Arguments) {
+		if cancelRequest != nil {
+			cancelRequest()
+		}
+	}).Return(nil)
 
 	tempClient.Mock.On("ExecuteWorkflow", mock.Anything, mock.AnythingOfType("internal.StartWorkflowOptions"),
 		mock.AnythingOfType("func(internal.Context, uuid.UUID, uuid.UUID) error"), mock.AnythingOfType("uuid.UUID"),
@@ -259,6 +266,9 @@ func TestVpcPrefixHandler_Create(t *testing.T) {
 	okBodySlash31, err := json.Marshal(model.APIVpcPrefixCreateRequest{Name: "ok31", VpcID: vpc1.ID.String(), IPBlockID: cutil.GetPtr(ipb1.ID.String()), PrefixLength: 31})
 	assert.Nil(t, err)
 
+	okBodyCallerGone, err := json.Marshal(model.APIVpcPrefixCreateRequest{Name: "okCallerGone", VpcID: vpc1.ID.String(), IPBlockID: cutil.GetPtr(ipb1.ID.String()), PrefixLength: 24})
+	assert.Nil(t, err)
+
 	errBodySlash32, err := json.Marshal(model.APIVpcPrefixCreateRequest{Name: "err32", VpcID: vpc1.ID.String(), IPBlockID: cutil.GetPtr(ipb1.ID.String()), PrefixLength: 32})
 	assert.Nil(t, err)
 
@@ -309,6 +319,7 @@ func TestVpcPrefixHandler_Create(t *testing.T) {
 		expectedIpamErrMsg string
 		expectedPrefix     string
 		verifyChildSpanner bool
+		callerHangsUp      bool
 	}{
 		{
 			name:           "error when user not found in request context",
@@ -452,6 +463,16 @@ func TestVpcPrefixHandler_Create(t *testing.T) {
 			expectedPrefix: "192.168.1.0/31",
 		},
 		{
+			name:           "success when caller hangs up while the site workflow is running",
+			reqOrgName:     tnOrg1,
+			reqBody:        string(okBodyCallerGone),
+			user:           tnu,
+			expectedErr:    false,
+			expectedStatus: http.StatusCreated,
+			expectedPrefix: "192.168.2.0/24",
+			callerHangsUp:  true,
+		},
+		{
 			name:           "error case with /32",
 			reqOrgName:     tnOrg1,
 			reqBody:        string(errBodySlash32),
@@ -521,7 +542,15 @@ func TestVpcPrefixHandler_Create(t *testing.T) {
 			}
 
 			ctx = context.WithValue(ctx, otelecho.TracerKey, tracer)
-			ec.SetRequest(ec.Request().WithContext(ctx))
+			reqCtx := ctx
+			cancelRequest = nil
+			if tc.callerHangsUp {
+				var cancel context.CancelFunc
+				reqCtx, cancel = context.WithCancel(ctx)
+				defer cancel()
+				cancelRequest = cancel
+			}
+			ec.SetRequest(ec.Request().WithContext(reqCtx))
 
 			cipbh := CreateVpcPrefixHandler{
 				dbSession: dbSession,

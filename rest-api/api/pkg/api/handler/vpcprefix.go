@@ -198,6 +198,11 @@ func (csh CreateVpcPrefixHandler) Handle(c echo.Context) error {
 	// the DB tx unwinds before we make the second remote call. nil means
 	// no timeout occurred and the normal flow continues.
 	var timeoutResp func() error
+	// The caller hanging up must not decide the outcome of side effects that
+	// are already in flight: the Site workflow keeps running on its own, and
+	// rolling back here would leave Core holding a prefix that REST has no
+	// record of. From this point on WorkflowContextTimeout is the only deadline.
+	ctx = context.WithoutCancel(ctx)
 	err = cdb.WithTx(ctx, csh.dbSession, func(tx *cdb.Tx) error {
 		// acquire an advisory lock on the parent IP block ID on which there could be contention
 		// this lock is released when the transaction commits or rollsback
