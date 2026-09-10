@@ -185,8 +185,12 @@ pub async fn find_allocation_candidates(
     "#;
     sqlx::query_as(query)
         .bind(vpc_ids)
-        .bind(i32::from(carbide_network::virtualization::linknet_prefix_len(true)))
-        .bind(i32::from(carbide_network::virtualization::linknet_prefix_len(false)))
+        .bind(i32::from(
+            carbide_network::virtualization::linknet_prefix_len(true),
+        ))
+        .bind(i32::from(
+            carbide_network::virtualization::linknet_prefix_len(false),
+        ))
         .fetch_all(&mut *txn)
         .await
         .map_err(|e| DatabaseError::query(query, e))
