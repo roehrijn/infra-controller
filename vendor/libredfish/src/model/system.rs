@@ -179,6 +179,7 @@ pub struct ComputerSystem {
     pub asset_tag: Option<String>,
     #[serde(default)] // Some viking ComputerSystem has no Boot property; so use the default
     pub boot: Boot,
+    pub bios: Option<ODataId>,
     pub bios_version: Option<String>,
     pub ethernet_interfaces: Option<ODataId>,
     pub id: String,
@@ -380,6 +381,18 @@ mod test {
         assert_eq!(result.power_state, crate::PowerState::On);
         assert_eq!(result.processor_summary.unwrap().count, Some(2));
         assert_eq!(result.part_number.as_deref(), Some("0H28RRA06"));
+    }
+
+    #[test]
+    fn test_system_dell_null_temp_rollup() {
+        let data = include_str!("testdata/system_dell_null_temp_rollup.json");
+        let result: super::ComputerSystem = serde_json::from_str(data).unwrap();
+        let dell = result
+            .oem
+            .expect("should contain OEM data")
+            .dell
+            .expect("should contain dell-specific OEM data");
+        assert!(dell.dell_system.temp_rollup_status.is_empty());
     }
 
     #[test]

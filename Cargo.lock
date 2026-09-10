@@ -6844,7 +6844,6 @@ dependencies = [
 [[package]]
 name = "libredfish"
 version = "0.0.0"
-source = "git+https://github.com/NVIDIA/libredfish.git?tag=v0.47.5#569bc602d2aa03b3f2ea4c9e006d593a05c7b1dc"
 dependencies = [
  "chrono",
  "clap",
@@ -7838,8 +7837,6 @@ dependencies = [
 [[package]]
 name = "nv-redfish-core"
 version = "0.14.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "566a75a8c7d75b0d8e24289e2d8c9792ed102ede29ab7a4996510c90b21a3fce"
 dependencies = [
  "futures-core",
  "futures-io",
@@ -7853,8 +7850,6 @@ dependencies = [
 [[package]]
 name = "nv-redfish-csdl-compiler"
 version = "0.14.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5838f179f001a8250aa08ae69abac660e8d29f2dd8041fa5806579b64b1b734c"
 dependencies = [
  "clap",
  "clap_derive",

@@ -74,6 +74,7 @@ pub enum RedfishVendor {
     P3809, // dummy for P3809, needs to be set to NvidiaGH200 or NvidiaGBSwitch based on chassis
     LiteOnPowerShelf,
     DeltaPowerShelf,
+    Sushy,
     Unknown,
 }
 
@@ -114,9 +115,13 @@ impl ServiceRoot {
                 _ => RedfishVendor::NvidiaDpu,
             },
             "wiwynn" => RedfishVendor::NvidiaGBx00,
-            "supermicro" => RedfishVendor::Supermicro,
+            "supermicro" => match self.product.as_deref() {
+                Some("GB NVL") => RedfishVendor::NvidiaGBx00,
+                _ => RedfishVendor::Supermicro,
+            },
             "lite-on technology corp." => RedfishVendor::LiteOnPowerShelf,
-            "delta" => RedfishVendor::DeltaPowerShelf,
+            "delta electronics inc." => RedfishVendor::DeltaPowerShelf,
+            "sushy" | "contoso" | "redvirt" => RedfishVendor::Sushy,
             // Some Dell iDRACs report "Dell Inc." in the ServiceRoot Vendor field
             // (seen on iDRAC8 / PowerEdge T330 under authenticated access) rather
             // than the bare "Dell" Oem key. Without this, auto-detect returns
@@ -188,6 +193,16 @@ mod test {
     }
 
     #[test]
+    fn test_supermicro_gb300_service_root() {
+        let result = ServiceRoot {
+            vendor: Some("Supermicro".to_string()),
+            product: Some("GB NVL".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(result.vendor().unwrap(), RedfishVendor::NvidiaGBx00);
+    }
+
+    #[test]
     fn test_nvidia_bluefield_service_root() {
         let result = ServiceRoot {
             vendor: Some("NVIDIA".to_string()),
@@ -206,5 +221,26 @@ mod test {
         };
         assert_eq!(result.vendor().unwrap(), RedfishVendor::VeraRubin);
         assert!(result.is_vera_rubin());
+    }
+
+    #[test]
+    fn test_delta_powershelf_service_root() {
+        // Real Delta power shelves report their full manufacturer string in the
+        // service-root `Vendor` field, not a bare "Delta".
+        let result = ServiceRoot {
+            vendor: Some("Delta Electronics Inc.".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(result.vendor().unwrap(), RedfishVendor::DeltaPowerShelf);
+    }
+
+    #[test]
+    fn test_delta_powershelf_service_root_case_insensitive() {
+        // Matching is case-insensitive (the vendor string is lowercased first).
+        let result = ServiceRoot {
+            vendor: Some("DELTA ELECTRONICS INC.".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(result.vendor().unwrap(), RedfishVendor::DeltaPowerShelf);
     }
 }
